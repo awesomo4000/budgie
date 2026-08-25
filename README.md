@@ -104,18 +104,37 @@ deliberately outside the build -- those files are snapshots, not sources.
 
 Requires Zig 0.16.0.
 
-| | Linux | macOS / BSD |
+| | Linux | macOS |
 |---|---|---|
-| `zig build test` | yes | yes |
+| `zig build test` | 6/6 pass | 6/6 pass |
 | `server` (readiness reactor) | epoll | kqueue |
 | `server_uring2` (completion) | io_uring | not available |
 | `zig build bench` | yes | not ported |
 
+Both columns are measured, not assumed: the Linux side was run on Ubuntu
+6.8.0 / x86_64 with binaries cross-compiled from an arm64 Mac. Nothing needed
+to be installed on the Linux box to do it -- the Linux build links no libc at
+all, so the binaries are static and simply run. macOS cannot say the same and
+never will: there is no stable syscall ABI there, so every binary links
+`libSystem`.
+
+`sim` produces a **byte-identical trace hash on both** -- `663f011e3a5bb05c`
+for the default seed on macOS/arm64 and Linux/x86_64 alike. The scheduler is
+deterministic across architecture and operating system, not merely across
+runs on one machine.
+
 ```sh
-zig build                                  # servers -> zig-out/bin
+zig build -Drelease                        # servers -> zig-out/bin
 zig build test                             # the six test programs
 zig build check                            # typecheck for Linux without running
 ```
+
+`-Drelease` and not `-Doptimize=ReleaseFast`: 0.16's `standardOptimizeOption`
+exposes the former and rejects the latter outright. **Build with it.** A Debug
+server is ~500 MB, because `iobuf.store` is a 141 MB `undefined` static pool
+and Debug writes `0xAA` over it, which moves the whole thing out of `.bss` and
+into the binary. ReleaseFast leaves it uninitialised and the same binary is
+1.3 MB.
 
 The io_uring build is Linux-only and there is nothing to port it to: kqueue is
 a readiness interface, and that build exists precisely to exercise completion
@@ -279,6 +298,15 @@ Known gaps:
   not built.
 - The benches still speak raw Linux syscalls and have not been ported, so load
   generation on macOS needs an external tool such as `wrk`.
+- `IORING_REGISTER_PBUF_RING` is rejected with `EINVAL` on Ubuntu's 6.8.0-136
+  kernel, which takes `server_uring2` and `gen` with it -- both depend on a
+  provided buffer ring. This is not a code fault and not a kernel-version
+  one: `io_uring_setup` reports every feature bit, and `REGISTER_FILES` and
+  `REGISTER_BUFFERS` both succeed on the same ring; only `PBUF_RING` fails,
+  and it fails identically for a hand-built, zeroed, page-aligned
+  registration struct at every entry count and every setup-flag combination.
+  So the completion reactor is currently unexercised on that host, and the
+  io_uring figures below are the original ones, not re-measured.
 - Tasks are hand-rolled state machines, not fibers. No `perform` / `around`.
 - io_uring completion build no longer *fails* at depth, but does not scale with
   it: 44-53k req/s from depth 32 to 256, flat, while epoll climbs 66k -> 198k.
