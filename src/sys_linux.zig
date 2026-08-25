@@ -1,0 +1,107 @@
+//! The Linux half of the application's platform seam.
+//!
+//! Everything here is the raw syscall layer, unchanged from the build the
+//! measurements in README.md were taken on. `sys.zig` documents the contract
+//! these functions implement; the notes below are only about what is specific
+//! to Linux.
+
+const std = @import("std");
+const linux = std.os.linux;
+
+/// Linux orders the family first and has no length byte.
+pub const SockAddrIn = extern struct {
+    family: u16 = linux.AF.INET,
+    port: u16,
+    addr: u32,
+    zero: [8]u8 = @splat(0),
+};
+
+/// `SOCK_NONBLOCK` folds into the socket type, so this is one call.
+pub fn tcpSocketNonblock() usize {
+    return linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK, 0);
+}
+
+pub fn setReuseAddr(fd: i32) void {
+    const one: c_int = 1;
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int));
+}
+
+pub fn bind(fd: i32, addr: *const SockAddrIn) usize {
+    return linux.bind(fd, @ptrCast(addr), @sizeOf(SockAddrIn));
+}
+
+pub fn listen(fd: i32, backlog: u31) usize {
+    return linux.listen(fd, backlog);
+}
+
+pub fn getsockname(fd: i32, addr: *SockAddrIn) usize {
+    var len: linux.socklen_t = @sizeOf(SockAddrIn);
+    return linux.getsockname(fd, @ptrCast(addr), &len);
+}
+
+/// `accept4` takes the non-blocking flag directly, so an accepted connection
+/// costs exactly one syscall.
+pub fn acceptNonblock(listener: i32) usize {
+    return linux.accept4(listener, null, null, linux.SOCK.NONBLOCK);
+}
+
+pub fn read(fd: i32, buf: [*]u8, len: usize) usize {
+    return linux.read(fd, buf, len);
+}
+
+pub fn write(fd: i32, buf: [*]const u8, len: usize) usize {
+    return linux.write(fd, buf, len);
+}
+
+pub fn close(fd: i32) void {
+    _ = linux.close(fd);
+}
+
+const timeval = extern struct { sec: isize, usec: isize };
+const itimerval = extern struct { it_interval: timeval, it_value: timeval };
+
+pub fn armIntervalTimer(ms: u64) void {
+    const v: itimerval = .{
+        .it_interval = .{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) },
+        .it_value = .{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) },
+    };
+    _ = linux.syscall3(.setitimer, 0, @intFromPtr(&v), 0);
+}
+
+fn sysErr(rc: usize) bool {
+    return @as(isize, @bitCast(rc)) < 0;
+}
+
+/// Field two of `/proc/self/statm` is resident pages.
+pub fn rssKb() u64 {
+    var buf: [256]u8 = undefined;
+    const fd = linux.open("/proc/self/statm", .{ .ACCMODE = .RDONLY }, 0);
+    if (sysErr(fd)) return 0;
+    defer _ = linux.close(@intCast(fd));
+    const n = linux.read(@intCast(fd), &buf, buf.len);
+    if (sysErr(n)) return 0;
+    var it = std.mem.tokenizeScalar(u8, buf[0..n], ' ');
+    _ = it.next();
+    const pages = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
+    return pages * 4; // 4 KiB pages
+}
+
+/// utime + stime from `/proc/self/stat`, fields 14 and 15 -- counted from
+/// after the last ')' because the comm field can itself contain parentheses.
+pub fn cpuMs() u64 {
+    var buf: [1024]u8 = undefined;
+    const fd = linux.open("/proc/self/stat", .{ .ACCMODE = .RDONLY }, 0);
+    if (sysErr(fd)) return 0;
+    defer _ = linux.close(@intCast(fd));
+    const n = linux.read(@intCast(fd), &buf, buf.len);
+    if (sysErr(n)) return 0;
+    const close_paren = std.mem.lastIndexOfScalar(u8, buf[0..n], ')') orelse return 0;
+    var it = std.mem.tokenizeScalar(u8, buf[close_paren + 2 .. n], ' ');
+    var i: usize = 0;
+    var total: u64 = 0;
+    while (it.next()) |tok| : (i += 1) {
+        if (i == 11 or i == 12) total += std.fmt.parseInt(u64, tok, 10) catch 0;
+        if (i > 12) break;
+    }
+    return total * 10; // USER_HZ = 100
+}

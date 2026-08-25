@@ -16,31 +16,26 @@
 //! except to decide how long to block -- which in virtual mode is a jump.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const posix = std.posix;
 
 /// Monotonic nanoseconds, straight from the OS.
 ///
-/// This is the only line of the kernel that is platform-specific, and it is
-/// deliberately not `std.Io.Clock`: that wants an `Io` threaded through every
-/// caller, and a clock you must be handed is exactly what the `Clock` type
-/// below exists to avoid. On Linux it is the raw syscall and needs no libc;
-/// everywhere else it is the libc entry point.
+/// `posix.system` is the platform dispatch: it resolves to `std.c` where libc
+/// is linked and to the native OS module otherwise, so this needs no switch of
+/// its own and no direct reference to libc. `posix.errno` normalises the two
+/// return conventions -- Linux returns a negative errno, Darwin returns -1 and
+/// sets a global -- which is the other half of what a hand-written switch here
+/// would have had to get right. It is the same call std makes internally for
+/// `Io.Clock`, which is deliberately not used here: that wants an `Io` threaded
+/// through every caller, and a clock you must be handed is exactly what the
+/// `Clock` type below exists to avoid.
 ///
-/// MONOTONIC and never REALTIME. Nothing here may observe time going
-/// backwards because an operator set the wall clock.
+/// MONOTONIC and never REALTIME. Nothing here may observe time going backwards
+/// because an operator set the wall clock.
 pub fn monotonicNs() i64 {
-    switch (builtin.os.tag) {
-        .linux => {
-            var ts: std.os.linux.timespec = undefined;
-            _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
-            return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
-        },
-        else => {
-            var ts: std.c.timespec = undefined;
-            _ = std.c.clock_gettime(.MONOTONIC, &ts);
-            return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
-        },
-    }
+    var ts: posix.timespec = undefined;
+    if (posix.errno(posix.system.clock_gettime(posix.CLOCK.MONOTONIC, &ts)) != .SUCCESS) return 0;
+    return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
 }
 
 pub const Mode = enum { real, virtual };

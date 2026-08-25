@@ -31,7 +31,8 @@ pub const accounts = @import("accounts.zig");
 pub const clock = @import("clock.zig");
 
 /// Sockets, the tick timer, and process introspection. The platform seam for
-/// the application, as `reactor.backend` is for the wakeup primitive.
+/// the application, as `reactor.backend` is for the wakeup primitive: a
+/// selector over `sys_linux.zig` and `sys_darwin.zig`.
 pub const sys = @import("sys.zig");
 
 /// Sans-I/O HTTP request parser: bytes in, events out.
