@@ -111,12 +111,16 @@ Requires Zig 0.16.0.
 | `server_uring2` (completion) | io_uring | not available |
 | `zig build bench` | yes | not ported |
 
-Both columns are measured, not assumed: the Linux side was run on Ubuntu
-6.8.0 / x86_64 with binaries cross-compiled from an arm64 Mac. Nothing needed
-to be installed on the Linux box to do it -- the Linux build links no libc at
-all, so the binaries are static and simply run. macOS cannot say the same and
-never will: there is no stable syscall ABI there, so every binary links
-`libSystem`.
+Both columns are measured, not assumed. The Linux side was built and run
+natively on Ubuntu 6.8.0 / x86_64 -- `zig build -Drelease`, `zig build test`,
+`zig build bench` and `zig build check` all pass there, and the bench step
+builds all eight generators.
+
+It also runs cross-compiled: binaries built on an arm64 Mac execute on that
+Linux box with nothing installed, because the Linux build links no libc at
+all. Nothing calls `linkLibC`, the ELF is static, and it carries zero libc
+symbols. macOS cannot say the same and never will -- there is no stable
+syscall ABI there, so every binary links `libSystem`.
 
 `sim` produces a **byte-identical trace hash on both** -- `663f011e3a5bb05c`
 for the default seed on macOS/arm64 and Linux/x86_64 alike. The scheduler is
@@ -298,15 +302,21 @@ Known gaps:
   not built.
 - The benches still speak raw Linux syscalls and have not been ported, so load
   generation on macOS needs an external tool such as `wrk`.
-- `IORING_REGISTER_PBUF_RING` is rejected with `EINVAL` on Ubuntu's 6.8.0-136
-  kernel, which takes `server_uring2` and `gen` with it -- both depend on a
-  provided buffer ring. This is not a code fault and not a kernel-version
-  one: `io_uring_setup` reports every feature bit, and `REGISTER_FILES` and
-  `REGISTER_BUFFERS` both succeed on the same ring; only `PBUF_RING` fails,
-  and it fails identically for a hand-built, zeroed, page-aligned
-  registration struct at every entry count and every setup-flag combination.
-  So the completion reactor is currently unexercised on that host, and the
-  io_uring figures below are the original ones, not re-measured.
+- `IORING_REGISTER_PBUF_RING` is rejected with `EINVAL` on Ubuntu's
+  6.8.0-136 kernel, which takes `server_uring2` and `gen` with it since both
+  need a provided buffer ring. Everything around it works, which is what
+  makes it odd. On the same ring: `io_uring_setup` reports every feature bit
+  (`0x3fff`); `REGISTER_FILES`, `REGISTER_BUFFERS`, `REGISTER_PROBE` and
+  `REGISTER_IOWQ_MAX_WORKERS` all succeed; and `REGISTER_PROBE` reports
+  `PROVIDE_BUFFERS`, `RECV` and `POLL_ADD` as supported, up to `last_op=54`.
+  Only the ring registration fails, and it fails for a hand-built, zeroed,
+  page-aligned struct -- verified 40 bytes with the right field offsets and
+  opcode 22 -- at every entry count, both buffer group ids, and both the
+  user-allocated and `IOU_PBUF_RING_MMAP` paths. The pre-port commit fails
+  identically, so it predates this work and is not a regression. Cause
+  unknown; it looks like kernel policy rather than anything in this code. The
+  completion reactor is therefore unexercised on that host and the io_uring
+  figures below are the original ones, not re-measured.
 - Tasks are hand-rolled state machines, not fibers. No `perform` / `around`.
 - io_uring completion build no longer *fails* at depth, but does not scale with
   it: 44-53k req/s from depth 32 to 256, flat, while epoll climbs 66k -> 198k.
