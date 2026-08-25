@@ -16,7 +16,32 @@
 //! except to decide how long to block -- which in virtual mode is a jump.
 
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
+
+/// Monotonic nanoseconds, straight from the OS.
+///
+/// This is the only line of the kernel that is platform-specific, and it is
+/// deliberately not `std.Io.Clock`: that wants an `Io` threaded through every
+/// caller, and a clock you must be handed is exactly what the `Clock` type
+/// below exists to avoid. On Linux it is the raw syscall and needs no libc;
+/// everywhere else it is the libc entry point.
+///
+/// MONOTONIC and never REALTIME. Nothing here may observe time going
+/// backwards because an operator set the wall clock.
+pub fn monotonicNs() i64 {
+    switch (builtin.os.tag) {
+        .linux => {
+            var ts: std.os.linux.timespec = undefined;
+            _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+            return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
+        },
+        else => {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &ts);
+            return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
+        },
+    }
+}
 
 pub const Mode = enum { real, virtual };
 
@@ -37,9 +62,7 @@ pub const Clock = struct {
     pub fn ns(c: *Clock) i64 {
         c.reads += 1;
         if (c.mode == .virtual) return c.v_ns;
-        var ts: linux.timespec = undefined;
-        _ = linux.clock_gettime(.MONOTONIC, &ts);
-        return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
+        return monotonicNs();
     }
 
     pub fn ms(c: *Clock) i64 {

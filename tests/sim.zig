@@ -19,13 +19,10 @@ const std = @import("std");
 const sched = @import("coopkernel").sched;
 const Clock = @import("coopkernel").clock.Clock;
 const quota = @import("coopkernel").quota;
-const linux = std.os.linux;
-
-fn wallNs() i64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
-}
+/// Wall time, used only to report how long the run took. The simulation
+/// itself never reads this -- it runs on the virtual clock, which is the
+/// whole point -- so this is a stopwatch and nothing branches on it.
+const wallNs = @import("coopkernel").clock.monotonicNs;
 
 const Sched = sched.Sched;
 const TaskId = sched.TaskId;

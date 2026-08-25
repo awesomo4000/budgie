@@ -1,39 +1,39 @@
-//! The reactor, on epoll. Same public surface as the poll version:
+//! The readiness reactor. Same public surface as the poll version:
 //!
 //!     watch(task, fd, interest)   unwatch(task)   watching(task)
 //!     wait(sched, timeout_ms) -> marks ready tasks runnable
 //!
 //! Nothing outside this file changed. sched.zig and server.zig are untouched.
 //!
-//! EPOLLONESHOT is what makes the semantics line up exactly. The poll version
-//! removed a task from the poll set the moment it became ready, so the set
-//! always held only the parked population. ONESHOT gets that from the kernel:
-//! after an event fires, the fd is disarmed until explicitly rearmed with
-//! EPOLL_CTL_MOD. So `wait` needs no bookkeeping at all on the ready path,
-//! and parking costs exactly one `epoll_ctl`.
+//! This file owns the client table, the byte accounting and the round policy,
+//! and none of that is platform-specific. The wakeup primitive is, so it lives
+//! behind `Backend`: epoll on Linux, kqueue on macOS and the BSDs. The split
+//! is deliberately at the smallest possible seam -- arm, disarm, wait, read --
+//! because the interesting code here is the ~390 lines of fairness policy
+//! below, and having two copies of it that drift apart would be much worse
+//! than having two copies of four syscall wrappers.
+//!
+//! Oneshot arming is what makes the semantics line up exactly. The poll
+//! version removed a task from the poll set the moment it became ready, so the
+//! set always held only the parked population. Both backends get that from the
+//! kernel -- EPOLLONESHOT and EV_ONESHOT -- so `wait` needs no bookkeeping at
+//! all on the ready path, and parking costs exactly one registration call.
 
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
 const sched = @import("sched.zig");
 
-pub const Interest = enum {
-    read,
-    write,
+pub const Interest = @import("interest.zig").Interest;
 
-    fn events(i: Interest) u32 {
-        const base: u32 = switch (i) {
-            .read => linux.EPOLL.IN,
-            .write => linux.EPOLL.OUT,
-        };
-        return base | linux.EPOLL.ONESHOT | linux.EPOLL.RDHUP;
-    }
+/// The platform wakeup primitive. Selected here and nowhere else.
+pub const backend = switch (builtin.os.tag) {
+    .linux => @import("backend_epoll.zig"),
+    .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => @import("backend_kqueue.zig"),
+    else => @compileError("no readiness backend for this OS"),
 };
+const Backend = backend.Backend;
 
 const max_events = 1024;
-
-fn sysErr(rc: usize) bool {
-    return @as(isize, @bitCast(rc)) < 0;
-}
 
 /// Per-client state the reactor keeps for itself.
 ///
@@ -62,7 +62,7 @@ const Client = struct {
 };
 
 pub const Reactor = struct {
-    epfd: i32 = -1,
+    be: Backend = .{},
     /// Whether the fd for this task has ever been added. After the first ADD
     /// every rearm is a MOD, which is what ONESHOT expects.
     added: [sched.max_tasks]bool = @splat(false),
@@ -127,7 +127,7 @@ pub const Reactor = struct {
     /// more than their current share.
     demanding: usize = 0,
 
-    // --- service-counted rounds, with epoll supplying the backlogged set ---
+    // --- service-counted rounds, with the backend supplying the backlogged set ---
     //
     // The whole difficulty with DRR here was that classic DRR observes the
     // DEQUEUE -- "a round ends once every backlogged flow has had a turn" --
@@ -136,7 +136,7 @@ pub const Reactor = struct {
     // because a throttled flow stops being served and therefore stops looking
     // backlogged.
     //
-    // But epoll_wait already reports exactly the backlogged set: a client with
+    // But the backend already reports exactly the backlogged set: a client with
     // nothing pending is simply not in it. And a client we refused to arm is
     // known to have data waiting, because that is why we refused. Together
     // those give a backlogged count that SURVIVES throttling, which is the
@@ -161,9 +161,11 @@ pub const Reactor = struct {
     ctls: u64 = 0,
 
     pub fn init(r: *Reactor) !void {
-        const rc = linux.epoll_create1(0);
-        if (sysErr(rc)) return error.EpollCreateFailed;
-        r.epfd = @intCast(rc);
+        try r.be.init();
+    }
+
+    pub fn deinit(r: *Reactor) void {
+        r.be.deinit();
     }
 
     /// Admit a client. Its deficit starts full.
@@ -186,8 +188,7 @@ pub const Reactor = struct {
     /// live somewhere else and coordinate -- which is exactly what did not
     /// work.
     pub fn read(r: *Reactor, task: sched.TaskId, fd: i32, buf: []u8) isize {
-        const rc = linux.read(fd, buf.ptr, buf.len);
-        const n: isize = @bitCast(rc);
+        const n = Backend.read(fd, buf);
         if (n <= 0) return n;
         r.bytes_in += @intCast(n);
         r.round_bytes += n;
@@ -327,7 +328,7 @@ pub const Reactor = struct {
     ///
     /// STATUS: implemented, measured, DOES NOT WORK. Default off.
     ///
-    /// The idea was that epoll_wait already reports the backlogged set, giving
+    /// The idea was that the backend already reports the backlogged set, giving
     /// the service-counted round that classic DRR needs. Two failures:
     ///
     ///   * counting throttled clients as backlogged deadlocks -- they are
@@ -349,13 +350,8 @@ pub const Reactor = struct {
     }
 
     fn armNow(r: *Reactor, task: sched.TaskId, fd: i32, i: Interest) void {
-        var ev = linux.epoll_event{
-            .events = i.events(),
-            .data = .{ .u64 = task },
-        };
-        const op: u32 = if (r.added[task]) linux.EPOLL.CTL_MOD else linux.EPOLL.CTL_ADD;
         r.ctls += 1;
-        if (sysErr(linux.epoll_ctl(r.epfd, op, fd, &ev))) return;
+        if (!r.be.arm(task, fd, i, r.added[task])) return;
         if (!r.added[task]) {
             r.added[task] = true;
             r.fd_of[task] = fd;
@@ -366,7 +362,7 @@ pub const Reactor = struct {
     pub fn unwatch(r: *Reactor, task: sched.TaskId) void {
         if (!r.added[task]) return;
         r.ctls += 1;
-        _ = linux.epoll_ctl(r.epfd, linux.EPOLL.CTL_DEL, r.fd_of[task], null);
+        r.be.disarm(task, r.fd_of[task]);
         r.added[task] = false;
         r.fd_of[task] = -1;
         if (r.armed > 0) r.armed -= 1;
@@ -381,12 +377,10 @@ pub const Reactor = struct {
     /// The kernel hands back only the ready set, so this is O(ready) rather
     /// than O(registered). That is the entire difference from the poll build.
     pub fn wait(r: *Reactor, s: *sched.Sched, timeout_ms: i32) usize {
-        var evs: [max_events]linux.epoll_event = undefined;
+        var ready: [max_events]sched.TaskId = undefined;
         r.waits += 1;
         r.fds_polled += r.armed;
-        const rc = linux.epoll_wait(r.epfd, &evs, max_events, timeout_ms);
-        if (sysErr(rc)) return 0;
-        const n: usize = rc;
+        const n = r.be.wait(&ready, timeout_ms);
         // The ready set is the set we WILL serve this round.
         //
         // Adding the throttled clients to it deadlocks: they are precisely the
@@ -394,8 +388,7 @@ pub const Reactor = struct {
         // rounds stop (measured: 8 rounds in 5s, everything stalled). They get
         // credited when the round ends, not counted as participants in it.
         r.backlogged = n;
-        for (evs[0..n]) |ev| {
-            const task: sched.TaskId = @intCast(ev.data.u64);
+        for (ready[0..n]) |task| {
             // ONESHOT already disarmed it kernel-side; mirror that locally so
             // the next park issues a MOD rather than a redundant ADD.
             if (r.armed > 0) r.armed -= 1;

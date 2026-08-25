@@ -32,6 +32,7 @@ const posix = std.posix;
 const http = @import("coopkernel").http;
 const Clock = @import("coopkernel").clock.Clock;
 const iobuf = @import("coopkernel").iobuf;
+const sys = @import("coopkernel").sys;
 
 /// Every knob is runtime-settable so a sweep needs no recompile. Defaults
 /// match the values the earlier runs used.
@@ -136,16 +137,8 @@ const prio_conn: u8 = 2;
 /// no matter how much work it wants to do.
 
 
-const sockaddr_in = extern struct {
-    family: u16 = linux.AF.INET,
-    port: u16,
-    addr: u32,
-    zero: [8]u8 = @splat(0),
-};
-
-fn sysErr(rc: usize) bool {
-    return @as(isize, @bitCast(rc)) < 0;
-}
+const sockaddr_in = sys.SockAddrIn;
+const sysErr = sys.sysErr;
 
 // ---------------------------------------------------------------- the tick
 //
@@ -245,48 +238,11 @@ fn onTick(_: posix.SIG) callconv(.c) void {
     }
 }
 
-const timeval = extern struct { sec: isize, usec: isize };
-const itimerval = extern struct { it_interval: timeval, it_value: timeval };
+const armTimer = sys.armIntervalTimer;
 
-fn armTimer(ms: u64) void {
-    const v: itimerval = .{
-        .it_interval = .{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) },
-        .it_value = .{ .sec = @intCast(ms / 1000), .usec = @intCast((ms % 1000) * 1000) },
-    };
-    _ = linux.syscall3(.setitimer, 0, @intFromPtr(&v), 0);
-}
+const rssKb = sys.rssKb;
 
-fn rssKb() u64 {
-    var buf: [256]u8 = undefined;
-    const fd = linux.open("/proc/self/statm", .{ .ACCMODE = .RDONLY }, 0);
-    if (sysErr(fd)) return 0;
-    defer _ = linux.close(@intCast(fd));
-    const n = linux.read(@intCast(fd), &buf, buf.len);
-    if (sysErr(n)) return 0;
-    var it = std.mem.tokenizeScalar(u8, buf[0..n], ' ');
-    _ = it.next();
-    const pages = std.fmt.parseInt(u64, it.next() orelse "0", 10) catch 0;
-    return pages * 4; // 4 KiB pages
-}
-
-/// utime + stime in milliseconds, from /proc/self/stat.
-fn cpuMs() u64 {
-    var buf: [1024]u8 = undefined;
-    const fd = linux.open("/proc/self/stat", .{ .ACCMODE = .RDONLY }, 0);
-    if (sysErr(fd)) return 0;
-    defer _ = linux.close(@intCast(fd));
-    const n = linux.read(@intCast(fd), &buf, buf.len);
-    if (sysErr(n)) return 0;
-    const close_paren = std.mem.lastIndexOfScalar(u8, buf[0..n], ')') orelse return 0;
-    var it = std.mem.tokenizeScalar(u8, buf[close_paren + 2 .. n], ' ');
-    var i: usize = 0;
-    var total: u64 = 0;
-    while (it.next()) |tok| : (i += 1) {
-        if (i == 11 or i == 12) total += std.fmt.parseInt(u64, tok, 10) catch 0;
-        if (i > 12) break;
-    }
-    return total * 10; // USER_HZ = 100
-}
+const cpuMs = sys.cpuMs;
 
 /// Kept as free functions so the diff stays small, but they now read the
 /// process clock rather than the system clock. `app_storage.clock` is the only
@@ -300,9 +256,7 @@ fn nowNs() i64 {
 }
 
 fn realNowMs() i64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+    return @divTrunc(@import("coopkernel").clock.monotonicNs(), 1_000_000);
 }
 
 /// The yield primitive.
@@ -507,11 +461,11 @@ const App = struct {
         defer a.book.observe(.accept, nowNs() - t0);
         var burst: usize = 0;
         while (burst < K.accept_burst) : (burst += 1) {
-            const rc = linux.accept4(a.listener, null, null, linux.SOCK.NONBLOCK);
+            const rc = sys.acceptNonblock(a.listener);
             if (sysErr(rc)) break;
             const fd: i32 = @intCast(rc);
             const t = a.freeTask() orelse {
-                _ = linux.close(fd);
+                sys.close(fd);
                 break;
             };
             a.conn_store[t] = .{ .fd = fd };
@@ -565,11 +519,11 @@ const App = struct {
     /// surface that can be made to do arbitrary work is not a control surface.
     fn acceptCtrl(a: *App) void {
         while (true) {
-            const rc = linux.accept4(a.ctrl_listener, null, null, linux.SOCK.NONBLOCK);
+            const rc = sys.acceptNonblock(a.ctrl_listener);
             if (sysErr(rc)) break;
             const fd: i32 = @intCast(rc);
             const t = a.freeTask() orelse {
-                _ = linux.close(fd);
+                sys.close(fd);
                 break;
             };
             a.conn_store[t] = .{ .fd = fd, .is_ctrl = true };
@@ -584,16 +538,16 @@ const App = struct {
 
     fn stepCtrl(a: *App, t: TaskId, c: *Conn) void {
         var buf: [64]u8 = undefined;
-        const rc = linux.read(c.fd, &buf, buf.len);
+        const rc = sys.read(c.fd, &buf, buf.len);
         if (sysErr(rc)) return a.r.watch(t, c.fd, .read);
         if (rc == 0) {
             a.r.unwatch(t);
             a.s.release(t);
-            _ = linux.close(c.fd);
+            sys.close(c.fd);
             a.live_conn[t] = false;
             return;
         }
-        _ = linux.write(c.fd, &buf, rc);
+        _ = sys.write(c.fd, &buf, rc);
         a.r.watch(t, c.fd, .read);
     }
 
@@ -759,7 +713,7 @@ const App = struct {
         const t0 = nowNs();
         defer a.book.observe(.write, nowNs() - t0);
         const b = a.bufs.get(c.buf) orelse return a.finish(t, c, .peer_gone);
-        const rc = linux.write(c.fd, b.out[b.out_sent..].ptr, b.out_len - b.out_sent);
+        const rc = sys.write(c.fd, b.out[b.out_sent..].ptr, b.out_len - b.out_sent);
         if (sysErr(rc)) return a.park(t, c, .write);
         b.out_sent += rc;
         if (b.out_sent < b.out_len) return a.park(t, c, .write);
@@ -801,7 +755,7 @@ const App = struct {
         a.s.release(t);
         a.bufs.release(c.buf);
         c.buf = .{};
-        _ = linux.close(c.fd);
+        sys.close(c.fd);
         a.live_conn[t] = false;
         a.served += 1;
     }
@@ -839,16 +793,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
 
-    const src = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK, 0);
+    const src = sys.tcpSocketNonblock();
     if (sysErr(src)) return error.SocketFailed;
     const sock: i32 = @intCast(src);
-    const one: c_int = 1;
-    _ = linux.setsockopt(sock, linux.SOL.SOCKET, linux.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int));
-    var addr = sockaddr_in{ .port = std.mem.nativeToBig(u16, arg_port), .addr = 0x0100007f };
-    if (sysErr(linux.bind(sock, @ptrCast(&addr), @sizeOf(sockaddr_in)))) return error.BindFailed;
-    if (sysErr(linux.listen(sock, 4096))) return error.ListenFailed;
-    var len: linux.socklen_t = @sizeOf(sockaddr_in);
-    _ = linux.getsockname(sock, @ptrCast(&addr), &len);
+    sys.setReuseAddr(sock);
+    var addr = sockaddr_in{ .port = sys.hostToNetPort(arg_port), .addr = sys.loopback };
+    if (sysErr(sys.bind(sock, &addr))) return error.BindFailed;
+    if (sysErr(sys.listen(sock, 4096))) return error.ListenFailed;
+    _ = sys.getsockname(sock, &addr);
 
     app_storage = .{ .listener = sock };
     const a = &app_storage;
@@ -880,12 +832,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     a.q.define(sup_ctrl, sup_root, quota.unlimited, .periodic, K.sup_period_ms, "ctrl");
 
     // Control listener on port+1, top priority class.
-    const csr = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK, 0);
+    const csr = sys.tcpSocketNonblock();
     const csock: i32 = @intCast(csr);
-    _ = linux.setsockopt(csock, linux.SOL.SOCKET, linux.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int));
-    var caddr = sockaddr_in{ .port = std.mem.nativeToBig(u16, std.mem.bigToNative(u16, addr.port) + 1), .addr = 0x0100007f };
-    _ = linux.bind(csock, @ptrCast(&caddr), @sizeOf(sockaddr_in));
-    _ = linux.listen(csock, 64);
+    sys.setReuseAddr(csock);
+    var caddr = sockaddr_in{ .port = sys.hostToNetPort(sys.netToHostPort(addr.port) + 1), .addr = sys.loopback };
+    _ = sys.bind(csock, &caddr);
+    _ = sys.listen(csock, 64);
     a.ctrl_listener = csock;
     a.s.live[ctrl_listener_task] = true;
     a.s.setPrio(ctrl_listener_task, prio_ctrl);
@@ -937,7 +889,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     std.debug.print(
-        "\nsteps={d} accepted={d} served={d} epoll_waits={d} avg_armed={d} rearms={d}\n",
+        "\nsteps={d} accepted={d} served={d} reactor_waits={d} avg_armed={d} rearms={d}\n",
         .{ a.steps, a.accepted, a.served, a.r.waits, if (a.r.waits > 0) a.r.fds_polled / a.r.waits else 0, a.s.rearms },
     );
     std.debug.print("fair: quantum={d} (auto={}) peak_round={d} q_range={d}..{d} n_max={d} honest={d} rounds={d} throttles={d} resumes={d} bytes={d}\n", .{ a.r.quantum, a.r.auto, a.r.peak_round_bytes, a.r.q_min, a.r.q_max, a.r.n_max, a.r.honest_rounds, a.r.rounds, a.r.throttles, a.r.resumes, a.r.bytes_in });
@@ -986,7 +938,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         });
     }
     std.debug.print("{s:<12} {s:>10} {s:>12} {d:>12}\n", .{ "wall", "", "", wall_ns });
-    std.debug.print("{s:<12} {s:>10} {s:>12} {d:>12}   <- charges no units: syscalls, epoll_wait, scheduler ({d:.1}%)\n", .{
+    std.debug.print("{s:<12} {s:>10} {s:>12} {d:>12}   <- charges no units: syscalls, reactor wait, scheduler ({d:.1}%)\n", .{
         "UNACCOUNTED", "", "", unacc,
         100.0 * @as(f64, @floatFromInt(unacc)) / @as(f64, @floatFromInt(wall_ns)),
     });

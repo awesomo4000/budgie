@@ -1,10 +1,20 @@
 const std = @import("std");
 
 /// The two servers. Same scheduler, different reactor.
+///
+/// `server` runs anywhere the readiness reactor does -- epoll on Linux, kqueue
+/// on macOS and the BSDs. `server_uring2` is Linux-only and there is nothing
+/// to port it to: kqueue is a readiness interface, and that build exists to
+/// exercise completion with a kernel-owned buffer ring.
 const apps = [_][]const u8{ "server", "server_uring2" };
+const linux_only_apps = [_][]const u8{"server_uring2"};
 
-/// Load generators and microbenchmarks. Every one is standalone — they import
+/// Load generators and microbenchmarks. Every one is standalone -- they import
 /// only `std`, so a bench can be built and shipped to a load box on its own.
+///
+/// All of them still speak raw Linux syscalls directly and have not been
+/// ported; `gen` and `diskbench` are io_uring and never will be. The bench
+/// step is gated on Linux for that reason.
 const benches = [_][]const u8{
     "gen",       "bench",  "bench2",  "ctrl",
     "diskbench", "hold",   "iobench", "sysc",
@@ -49,7 +59,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const is_linux = target.result.os.tag == .linux;
+
     for (apps) |name| {
+        if (!is_linux and isLinuxOnly(name)) continue;
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -67,7 +80,16 @@ pub fn build(b: *std.Build) void {
     }
 
     const bench_step = b.step("bench", "Build the load generators and microbenchmarks");
-    for (benches) |name| {
+    if (!is_linux) {
+        // Say so rather than failing with a page of errors from inside the
+        // standard library, which is what a raw-syscall bench does when it is
+        // pointed at the wrong OS.
+        const note = b.addSystemCommand(&.{
+            "sh", "-c",
+            "echo 'bench: skipped -- the benches are Linux-only (raw syscalls; gen and diskbench are io_uring).' >&2",
+        });
+        bench_step.dependOn(&note.step);
+    } else for (benches) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -94,15 +116,21 @@ pub fn build(b: *std.Build) void {
 
         const run = b.addRunArtifact(exe);
         run.addArgs(t.args);
-        // A test that exits non-zero must fail the build. The old run_tests.sh
-        // needed an explicit `check` wrapper for this, because `set -e` let a
-        // failure inside a pipeline through and once hid a broken simulator.
-        run.expectExitCode(0);
+        // `.inherit` rather than the default capture-and-check. These
+        // programs report what they checked on stderr and that report is the
+        // point of running them; captured, the build runner calls it
+        // unexpected output and prints "failed command" beside a step that
+        // passed. `.inherit` also fails the step on a non-zero exit on its
+        // own -- so it replaces expectExitCode rather than needing it, and
+        // the two together are a hard error -- and marks the step as having
+        // side effects, so the suite re-runs instead of being cached away.
+        run.stdio = .inherit;
         test_step.dependOn(&run.step);
 
         // Each test is also its own step, so a single one can be re-run with
         // different arguments: `zig build sim -- 7 256 600`.
         const solo = b.addRunArtifact(exe);
+        solo.stdio = .inherit;
         if (b.args) |args| solo.addArgs(args) else solo.addArgs(t.args);
         b.step(t.name, b.fmt("Run {s}", .{t.name})).dependOn(&solo.step);
     }
@@ -156,4 +184,12 @@ pub fn build(b: *std.Build) void {
         });
         check_step.dependOn(&exe.step);
     }
+}
+
+/// Whether an executable exists only on Linux.
+fn isLinuxOnly(name: []const u8) bool {
+    for (linux_only_apps) |n| {
+        if (std.mem.eql(u8, n, name)) return true;
+    }
+    return false;
 }

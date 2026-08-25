@@ -35,7 +35,14 @@ src/
                        This was an `Account` enum inside the scheduler reading
                        {accept, parse, work, write, ...} -- HTTP server phases
                        in a CPU scheduler.
-  reactor.zig          epoll reactor (readiness)
+  reactor.zig          readiness reactor: client table, byte accounting and
+                       round policy. Platform-free; the wakeup primitive is a
+                       backend.
+  backend_epoll.zig    the epoll half of it (Linux)
+  backend_kqueue.zig   the kqueue half of it (macOS, BSD)
+  interest.zig         what a task waits for; shared by the two above
+  sys.zig              sockets, tick timer, process introspection -- the
+                       platform seam for the application
   reactor_uring.zig    io_uring reactor, IORING_OP_POLL_ADD (readiness)
   reactor_uring2.zig   io_uring reactor, multishot recv + buffer ring
                        (completion). Registered files and buffers.
@@ -95,22 +102,32 @@ deliberately outside the build -- those files are snapshots, not sources.
 
 ## Build and run
 
-Requires Zig 0.16.0. The kernel is Linux-only (kernel 5.19+ for the io_uring
-completion reactor; 6.0+ for `IORING_RECV_MULTISHOT`), and `zig build` targets
-the host by default, so on a non-Linux machine it will fail in the reactors.
-Cross-compile instead:
+Requires Zig 0.16.0.
+
+| | Linux | macOS / BSD |
+|---|---|---|
+| `zig build test` | yes | yes |
+| `server` (readiness reactor) | epoll | kqueue |
+| `server_uring2` (completion) | io_uring | not available |
+| `zig build bench` | yes | not ported |
 
 ```sh
-zig build                                  # both servers -> zig-out/bin
-zig build -Dtarget=x86_64-linux-gnu        # from a non-Linux host
-zig build check                            # typecheck everything for Linux, no run
+zig build                                  # servers -> zig-out/bin
+zig build test                             # the six test programs
+zig build check                            # typecheck for Linux without running
 ```
 
-`zig build check` is the one to reach for while editing on macOS: it compiles
-every executable for `x86_64-linux-gnu` without running anything, so a change
-to the kernel is verified without a Linux box. Pass `-Dcheck-target=` to aim
-it elsewhere -- note that `bench/diskbench.zig` issues a raw `open` syscall
-and so does not compile for arm64 Linux, which is openat-only.
+The io_uring build is Linux-only and there is nothing to port it to: kqueue is
+a readiness interface, and that build exists precisely to exercise completion
+with a kernel-owned buffer ring. `build.zig` drops it from a non-Linux build
+rather than failing, and naming `reactor_uring2` on such a target is a one-line
+error instead of a wall of io_uring internals.
+
+`zig build check` cross-compiles every executable for `x86_64-linux-gnu`
+without running anything, so a change made on a Mac is verified against the
+Linux path too. Pass `-Dcheck-target=` to aim it elsewhere -- note that
+`bench/diskbench.zig` issues a raw `open` syscall and so does not compile for
+arm64 Linux, which is openat-only.
 
 Run a server:
 
@@ -185,8 +202,17 @@ budget experiments need.
   since the last tick, the supervisor gets a fault naming the task. Turns "we
   are careful about yielding" from a convention into a measured property.
 
-**Reactors** — same four-function interface, four implementations. `sched.zig`
-was byte-identical across all four ports.
+**Reactors** — same four-function interface, five implementations: poll,
+epoll, io_uring readiness, io_uring completion, and kqueue. `sched.zig` was
+byte-identical across all of them.
+
+The kqueue port did not need a fifth copy of the reactor. Only about fifteen
+of `reactor.zig`'s four hundred lines were ever epoll-specific -- arm, disarm,
+wait, and the read -- and those are now `backend_epoll.zig` and
+`backend_kqueue.zig`. The client table, the byte accounting and the round
+policy are shared, which is the part worth not having two of. The semantics
+line up because `EV_ONESHOT` is `EPOLLONESHOT`: an event fires, the
+registration is gone, and the task stays parked until something rearms it.
 
 **Determinism** — `sim.zig` imports the unmodified scheduler and runs it on a
 virtual clock. Same seed produces a byte-identical trace hash over a million
@@ -251,6 +277,8 @@ Known gaps:
 
 - Single carrier. No threads. Multi-core is designed (shard, don't steal) but
   not built.
+- The benches still speak raw Linux syscalls and have not been ported, so load
+  generation on macOS needs an external tool such as `wrk`.
 - Tasks are hand-rolled state machines, not fibers. No `perform` / `around`.
 - io_uring completion build no longer *fails* at depth, but does not scale with
   it: 44-53k req/s from depth 32 to 256, flat, while epoll climbs 66k -> 198k.
