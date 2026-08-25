@@ -1,0 +1,382 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1230" width="1600" height="1230" font-family="'JetBrains Mono','SFMono-Regular','SF Mono',Menlo,Consolas,monospace">
+<defs>
+  <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#14181F"/>
+  </marker>
+  <marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#1D4ED8"/>
+  </marker>
+  <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#A85400"/>
+  </marker>
+  <marker id="ahr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#B01A1A"/>
+  </marker>
+  <marker id="ahv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#6021A8"/>
+  </marker>
+</defs>
+
+<rect width="1600" height="1230" fill="#F1F2F4"/>
+
+<!-- ══ HEADER ══ -->
+<text x="40" y="46" font-size="21" font-weight="700" fill="#14181F" letter-spacing="0.5">in-process seL4-model async server</text>
+<text x="40" y="70" font-size="12.5" fill="#5A6470">accept → admit → parse → compute → reply · MCS scheduling contexts · fault endpoints · budget charged at effect-suspension points</text>
+<line x1="40" y1="80" x2="1560" y2="80" stroke="#C3C8CE" stroke-width="1"/>
+<g font-size="10.5" fill="#A85400">
+  <rect x="1240" y="30" width="10" height="22" fill="#A85400"/>
+  <text x="1258" y="40">amber left-edge stripe = this code</text>
+  <text x="1258" y="52">runs on someone else's budget</text>
+</g>
+
+<!-- ══ ① ACCEPT & ADMIT ══ -->
+<rect x="40" y="90" width="430" height="320" rx="4" fill="#FFFFFF" stroke="#C3C8CE"/>
+<text x="58" y="118" font-size="12.5" font-weight="700" fill="#14181F" letter-spacing="1.6">① ACCEPT &amp; ADMIT</text>
+
+<rect x="58" y="142" width="176" height="44" rx="3" fill="#E3EAFB" stroke="#1D4ED8"/>
+<text x="146" y="163" font-size="12.5" fill="#14181F" text-anchor="middle">N_accept</text>
+<text x="146" y="178" font-size="10" fill="#5A6470" text-anchor="middle">notification · bitmask</text>
+
+<rect x="250" y="142" width="202" height="44" rx="3" fill="#E3EAFB" stroke="#1D4ED8"/>
+<text x="351" y="161" font-size="12.5" fill="#14181F" text-anchor="middle">TCB_acceptor</text>
+<text x="351" y="177" font-size="10" fill="#A85400" text-anchor="middle">SC_io · prio 200 · 200µs/1ms</text>
+<line x1="234" y1="164" x2="244" y2="164" stroke="#1D4ED8" stroke-width="1.5" marker-end="url(#ahb)"/>
+
+<rect x="58" y="214" width="394" height="62" rx="3" fill="#E3EAFB" stroke="#1D4ED8"/>
+<text x="70" y="234" font-size="12.5" fill="#14181F">UNTYPED POOL — fixed extent, no kernel heap</text>
+<g>
+  <rect x="70" y="244" width="46" height="18" fill="#1D4ED8" opacity="0.75"/>
+  <rect x="120" y="244" width="46" height="18" fill="#1D4ED8" opacity="0.75"/>
+  <rect x="170" y="244" width="46" height="18" fill="#1D4ED8" opacity="0.75"/>
+  <rect x="220" y="244" width="46" height="18" fill="#FFFFFF" stroke="#1D4ED8" stroke-dasharray="2 2"/>
+  <rect x="270" y="244" width="46" height="18" fill="#FFFFFF" stroke="#1D4ED8" stroke-dasharray="2 2"/>
+  <text x="330" y="258" font-size="10" fill="#5A6470">in use / free</text>
+</g>
+<line x1="351" y1="186" x2="351" y2="210" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<rect x="58" y="300" width="394" height="44" rx="3" fill="#E3EAFB" stroke="#1D4ED8"/>
+<text x="70" y="319" font-size="12.5" fill="#14181F">Retype → { TCB_conn · EP_reply · Reply obj · 2 frames }</text>
+<text x="70" y="334" font-size="10" fill="#5A6470">per-connection objects carved from the pool, nothing malloc'd</text>
+<line x1="255" y1="276" x2="255" y2="296" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<rect x="58" y="358" width="394" height="40" rx="3" fill="#FBE9E9" stroke="#B01A1A" stroke-dasharray="4 3"/>
+<text x="70" y="375" font-size="12" fill="#B01A1A">retype fails ⇒ static 503 + close</text>
+<text x="70" y="389" font-size="10" fill="#5A6470">refusal is exhaustion of a capability, not a counter you can forget to check</text>
+<line x1="150" y1="344" x2="150" y2="354" stroke="#B01A1A" stroke-width="1.4" stroke-dasharray="3 2" marker-end="url(#ahr)"/>
+
+<path d="M452,322 H486 V166 H514" fill="none" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<!-- ══ ② CONNECTION FIBER ══ -->
+<rect x="500" y="90" width="380" height="320" rx="4" fill="#FFFFFF" stroke="#C3C8CE"/>
+<text x="518" y="118" font-size="12.5" font-weight="700" fill="#14181F" letter-spacing="1.6">② CONNECTION FIBER</text>
+
+<rect x="518" y="142" width="344" height="48" rx="3" fill="#E3EAFB" stroke="#1D4ED8"/>
+<text x="530" y="162" font-size="12.5" fill="#14181F">TCB_conn — stackful fiber, not an OS thread</text>
+<text x="530" y="180" font-size="10" fill="#A85400">SC_conn · prio 180 · 500µs/5ms  (latency class)</text>
+
+<rect x="518" y="212" width="344" height="42" rx="3" fill="#FFFFFF" stroke="#5A6470"/>
+<text x="530" y="230" font-size="12" fill="#14181F">recv → seL4_Call(EP_parse)</text>
+<text x="530" y="245" font-size="10" fill="#5A6470">rendezvous, built above N_readable — not the primitive</text>
+<line x1="690" y1="190" x2="690" y2="208" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<rect x="518" y="276" width="344" height="56" rx="3" fill="#E3EAFB" stroke="#1D4ED8"/>
+<rect x="518" y="276" width="7" height="56" fill="#A85400"/>
+<text x="534" y="296" font-size="12.5" fill="#14181F">TCB_parser — PASSIVE (holds no SC)</text>
+<text x="534" y="311" font-size="10" fill="#A85400">runs on donated SC_conn ⇒ the caller pays for its own parse</text>
+<text x="534" y="325" font-size="10" fill="#5A6470">own fault EP: a trap on hostile input is a message, not an abort</text>
+<line x1="690" y1="254" x2="690" y2="272" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<text x="518" y="356" font-size="10" fill="#5A6470">Untrusted bytes never touch a thread that owns a budget.</text>
+<text x="518" y="370" font-size="10" fill="#5A6470">A runaway parse burns the client's own SC and trips ④ — it</text>
+<text x="518" y="384" font-size="10" fill="#5A6470">cannot steal time from another connection.</text>
+<circle cx="852" cy="366" r="10" fill="#FBE9E9" stroke="#B01A1A"/>
+<text x="852" y="370" font-size="10" fill="#B01A1A" text-anchor="middle">a</text>
+<path d="M818,332 V366 H840" fill="none" stroke="#B01A1A" stroke-width="1.3" stroke-dasharray="3 2" marker-end="url(#ahr)"/>
+
+<path d="M690,332 V420 H160 V482" fill="none" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<text x="481" y="252" font-size="9.5" fill="#5A6470" text-anchor="middle" transform="rotate(-90,481,252)">spawn fiber on retyped objects</text>
+
+<!-- ══ ③ WORK ══ -->
+<rect x="40" y="430" width="840" height="430" rx="4" fill="#FFFFFF" stroke="#C3C8CE"/>
+<text x="58" y="458" font-size="12.5" font-weight="700" fill="#14181F" letter-spacing="1.6">③ COMPUTE-CONSTRAINED WORK ON THE UPLOADED INPUT</text>
+
+<rect x="58" y="482" width="258" height="96" rx="3" fill="#FBEEDD" stroke="#A85400"/>
+<text x="70" y="502" font-size="12.5" fill="#14181F">SC_work POOL</text>
+<text x="70" y="517" font-size="10" fill="#5A6470">N objects · 20ms/50ms (throughput class)</text>
+<g>
+  <rect x="70" y="526" width="34" height="22" fill="#A85400" opacity="0.8"/>
+  <rect x="110" y="526" width="34" height="22" fill="#A85400" opacity="0.8"/>
+  <rect x="150" y="526" width="34" height="22" fill="#FFFFFF" stroke="#A85400" stroke-dasharray="2 2"/>
+  <rect x="190" y="526" width="34" height="22" fill="#FFFFFF" stroke="#A85400" stroke-dasharray="2 2"/>
+</g>
+<text x="70" y="566" font-size="10" fill="#B01A1A">pool empty ⇒ 503 here, before any input is touched</text>
+
+<rect x="338" y="482" width="240" height="52" rx="3" fill="#FBEEDD" stroke="#A85400"/>
+<text x="350" y="501" font-size="12" fill="#14181F">bind SC_work → TCB_conn</text>
+<text x="350" y="516" font-size="10" fill="#5A6470">swap budget class: latency → throughput</text>
+<line x1="320" y1="508" x2="332" y2="508" stroke="#A85400" stroke-width="1.5" marker-end="url(#aha)"/>
+
+<rect x="600" y="482" width="262" height="52" rx="3" fill="#E3EAFB" stroke="#1D4ED8"/>
+<text x="612" y="501" font-size="12" fill="#14181F">seL4_Call(EP_work)</text>
+<text x="612" y="516" font-size="10" fill="#A85400">SC_work donated for the duration</text>
+<line x1="582" y1="508" x2="594" y2="508" stroke="#A85400" stroke-width="1.5" marker-end="url(#aha)"/>
+
+<text x="338" y="552" font-size="10" fill="#5A6470">The compute cap is |SC_work|, an object count — not a</text>
+<text x="338" y="566" font-size="10" fill="#5A6470">fetchAdd/compare/fetchSub that overshoots under contention.</text>
+
+<rect x="58" y="596" width="804" height="248" rx="3" fill="#FAFAFB" stroke="#5A6470"/>
+<rect x="58" y="596" width="7" height="248" fill="#A85400"/>
+<text x="76" y="618" font-size="12.5" fill="#14181F">TCB_worker — PASSIVE, no SC of its own · runs only while a client donates one</text>
+
+<rect x="76" y="632" width="768" height="196" rx="3" fill="#F0E8FA" stroke="#6021A8" stroke-dasharray="5 3"/>
+<text x="90" y="652" font-size="12" fill="#6021A8" font-weight="700">around(body, cleanup)</text>
+<text x="238" y="652" font-size="10" fill="#5A6470">— one primitive owning entry, exit, and the exit-on-fault case</text>
+
+<rect x="92" y="664" width="188" height="44" rx="3" fill="#FFFFFF" stroke="#6021A8"/>
+<text x="104" y="682" font-size="11.5" fill="#14181F">enter</text>
+<text x="104" y="697" font-size="9.5" fill="#5A6470">install handler · arm SC_cleanup</text>
+
+<rect x="300" y="664" width="304" height="44" rx="3" fill="#FFFFFF" stroke="#6021A8"/>
+<text x="312" y="682" font-size="11.5" fill="#14181F">body: process uploaded input</text>
+<text x="312" y="697" font-size="9.5" fill="#5A6470">perform Read · perform Chunk · perform Emit</text>
+<line x1="284" y1="686" x2="294" y2="686" stroke="#6021A8" stroke-width="1.4" marker-end="url(#ahv)"/>
+
+<rect x="624" y="664" width="212" height="44" rx="3" fill="#FFFFFF" stroke="#6021A8"/>
+<text x="636" y="682" font-size="11.5" fill="#14181F">exit</text>
+<text x="636" y="697" font-size="9.5" fill="#5A6470">unwind on SC_cleanup reserve</text>
+<line x1="608" y1="686" x2="618" y2="686" stroke="#6021A8" stroke-width="1.4" marker-end="url(#ahv)"/>
+
+<rect x="300" y="722" width="304" height="42" rx="3" fill="#FFFFFF" stroke="#6021A8"/>
+<text x="312" y="740" font-size="11.5" fill="#14181F">every perform = suspension = charge point</text>
+<text x="312" y="754" font-size="9.5" fill="#A85400">budget debited here, not on a timer IRQ — exact, hosted-safe</text>
+<line x1="452" y1="708" x2="452" y2="718" stroke="#6021A8" stroke-width="1.4" marker-end="url(#ahv)"/>
+
+<text x="92" y="740" font-size="10" fill="#5A6470">SC_cleanup is a separate,</text>
+<text x="92" y="753" font-size="10" fill="#5A6470">always-granted reserve. Unwind</text>
+<text x="92" y="766" font-size="10" fill="#5A6470">never competes with the work</text>
+<text x="92" y="779" font-size="10" fill="#5A6470">that just overran.</text>
+
+<rect x="300" y="778" width="96" height="42" rx="3" fill="#FFFFFF" stroke="#6021A8"/>
+<text x="348" y="795" font-size="11" fill="#14181F" text-anchor="middle">k(v)</text>
+<text x="348" y="809" font-size="9" fill="#5A6470" text-anchor="middle">resume</text>
+<rect x="404" y="778" width="96" height="42" rx="3" fill="#FFFFFF" stroke="#6021A8"/>
+<text x="452" y="795" font-size="11" fill="#14181F" text-anchor="middle">k(v′)</text>
+<text x="452" y="809" font-size="9" fill="#5A6470" text-anchor="middle">multishot replay</text>
+<rect x="508" y="778" width="96" height="42" rx="3" fill="#FFFFFF" stroke="#6021A8"/>
+<text x="556" y="795" font-size="11" fill="#14181F" text-anchor="middle">drop k</text>
+<text x="556" y="809" font-size="9" fill="#5A6470" text-anchor="middle">→ exit</text>
+<line x1="452" y1="764" x2="452" y2="774" stroke="#6021A8" stroke-width="1.4" marker-end="url(#ahv)"/>
+
+<text x="624" y="740" font-size="10" fill="#5A6470">k is captured at the charge</text>
+<text x="624" y="753" font-size="10" fill="#5A6470">point, so a refill resumes the</text>
+<text x="624" y="766" font-size="10" fill="#5A6470">exact same frame; replay re-runs</text>
+<text x="624" y="779" font-size="10" fill="#5A6470">a chunk speculatively without</text>
+<text x="624" y="792" font-size="10" fill="#5A6470">re-reading the input.</text>
+
+<path d="M240,844 V872 H174 V942" fill="none" stroke="#B01A1A" stroke-width="1.3" stroke-dasharray="3 2" marker-end="url(#ahr)"/>
+<text x="248" y="866" font-size="9.5" fill="#B01A1A">budget expiry ⇒ fault IPC</text>
+
+<!-- ══ ④ SUPERVISION ══ -->
+<rect x="40" y="890" width="840" height="286" rx="4" fill="#FFFFFF" stroke="#C3C8CE"/>
+<text x="58" y="918" font-size="12.5" font-weight="700" fill="#14181F" letter-spacing="1.6">④ SUPERVISION — A FAULT IS A MESSAGE, NOT AN ABORT</text>
+
+<rect x="58" y="942" width="232" height="56" rx="3" fill="#FBE9E9" stroke="#B01A1A"/>
+<text x="70" y="962" font-size="12" fill="#14181F">EP_fault ⟨timeout⟩</text>
+<text x="70" y="977" font-size="9.5" fill="#5A6470">SC_work budget exhausted</text>
+<text x="70" y="990" font-size="9.5" fill="#5A6470">from ③</text>
+
+<rect x="58" y="1012" width="232" height="56" rx="3" fill="#FBE9E9" stroke="#B01A1A"/>
+<text x="70" y="1032" font-size="12" fill="#14181F">EP_fault ⟨parser⟩</text>
+<text x="70" y="1047" font-size="9.5" fill="#5A6470">trap · range check · bad cap</text>
+<circle cx="268" cy="1057" r="10" fill="#FBE9E9" stroke="#B01A1A"/>
+<text x="268" y="1061" font-size="10" fill="#B01A1A" text-anchor="middle">a</text>
+
+<rect x="320" y="942" width="242" height="126" rx="3" fill="#E3EAFB" stroke="#1D4ED8"/>
+<text x="332" y="962" font-size="12.5" fill="#14181F">TCB_supervisor</text>
+<text x="332" y="977" font-size="10" fill="#A85400">SC_sup · prio 250 · always runnable</text>
+<line x1="332" y1="988" x2="550" y2="988" stroke="#1D4ED8" stroke-opacity="0.35"/>
+<text x="332" y="1004" font-size="9.5" fill="#5A6470">msg = { sc, tcb, consumed, fault IP }</text>
+<text x="332" y="1020" font-size="9.5" fill="#14181F">the faulting fiber is FROZEN,</text>
+<text x="332" y="1033" font-size="9.5" fill="#14181F">not unwound — stack intact,</text>
+<text x="332" y="1046" font-size="9.5" fill="#14181F">k still live, decision deferred</text>
+<text x="332" y="1059" font-size="9.5" fill="#14181F">to policy that can see it.</text>
+<line x1="292" y1="970" x2="314" y2="970" stroke="#B01A1A" stroke-width="1.3" stroke-dasharray="3 2" marker-end="url(#ahr)"/>
+<line x1="292" y1="1040" x2="314" y2="1040" stroke="#B01A1A" stroke-width="1.3" stroke-dasharray="3 2" marker-end="url(#ahr)"/>
+
+<rect x="592" y="942" width="270" height="46" rx="3" fill="#FBEEDD" stroke="#A85400"/>
+<text x="604" y="960" font-size="11.5" fill="#14181F">refill SC_work → k(v)</text>
+<text x="604" y="975" font-size="9.5" fill="#5A6470">slow but legitimate work continues</text>
+
+<rect x="592" y="998" width="270" height="46" rx="3" fill="#FFFFFF" stroke="#5A6470"/>
+<text x="604" y="1016" font-size="11.5" fill="#14181F">suspend → reply 503</text>
+<text x="604" y="1031" font-size="9.5" fill="#5A6470">policy says this one has had enough</text>
+
+<rect x="592" y="1054" width="270" height="46" rx="3" fill="#F0E8FA" stroke="#6021A8"/>
+<text x="604" y="1072" font-size="11.5" fill="#14181F">grant SC_cleanup → drop k → exit</text>
+<text x="604" y="1087" font-size="9.5" fill="#5A6470">cancellation with a real unwind phase</text>
+<line x1="566" y1="965" x2="586" y2="965" stroke="#14181F" stroke-width="1.3" marker-end="url(#ah)"/>
+<line x1="566" y1="1021" x2="586" y2="1021" stroke="#14181F" stroke-width="1.3" marker-end="url(#ah)"/>
+<line x1="566" y1="1077" x2="586" y2="1077" stroke="#14181F" stroke-width="1.3" marker-end="url(#ah)"/>
+
+<text x="58" y="1096" font-size="10" fill="#5A6470">Contrast: a watchdog that shuts</text>
+<text x="58" y="1109" font-size="10" fill="#5A6470">the socket to wake a parked read</text>
+<text x="58" y="1122" font-size="10" fill="#5A6470">has one response to every case</text>
+<text x="58" y="1135" font-size="10" fill="#5A6470">and no way to run cleanup.</text>
+
+<text x="320" y="1096" font-size="10" fill="#5A6470">No 1 Hz slot scan, no atomic deadline publishing, no</text>
+<text x="320" y="1109" font-size="10" fill="#5A6470">"deadlines land within one tick of nominal", and no mutex</text>
+<text x="320" y="1122" font-size="10" fill="#5A6470">guarding a socket against the thing that kills it — because</text>
+<text x="320" y="1135" font-size="10" fill="#5A6470">nothing here reaches across to destroy another fiber's object.</text>
+
+<path d="M862,1077 H898 V712 H840" fill="none" stroke="#6021A8" stroke-width="1.4" marker-end="url(#ahv)"/>
+
+<!-- ══ ⑤ REPLY & SEND ══ -->
+<rect x="910" y="90" width="380" height="770" rx="4" fill="#FFFFFF" stroke="#C3C8CE"/>
+<text x="928" y="118" font-size="12.5" font-weight="700" fill="#14181F" letter-spacing="1.6">⑤ REPLY &amp; SEND</text>
+
+<rect x="928" y="142" width="344" height="52" rx="3" fill="#E3EAFB" stroke="#1D4ED8"/>
+<text x="940" y="162" font-size="12.5" fill="#14181F">Reply object — first-class</text>
+<text x="940" y="180" font-size="10" fill="#5A6470">not stashed in the TCB; revocable, one-shot, badged</text>
+
+<rect x="928" y="216" width="344" height="44" rx="3" fill="#FFFFFF" stroke="#5A6470"/>
+<text x="940" y="234" font-size="12" fill="#14181F">worker returns → TCB_conn resumes</text>
+<text x="940" y="249" font-size="10" fill="#A85400">donation ends: SC_work reverts to the pool holder</text>
+<line x1="1100" y1="194" x2="1100" y2="212" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<rect x="928" y="282" width="344" height="44" rx="3" fill="#FFFFFF" stroke="#5A6470"/>
+<text x="940" y="300" font-size="12" fill="#14181F">build response in conn arena</text>
+<text x="940" y="315" font-size="10" fill="#5A6470">arena lives in the retyped frames from ①</text>
+<line x1="1100" y1="260" x2="1100" y2="278" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<rect x="928" y="348" width="344" height="56" rx="3" fill="#E3EAFB" stroke="#1D4ED8"/>
+<text x="940" y="368" font-size="12.5" fill="#14181F">N_writable — notification</text>
+<text x="940" y="383" font-size="10" fill="#5A6470">async signal + bitmask is the PRIMITIVE here;</text>
+<text x="940" y="396" font-size="10" fill="#5A6470">blocking rendezvous is a library on top (inverse of seL4)</text>
+<line x1="1100" y1="326" x2="1100" y2="344" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<rect x="928" y="426" width="344" height="44" rx="3" fill="#FFFFFF" stroke="#5A6470"/>
+<text x="940" y="444" font-size="12" fill="#14181F">write + flush</text>
+<text x="940" y="459" font-size="10" fill="#5A6470">back on SC_conn: latency class again</text>
+<line x1="1100" y1="404" x2="1100" y2="422" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<rect x="928" y="492" width="344" height="48" rx="3" fill="#FBEEDD" stroke="#A85400"/>
+<text x="940" y="511" font-size="12" fill="#14181F">unbind SC_work → return to pool</text>
+<text x="940" y="527" font-size="10" fill="#5A6470">the compute slot is free the instant the reply is framed</text>
+<line x1="1100" y1="470" x2="1100" y2="488" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<rect x="928" y="562" width="344" height="44" rx="3" fill="#FFFFFF" stroke="#5A6470"/>
+<text x="940" y="580" font-size="12" fill="#14181F">keep-alive → back to ② (arena reset)</text>
+<text x="940" y="595" font-size="10" fill="#5A6470">objects retained, budget re-armed</text>
+<line x1="1100" y1="540" x2="1100" y2="558" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<rect x="928" y="628" width="344" height="48" rx="3" fill="#E3EAFB" stroke="#1D4ED8"/>
+<text x="940" y="647" font-size="12" fill="#14181F">close → delete conn objects</text>
+<text x="940" y="663" font-size="10" fill="#5A6470">frames + TCB + Reply revert to the untyped pool of ①</text>
+<line x1="1100" y1="606" x2="1100" y2="624" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<line x1="928" y1="700" x2="1272" y2="700" stroke="#C3C8CE"/>
+<text x="928" y="722" font-size="10.5" fill="#14181F">Backpressure is structural.</text>
+<text x="928" y="738" font-size="10" fill="#5A6470">No free untyped ⇒ refused at ①. No free SC_work ⇒</text>
+<text x="928" y="752" font-size="10" fill="#5A6470">refused at ③ before the input is read. There is no</text>
+<text x="928" y="766" font-size="10" fill="#5A6470">unbounded queue anywhere on the path, so there is no</text>
+<text x="928" y="780" font-size="10" fill="#5A6470">state in which the server is accepting work it cannot</text>
+<text x="928" y="794" font-size="10" fill="#5A6470">account for.</text>
+<text x="928" y="820" font-size="10" fill="#A85400">Every amber-striped box above ran on a budget it did</text>
+<text x="928" y="834" font-size="10" fill="#A85400">not own. That is the whole admission-control story —</text>
+<text x="928" y="848" font-size="10" fill="#A85400">there is no second counter.</text>
+
+<path d="M836,690 H886 V168 H922" fill="none" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<!-- ══ ⑥ DRAIN ══ -->
+<rect x="1320" y="90" width="240" height="1086" rx="4" fill="#FFFFFF" stroke="#C3C8CE"/>
+<text x="1338" y="118" font-size="12.5" font-weight="700" fill="#14181F" letter-spacing="1.6">⑥ DRAIN</text>
+
+<rect x="1338" y="142" width="204" height="52" rx="3" fill="#FFFFFF" stroke="#5A6470"/>
+<text x="1350" y="161" font-size="11.5" fill="#14181F">TCB_Suspend(acceptor)</text>
+<text x="1350" y="177" font-size="9.5" fill="#5A6470">no new connections</text>
+
+<rect x="1338" y="216" width="204" height="66" rx="3" fill="#FBEEDD" stroke="#A85400"/>
+<text x="1350" y="235" font-size="11.5" fill="#14181F">unbind SC from fibers</text>
+<text x="1350" y="250" font-size="9.5" fill="#5A6470">they stop at the next charge</text>
+<text x="1350" y="263" font-size="9.5" fill="#5A6470">point — a defined position,</text>
+<text x="1350" y="276" font-size="9.5" fill="#5A6470">not wherever the OS chose</text>
+<line x1="1440" y1="194" x2="1440" y2="212" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<rect x="1338" y="304" width="204" height="60" rx="3" fill="#F0E8FA" stroke="#6021A8"/>
+<text x="1350" y="323" font-size="11.5" fill="#14181F">grace: SC_cleanup only</text>
+<text x="1350" y="338" font-size="9.5" fill="#5A6470">every live k runs its around</text>
+<text x="1350" y="351" font-size="9.5" fill="#5A6470">exit; nothing else is funded</text>
+<line x1="1440" y1="282" x2="1440" y2="300" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<rect x="1338" y="386" width="204" height="74" rx="3" fill="#E3EAFB" stroke="#1D4ED8"/>
+<text x="1350" y="405" font-size="11.5" fill="#14181F">CNode_Revoke(untyped)</text>
+<text x="1350" y="420" font-size="9.5" fill="#5A6470">recursive delete of every cap</text>
+<text x="1350" y="433" font-size="9.5" fill="#5A6470">derived from the pool: one</text>
+<text x="1350" y="446" font-size="9.5" fill="#5A6470">operation, no straggler set</text>
+<line x1="1440" y1="364" x2="1440" y2="382" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+
+<text x="1338" y="486" font-size="10" fill="#5A6470">No group.await(), no drain</text>
+<text x="1338" y="500" font-size="10" fill="#5A6470">deadline race, no join-and-hope.</text>
+
+<line x1="1338" y1="524" x2="1542" y2="524" stroke="#C3C8CE"/>
+<text x="1338" y="548" font-size="11" font-weight="700" fill="#14181F" letter-spacing="1.4">LEGEND</text>
+
+<rect x="1338" y="566" width="16" height="16" fill="#E3EAFB" stroke="#1D4ED8"/>
+<text x="1362" y="578" font-size="9.5" fill="#5A6470">kernel object</text>
+<text x="1362" y="590" font-size="9" fill="#5A6470">TCB · EP · Notif · Reply · Untyped</text>
+
+<rect x="1338" y="606" width="16" height="16" fill="#FBEEDD" stroke="#A85400"/>
+<text x="1362" y="618" font-size="9.5" fill="#5A6470">scheduling context / budget</text>
+
+<rect x="1338" y="638" width="16" height="16" fill="#F0E8FA" stroke="#6021A8"/>
+<text x="1362" y="650" font-size="9.5" fill="#5A6470">effect · handler · continuation</text>
+
+<rect x="1338" y="670" width="16" height="16" fill="#FBE9E9" stroke="#B01A1A"/>
+<text x="1362" y="682" font-size="9.5" fill="#5A6470">fault / refusal</text>
+
+<rect x="1338" y="702" width="7" height="16" fill="#A85400"/>
+<text x="1362" y="714" font-size="9.5" fill="#5A6470">passive: runs on donated budget</text>
+
+<line x1="1338" y1="742" x2="1378" y2="742" stroke="#14181F" stroke-width="1.4" marker-end="url(#ah)"/>
+<text x="1388" y="746" font-size="9.5" fill="#5A6470">control flow</text>
+
+<line x1="1338" y1="766" x2="1378" y2="766" stroke="#A85400" stroke-width="1.5" marker-end="url(#aha)"/>
+<text x="1388" y="770" font-size="9.5" fill="#5A6470">SC bind / donate</text>
+
+<line x1="1338" y1="790" x2="1378" y2="790" stroke="#6021A8" stroke-width="1.4" marker-end="url(#ahv)"/>
+<text x="1388" y="794" font-size="9.5" fill="#5A6470">effect suspend / resume</text>
+
+<line x1="1338" y1="814" x2="1378" y2="814" stroke="#B01A1A" stroke-width="1.3" stroke-dasharray="3 2" marker-end="url(#ahr)"/>
+<text x="1388" y="818" font-size="9.5" fill="#5A6470">fault IPC</text>
+
+<circle cx="1346" cy="838" r="9" fill="#FBE9E9" stroke="#B01A1A"/>
+<text x="1346" y="842" font-size="9" fill="#B01A1A" text-anchor="middle">a</text>
+<text x="1362" y="842" font-size="9.5" fill="#5A6470">connector break</text>
+
+<line x1="1338" y1="868" x2="1542" y2="868" stroke="#C3C8CE"/>
+<text x="1338" y="892" font-size="11" font-weight="700" fill="#14181F" letter-spacing="1.4">HOSTED DEVIATIONS</text>
+<text x="1338" y="912" font-size="9.5" fill="#5A6470">TCB = stackful fiber on a small</text>
+<text x="1338" y="925" font-size="9.5" fill="#5A6470">pinned pool, not an OS thread —</text>
+<text x="1338" y="938" font-size="9.5" fill="#5A6470">otherwise EEVDF preempts under</text>
+<text x="1338" y="951" font-size="9.5" fill="#5A6470">you and budgets go advisory.</text>
+
+<text x="1338" y="975" font-size="9.5" fill="#5A6470">Budget debited at effect</text>
+<text x="1338" y="988" font-size="9.5" fill="#5A6470">suspension, not on a timer IRQ.</text>
+<text x="1338" y="1001" font-size="9.5" fill="#5A6470">More exact than seL4's; the cost</text>
+<text x="1338" y="1014" font-size="9.5" fill="#5A6470">is you cannot preempt an</text>
+<text x="1338" y="1027" font-size="9.5" fill="#5A6470">effect-free compute loop.</text>
+
+<text x="1338" y="1051" font-size="9.5" fill="#5A6470">Caps are generational indices</text>
+<text x="1338" y="1064" font-size="9.5" fill="#5A6470">with rights bits, not a CNode</text>
+<text x="1338" y="1077" font-size="9.5" fill="#5A6470">walk — same revocation semantics,</text>
+<text x="1338" y="1090" font-size="9.5" fill="#5A6470">one indirection, no MMU benefit</text>
+<text x="1338" y="1103" font-size="9.5" fill="#5A6470">to pay for in a single AS.</text>
+
+<text x="1338" y="1127" font-size="9.5" fill="#B01A1A">Open question: an effect-free</text>
+<text x="1338" y="1140" font-size="9.5" fill="#B01A1A">hot loop in ③ is unbounded.</text>
+<text x="1338" y="1153" font-size="9.5" fill="#B01A1A">Needs a compiler-inserted yield</text>
+<text x="1338" y="1166" font-size="9.5" fill="#B01A1A">or a watchdog fiber after all.</text>
+
+<text x="40" y="1206" font-size="10" fill="#5A6470">Request path: ① N_accept → TCB_acceptor → Retype  ·  ② TCB_conn → passive parser on donated SC_conn  ·  ③ acquire SC_work → passive worker → around/perform/k  ·  ⑤ Reply → write → unbind → keep-alive or close.  ④ observes ②③ by fault IPC only.  ⑥ tears the whole tree down from the untyped root.</text>
+</svg>

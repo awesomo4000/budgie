@@ -1,0 +1,14 @@
+knob,value,tput,p50,p99,ctxsw
+uring_cqe_batch,8,122157.04,1.48ms,2.41ms,40583
+uring_cqe_batch,16,119697.68,1.50ms,2.37ms,44056
+uring_cqe_batch,32,124452.64,1.43ms,2.44ms,45046
+io_bufs,32,131686.85,168.00us,276.00us,88615
+io_bufs,128,126565.63,1.41ms,2.16ms,48297
+io_bufs,512,129749.29,1.39ms,1.96ms,46913
+io_bufs,1024,127745.79,1.40ms,2.06ms,45961
+io_bufs,4096,125997.13,1.42ms,2.25ms,46116
+quantum_units,16,126450.83,1.40ms,2.33ms,47174
+quantum_units,64,126073.23,1.42ms,2.18ms,46628
+quantum_units,250,126377.85,1.41ms,2.05ms,48199
+quantum_units,1000,126221.56,1.41ms,2.30ms,45639
+quantum_units,4000,126981.83,1.41ms,2.09ms,47470

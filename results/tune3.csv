@@ -1,0 +1,8 @@
+knob,value,tput,p50,p99,ctxsw,non2xx
+io_bufs,32,134801.39,165.00us,265.00us,86260,0
+io_bufs,128,126283.31,1.41ms,2.23ms,45029,0
+io_bufs,1024,123562.73,1.43ms,2.46ms,48674,0
+quantum_units@work200,16,63787.41,3.71ms,6.18ms,642,0
+quantum_units@work200,64,66107.53,3.63ms,6.27ms,778,0
+quantum_units@work200,250,67716.41,3.50ms,6.17ms,770,0
+quantum_units@work200,1000,66026.19,3.59ms,6.39ms,757,0

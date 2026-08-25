@@ -1,0 +1,13 @@
+knob,value,tput,p50,p99,ctxsw
+uring_buf_size,256,118875.66,1.45ms,2.89ms,45196
+uring_buf_size,512,125995.52,1.40ms,2.42ms,49031
+uring_buf_size,1024,125384.37,1.41ms,2.44ms,47930
+uring_buf_size,2048,127697.94,1.40ms,2.03ms,47777
+uring_buf_size,4096,127407.62,1.40ms,2.01ms,47628
+uring_buf_size,16384,129906.94,1.39ms,2.07ms,48086
+uring_cqe_batch,1,108763.97,1.84ms,3.23ms,2294
+uring_cqe_batch,4,124029.28,1.49ms,2.58ms,23770
+uring_cqe_batch,16,,,,
+uring_cqe_batch,64,125300.38,1.43ms,2.13ms,45648
+uring_cqe_batch,256,125473.88,1.42ms,2.23ms,44194
+uring_cqe_batch,512,124221.54,1.43ms,2.33ms,46206
