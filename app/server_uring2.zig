@@ -1083,7 +1083,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     std.debug.print(
-        "\nsteps={d} accepted={d} served={d} epoll_waits={d} avg_armed={d} rearms={d}\n",
+        "\nsteps={d} accepted={d} served={d} reactor_waits={d} avg_armed={d} rearms={d}\n",
         .{ a.steps, a.accepted, a.served, a.r.waits, if (a.r.waits > 0) a.r.fds_polled / a.r.waits else 0, a.s.rearms },
     );
     std.debug.print("data: on_data={d} dropped={d} parsed={d} pipelined_kept={d} stashed={d} deferred={d} backpressure={d} held_now={d}\n", .{ a.on_data, a.data_dropped, a.reqs_parsed, a.pipelined_kept, a.data_stashed, a.stash_overflow, a.backpressure_events, a.r.held });
@@ -1139,7 +1139,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         });
     }
     std.debug.print("{s:<12} {s:>10} {s:>12} {d:>12}\n", .{ "wall", "", "", wall_ns });
-    std.debug.print("{s:<12} {s:>10} {s:>12} {d:>12}   <- charges no units: syscalls, epoll_wait, scheduler ({d:.1}%)\n", .{
+    std.debug.print("{s:<12} {s:>10} {s:>12} {d:>12}   <- charges no units: syscalls, reactor wait, scheduler ({d:.1}%)\n", .{
         "UNACCOUNTED", "", "", unacc,
         100.0 * @as(f64, @floatFromInt(unacc)) / @as(f64, @floatFromInt(wall_ns)),
     });

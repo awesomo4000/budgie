@@ -302,21 +302,32 @@ Known gaps:
   not built.
 - The benches still speak raw Linux syscalls and have not been ported, so load
   generation on macOS needs an external tool such as `wrk`.
-- `IORING_REGISTER_PBUF_RING` is rejected with `EINVAL` on Ubuntu's
-  6.8.0-136 kernel, which takes `server_uring2` and `gen` with it since both
-  need a provided buffer ring. Everything around it works, which is what
-  makes it odd. On the same ring: `io_uring_setup` reports every feature bit
-  (`0x3fff`); `REGISTER_FILES`, `REGISTER_BUFFERS`, `REGISTER_PROBE` and
-  `REGISTER_IOWQ_MAX_WORKERS` all succeed; and `REGISTER_PROBE` reports
-  `PROVIDE_BUFFERS`, `RECV` and `POLL_ADD` as supported, up to `last_op=54`.
-  Only the ring registration fails, and it fails for a hand-built, zeroed,
-  page-aligned struct -- verified 40 bytes with the right field offsets and
-  opcode 22 -- at every entry count, both buffer group ids, and both the
-  user-allocated and `IOU_PBUF_RING_MMAP` paths. The pre-port commit fails
-  identically, so it predates this work and is not a regression. Cause
-  unknown; it looks like kernel policy rather than anything in this code. The
-  completion reactor is therefore unexercised on that host and the io_uring
-  figures below are the original ones, not re-measured.
+- **Ubuntu 6.8.0-136 has an inverted check in `io_register_pbuf_ring`.** It
+  returns `EINVAL` when the `io_uring_buf_reg` reserved fields are correctly
+  zeroed, and succeeds when they are not -- so every spec-compliant io_uring
+  program, liburing and Zig's standard library included, is unable to
+  register a provided buffer ring on that kernel. That takes `server_uring2`
+  and `gen` with it, since both depend on one.
+
+  This was traced rather than guessed. A `kretprobe` shows
+  `io_register_pbuf_ring` entered and returning `-22` before `io_pin_pages`
+  is ever reached, so it fails in the early validation block. Disassembling
+  the function from `/proc/kcore` shows `memchr_inv(&resv, 0, 24)` followed
+  by a `je` into the `EINVAL` path -- taken precisely when the reserved
+  fields are all zero. Directly: `resv` zeroed gives `EINVAL`, `resv[0]=1`
+  gives `SUCCESS`, and the result does not depend on ordering or buffer group
+  id. Everything around it is healthy -- `io_uring_setup` reports every
+  feature bit, `REGISTER_FILES`/`REGISTER_BUFFERS`/`REGISTER_PROBE`/
+  `REGISTER_IOWQ_MAX_WORKERS` all succeed, and `REGISTER_PROBE` reports
+  `PROVIDE_BUFFERS`, `RECV` and `POLL_ADD` supported up to `last_op=54`.
+
+  The completion reactor itself is fine. Patched past the bad check locally
+  -- not committed, since writing junk into a reserved field is only correct
+  against a kernel this broken -- `server_uring2` serves 1,102,349 requests
+  at **91.9k req/s** against epoll's 67-81k on the same two cores, with
+  multishot recv rearming cleanly, `enobufs=0`, and buffer acquires equal to
+  releases. So the io_uring advantage the table below claims does reproduce;
+  it is the kernel, not the reactor, that is broken here.
 - Tasks are hand-rolled state machines, not fibers. No `perform` / `around`.
 - io_uring completion build no longer *fails* at depth, but does not scale with
   it: 44-53k req/s from depth 32 to 256, flat, while epoll climbs 66k -> 198k.
