@@ -2,3 +2,6 @@ x/
 .zig-cache/
 zig-out/
 .DS_Store
+
+# full-size logo source; the 400px img/logo.png is what the README uses
+img/budgie-logo.png

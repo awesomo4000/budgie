@@ -1,5 +1,7 @@
 # coopkernel
 
+<img src="img/logo.png" alt="coopkernel" width="180" align="right">
+
 A single-threaded cooperative kernel in userspace, written in Zig 0.16, built
 in one session as an exploration of seL4-style scheduling ideas applied to a
 hosted async runtime.
