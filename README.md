@@ -302,7 +302,10 @@ Known gaps:
   not built.
 - The benches still speak raw Linux syscalls and have not been ported, so load
   generation on macOS needs an external tool such as `wrk`.
-- **Ubuntu 6.8.0-136 has an inverted check in `io_register_pbuf_ring`.** It
+- **Ubuntu 6.8.0-136 has an inverted check in `io_register_pbuf_ring`**
+  ([Launchpad #2162843](https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2162843),
+  reported independently, affecting 6.8.0-136 and -137; 6.8.0-134 and
+  mainline are fine). It
   returns `EINVAL` when the `io_uring_buf_reg` reserved fields are correctly
   zeroed, and succeeds when they are not -- so every spec-compliant io_uring
   program, liburing and Zig's standard library included, is unable to
@@ -320,6 +323,21 @@ Known gaps:
   feature bit, `REGISTER_FILES`/`REGISTER_BUFFERS`/`REGISTER_PROBE`/
   `REGISTER_IOWQ_MAX_WORKERS` all succeed, and `REGISTER_PROBE` reports
   `PROVIDE_BUFFERS`, `RECV` and `POLL_ADD` supported up to `last_op=54`.
+
+  The cause is a botched backport of upstream commit `1724849`
+  ("io_uring/kbuf: use mem_is_zero()"), which rewrote
+  `if (reg.resv[0] || reg.resv[1] || reg.resv[2])` as
+  `if (!mem_is_zero(reg.resv, sizeof(reg.resv)))`. Since `mem_is_zero()` is
+  `memchr_inv(s, 0, n) == NULL`, upstream compiles to a `jne` into the
+  `EINVAL` path; the shipped kernel has a `je`, so the `!` was lost on the
+  way in. The Launchpad reporter suspected that commit; the disassembly above
+  is what confirms it.
+
+  There is no fix released as of this writing. The remedies are to run
+  6.8.0-134 or a mainline kernel. Working around it in userspace means
+  writing a non-zero value into a reserved field, which is correct only
+  against a kernel carrying this bug and rejected by every correct one, so
+  this project does not do it.
 
   The completion reactor itself is fine. Patched past the bad check locally
   -- not committed, since writing junk into a reserved field is only correct
