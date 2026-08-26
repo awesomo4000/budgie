@@ -4,31 +4,31 @@
 
 An experiment: build an async runtime by copying the architecture of a microkernel instead of the architecture of a promise library.
 
-## The observation
+## Observations about runtimes
 
-Stare at an async runtime long enough and it starts to look like an operating system. An asynchronous runtime divides a program into small pieces so that they can run in any order, which allows concurrent execution of those pieces and gives a program the ability to multiplex many operations at once. That freedom to run pieces as separate tasks is also what allows parallelism, by executing the pieces on different threads.
+If you stare at an asynchronous runtime system long enough it begins  to look like a small operating system. An asynchronous runtime divides a program into small pieces so that they can run in any order, which allows concurrent execution of those pieces and gives a program the ability to multiplex many operations at once. That freedom to run pieces as separate tasks is also what allows parallelism, by executing the pieces on different threads.
 
-Both multiplex reads and writes over many descriptors at once, so that no descriptor gets a thread of its own to block. Both run computation over whatever arrives, in pieces, without knowing in advance which piece comes next. Both keep a pile of independent handlers alive at once and switch between them. Both have background work that should happen when nothing more urgent wants the machine. And both, at the bottom, answer the same question a few million times a second: given everything that could run right now, what runs next?
+Numerous asynchronous systems exist, with different features, execution models, and multiplexing methods. A runtime handles tasks such as managing network and file descriptors, timers, background tasks, long running cpu bound tasks, and signals. These features must also work across differing event models such as "readiness-based" events, as well as "completion based" events.
 
-The piece that decides what should run is a scheduler. In many async runtimes we do not call it that. We call it an executor, a reactor, a task queue, or a disruptor, and we give it an API shaped like function calls so it feels like ordinary code. The kernel underneath is real either way. It is simply undocumented, and it usually has no notion of a budget, so a task that runs long stops every other task on that thread, and the runtime has no mechanism to detect it or account for it.
+Perhaps the most important consideration that a runtime makes many thousands of times per second is: given everything that could run right now, what runs next?
+
+The piece that decides what should run is a scheduler. In many async runtimes we do not call it that. We call it an executor, a reactor, a task queue, or a disruptor, and we give it an API shaped like function calls so it feels like ordinary code. The kernel underneath is real either way. 
 
 ## The idea
 
 Operating systems people have been at this for fifty years, and one branch of that work went somewhere unusual. seL4 is a microkernel small enough that its implementation has been proved to match its specification. It flies drones and sits inside medical devices. It is about ten thousand lines.
 
-The thought that started this project was to open the hood of one of those, lift the engine out, and drop it into an ordinary userspace process as an async runtime.
+The thought that started this project was to open the hood of seL4, look at its architecture, and attempt to use its ideas and constructions to form an asynchronous runtime usable in ordinary user processes on common operating systems. We're experimenting with the seL4 architecture and primitives.
 
-The proofs do not come along. They belong to seL4's specification and do not survive being lifted out of it. What does transplant is the shape, and seL4's shape is unusual in two ways worth stealing.
-
-A thread there gets a *scheduling context*: a budget and a period. The kernel enforces the thread from those two numbers and knows nothing else about it. Memory comes from untyped capabilities the process carves up itself, and the kernel tracks the derivation tree while the meaning of the memory stays with whoever asked for it. In both cases the kernel holds an accounting structure and refuses to hold a semantic one.
+In seL4, a "thread" there gets a *scheduling context*: a budget and a period. The kernel enforces the thread's scheduling using those two numbers, and maintains separation so that the kernel does not know much else about the thread. Memory comes from "untyped capabilities" that the process can use, while the kernel tracks the derivation tree of memory, and keeps the meaning of the memory with the requestor who asked for it. In both cases the kernel holds an accounting structure, but not a semantic one.
 
 Apply that to a runtime and you get a scheduler whose entire vocabulary is task ids, priorities, budgets, deadlines, and a cancel bit. It holds no file descriptors, performs no syscalls, and cannot read the clock. It has no representation of a request, a connection, or a protocol.
 
-## Whether that is a good idea
+## Good idea?
 
-I do not know yet. That is what building it was for.
+I do not know yet. That is what building this project is for.
 
-The honest description of what is here is a cooperative scheduler with budgets and cancellation, deliberately kept ignorant of I/O, plus a reactor that knows about I/O and nothing about scheduling policy. It runs on one thread, and nothing about it has been verified. Calling it a kernel is a claim about how the pieces are arranged and about nothing else.
+What is here is a "I/O free" cooperative scheduler with budgets and cancellation, and a reactor that does know about I/O and nothing about scheduling policy. The arrangement of the pieces here is similar in architure to a microkernel.
 
 What I wanted was a read on how it *feels* to write programs this way, next to the alternatives:
 
@@ -37,7 +37,7 @@ What I wanted was a read on how it *feels* to write programs this way, next to t
 - **BEAM processes** are the closest relative and got there decades earlier: isolation, preemption, supervision trees. Erlang solved the runaway task by preempting it. This meters instead, and stays cooperative, which is a weaker guarantee bought at a lower price.
 - **Zig's `std.Io`** threads an explicit `Io` through every caller, a different and defensible answer to the same question about who owns effects.
 
-Against those, what differs here is that a budget is a number the scheduler holds, so an overrun is something the runtime measures rather than something the application is trusted to avoid. Whether that is worth the extra bookkeeping is the open question. `docs/LESSONS.md` is the running record.
+Against those, what differs here is that a budget is a number the scheduler holds, so a budget overrun is something the runtime measures.
 
 ## What it looks like to use
 
@@ -51,28 +51,53 @@ while (true) {
 }
 ```
 
-A task is a state machine the scheduler hands control to. It runs until it would block, parks itself against a descriptor, and returns:
+The `s` and `r` used above are the two values the program owns, declared once at file scope, along with whatever state the application keeps per task:
+
+```zig
+var s: sched.Sched = .{};                        // the scheduler
+var r: Reactor = .{};                            // epoll or kqueue, chosen at compile time
+var conns: [max_conns + 1]Conn = @splat(.{});    // this program's own per-task state
+```
+
+A task is a state machine the scheduler hands control to. A task is formed by initializing the pieces it needs:
+
+```zig
+const t = freeTask() orelse { sys.close(fd); break; };
+
+conns[t] = .{ .fd = fd };   // the application's state for this task
+s.live[t] = true;           // the scheduler will now consider it
+s.setPrio(t, 2);            // below the listener, above background work
+s.admit(t, 1000, 50);       // 1000 units of budget, 50 held back for cleanup
+r.open(t);                  // the reactor starts accounting for it
+r.watch(t, fd, .read);      // park it until the descriptor is readable
+```
+
+There is no task object here, and no allocation. `t` is a small integer, and each of those calls writes into a table indexed by it. The scheduler holds the budget, the priority and the deadline. The reactor holds the descriptor and the byte accounting. `conns` holds whatever this particular program needs, and the scheduler never looks at it. Ending a task is those same lines in reverse, which is what `finish` does below.
+
+Once admitted, a task runs until it would block, parks itself against a descriptor, and returns:
 
 ```zig
 fn step(t: TaskId) void {
+    if (t == listener_task) return accept();     // task 0 is the listener
     const c = &conns[t];
+    if (c.writing) return write(t, c);           // mid-response, finish it
+    if (drain(t, c)) return;                     // a request may already be buffered
+
     const n = r.read(t, c.fd, c.in[c.in_len..]);
     if (n < 0) return r.watch(t, c.fd, .read);   // would block, park again
     if (n == 0) return finish(t, c);             // peer hung up
     c.in_len += @intCast(n);
 
-    const used = c.parser.feed(c.in[0..c.in_len]);
-    consume(c, used);                            // keep any pipelined remainder
-
-    switch (c.parser.poll()) {
-        .need_input => r.watch(t, c.fd, .read),
-        .protocol_error => finish(t, c),
-        .request => |req| respond(t, c, req),
-    }
+    if (drain(t, c)) return;
+    r.watch(t, c.fd, .read);                     // parser wants more bytes
 }
 ```
 
-Two things in there are load-bearing and easy to miss.
+That is the whole function, copied out of `examples/echo.zig`. `drain` feeds whatever is buffered to the parser and returns true if the connection changed phase. `respond` formats into `c.out` and then calls `s.makeRunnable(t, .spawn)` rather than parking, because it has work to do and needs a turn rather than a wakeup. `write` empties `c.out` and parks on `.write` if the socket fills. `finish` unwatches, releases the budget, and closes the descriptor.
+
+The `drain` before the read is the part worth pausing on. A pipelined client sends its next request without waiting for the previous answer, so `c.in` can already hold a complete request that no amount of further reading will announce. Calling `read` first gets `EAGAIN`, parks the task on `.read`, and the connection stalls until the peer sends something else or gives up. I had this wrong until testing four pipelined requests returned one answer.
+
+Two things in there are important to notice:
 
 `r.read` is the *reactor's* call, not the task's. A readiness reactor that hands out `watch` and lets the application do the read never learns how many bytes anyone consumed, so any fairness policy has to live somewhere else and coordinate with it. Six attempts came apart that way before the read moved inside. Now the reactor sees the byte count, so it owns the accounting and the arming together, and a pause happens in the same code that will resume it.
 

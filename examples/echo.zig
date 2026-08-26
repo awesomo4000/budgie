@@ -64,8 +64,12 @@ pub fn main() !void {
         // 2. Block until an fd is ready or a deadline comes due.
         _ = r.wait(&s, 1000);
         // 3. Fire expired timers.
-        s.expire(std.time.ns_per_ms);
+        s.expire(nowMs());
     }
+}
+
+fn nowMs() i64 {
+    return @divTrunc(budgie.clock.monotonicNs(), 1_000_000);
 }
 
 fn step(t: TaskId) void {
@@ -73,32 +77,57 @@ fn step(t: TaskId) void {
 
     const c = &conns[t];
     if (c.writing) return write(t, c);
+    if (drain(t, c)) return; // a pipelined request may already be buffered
 
     const n = r.read(t, c.fd, c.in[c.in_len..]);
     if (n < 0) return r.watch(t, c.fd, .read); // would block; park again
     if (n == 0) return finish(t, c); // peer hung up
     c.in_len += @intCast(n);
 
+    if (drain(t, c)) return;
+    r.watch(t, c.fd, .read); // parser wants more bytes
+}
+
+/// Feed whatever is buffered to the parser, keeping any remainder. Returns
+/// true if the connection changed phase and this turn is over.
+///
+/// This runs before the read, not only after it. A pipelined client sends the
+/// next request without waiting for the previous answer, so `c.in` can already
+/// hold a complete request that no amount of further reading will announce.
+fn drain(t: TaskId, c: *Conn) bool {
+    if (c.in_len == 0) return false;
+
     const used = c.parser.feed(c.in[0..c.in_len]);
     std.mem.copyForwards(u8, c.in[0 .. c.in_len - used], c.in[used..c.in_len]);
     c.in_len -= used;
 
     switch (c.parser.poll()) {
-        .need_input => r.watch(t, c.fd, .read),
-        .protocol_error => finish(t, c),
+        .need_input => return false,
+        .protocol_error => {
+            finish(t, c);
+            return true;
+        },
         .request => |req| {
-            c.out_len = (std.fmt.bufPrint(
-                &c.out,
-                "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}",
-                .{ body.len, body },
-            ) catch return finish(t, c)).len;
-            _ = req; // a real server would look at req.target here
-            c.out_sent = 0;
-            c.writing = true;
-            c.parser.reset();
-            s.makeRunnable(t, .spawn);
+            respond(t, c, req);
+            return true;
         },
     }
+}
+
+/// Format the answer and hand the task back to the scheduler. No I/O happens
+/// here, so the task is made runnable rather than parked: it has work to do
+/// and needs a turn, not a wakeup.
+fn respond(t: TaskId, c: *Conn, req: http.Request) void {
+    _ = req; // a real server would look at req.target here
+    c.out_len = (std.fmt.bufPrint(
+        &c.out,
+        "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ body.len, body },
+    ) catch return finish(t, c)).len;
+    c.out_sent = 0;
+    c.writing = true;
+    c.parser.reset();
+    s.makeRunnable(t, .spawn);
 }
 
 fn write(t: TaskId, c: *Conn) void {
@@ -106,8 +135,15 @@ fn write(t: TaskId, c: *Conn) void {
     if (sys.sysErr(rc)) return r.watch(t, c.fd, .write);
     c.out_sent += rc;
     if (c.out_sent < c.out_len) return r.watch(t, c.fd, .write);
-    c.writing = false; // keep-alive: go back to reading
-    r.watch(t, c.fd, .read);
+    c.writing = false;
+
+    // A pipelined client sends the next request without waiting for this
+    // answer, so `step` may already have left one sitting in `c.in`. Parking
+    // on `.read` here would wait for bytes that have already arrived, and the
+    // connection would stall until the peer sent something else or gave up.
+    if (c.in_len > 0) return s.makeRunnable(t, .spawn);
+
+    r.watch(t, c.fd, .read); // keep-alive: wait for the next request
 }
 
 fn accept() void {
