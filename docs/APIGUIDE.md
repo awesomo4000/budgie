@@ -9,9 +9,7 @@ http.zig      bytes -> events                                 (no fd, no allocat
 server*.zig   drives all three
 ```
 
-The separation is load-bearing: `sched.zig` was byte-identical across a poll
-port, an epoll port, an io_uring readiness port and an io_uring completion
-port.
+The separation is load-bearing: `sched.zig` was byte-identical across a poll port, an epoll port, an io_uring readiness port and an io_uring completion port.
 
 ---
 
@@ -30,10 +28,7 @@ _ = a.r.wait(&a.s, timeout);                  // reactor marks tasks runnable
 a.s.expire(a.clock.ms());
 ```
 
-The completion-mode server (`server_uring2.zig`) adds an inner loop that
-alternates "convert completions into work" and "drain the work" until neither
-remains, and only then blocks. Getting that order wrong costs a syscall per
-request — see LESSONS.md.
+The completion-mode server (`server_uring2.zig`) adds an inner loop that alternates "convert completions into work" and "drain the work" until neither remains, and only then blocks. Getting that order wrong costs a syscall per request — see LESSONS.md.
 
 ---
 
@@ -54,8 +49,7 @@ s.admit(id, cap, reserve);        // cap is the PER-REQUEST ceiling
 s.release(id);                    // invalidates every outstanding token
 ```
 
-`admit` sets `budget = 0`. Units only ever enter a task through `topUp`, so the
-supervisor tree stays conservative.
+`admit` sets `budget = 0`. Units only ever enter a task through `topUp`, so the supervisor tree stays conservative.
 
 ### Runnability
 
@@ -67,8 +61,7 @@ s.reasonFor(id) Wake;             // why this task woke
 s.runnableAbove(class) bool;
 ```
 
-Dispatch is by priority; budget bounds the turn. Both must pass: a task runs
-iff its class is the highest non-empty **and** it has budget.
+Dispatch is by priority; budget bounds the turn. Both must pass: a task runs iff its class is the highest non-empty **and** it has budget.
 
 > **Gotcha.** In a single-threaded cooperative runtime, budget is the *only*
 > mechanism that makes a task stop being runnable, and being not-runnable is
@@ -99,8 +92,7 @@ Three distinct levels, and they answer different questions:
 | `budget` | the grant currently held |
 | supervisor | a whole class, across all its tasks |
 
-Only the third can express "all connections together may spend X per period",
-and that is not derivable from per-task fields.
+Only the third can express "all connections together may spend X per period", and that is not derivable from per-task fields.
 
 > **Gotcha.** `sup_of` defaults to the **root** supervisor, and an explicit
 > `no_sup` is a denial. An earlier version treated `no_sup` as *unmetered*, so
@@ -119,13 +111,10 @@ s.isCancelled(id) bool;
 
 `cancel` does two independent things:
 
-- **safety** — `budget = 0` and `cap = 0`, so the task structurally cannot do
-  more body work even if the app's handling is buggy. The reserve is untouched.
-- **liveness** — `makeRunnable(.cancelled)`, so a task parked in epoll notices
-  now rather than at its deadline.
+- **safety** — `budget = 0` and `cap = 0`, so the task structurally cannot do more body work even if the app's handling is buggy. The reserve is untouched.
+- **liveness** — `makeRunnable(.cancelled)`, so a task parked in epoll notices now rather than at its deadline.
 
-Sticky, idempotent, and **not a value anything can swallow**. The check belongs
-in `run()`, unconditionally, before the phase dispatch:
+Sticky, idempotent, and **not a value anything can swallow**. The check belongs in `run()`, unconditionally, before the phase dispatch:
 
 ```zig
 if (c.phase != .cleanup) {
@@ -148,12 +137,9 @@ s.timeoutMs(now) ?i64; // how long the caller may block
 s.expire(now);         // fire everything due
 ```
 
-Single-level timer wheel, `wheel_slots` buckets at 1 ms, intrusive nodes in the
-task array, occupancy bitmap so "when is the next timer" skips empty buckets 64
-at a time. An overflow list handles deadlines beyond one revolution.
+Single-level timer wheel, `wheel_slots` buckets at 1 ms, intrusive nodes in the task array, occupancy bitmap so "when is the next timer" skips empty buckets 64 at a time. An overflow list handles deadlines beyond one revolution.
 
-Because arm/disarm are O(1) with no stale entries, no slack window is needed.
-The heap version this replaced discarded 500,532 stale entries in one run.
+Because arm/disarm are O(1) with no stale entries, no slack window is needed. The heap version this replaced discarded 500,532 stale entries in one run.
 
 > **Gotcha.** Sweep the overflow list *before* the fire loop, and fire directly
 > rather than relinking when an entry is already due — relinking a past-due
@@ -170,15 +156,9 @@ s.chargeTo(id, .parse, units);   // ENFORCED, deterministic
 s.observe(.parse, ns);           // OBSERVED, never read by control flow
 ```
 
-Units enforce so budget exhaustion lands at the identical point on every
-replay. Nanoseconds calibrate units to latency, detect drift in ns-per-unit,
-and — most usefully — expose wall time that charges nothing at all. In a
-typical run that unaccounted fraction is **96%**: syscalls, the reactor, the
-scheduler. That is the number that tells you tightening budgets will not find
-your next win.
+Units enforce so budget exhaustion lands at the identical point on every replay. Nanoseconds calibrate units to latency, detect drift in ns-per-unit, and — most usefully — expose wall time that charges nothing at all. In a typical run that unaccounted fraction is **96%**: syscalls, the reactor, the scheduler. That is the number that tells you tightening budgets will not find your next win.
 
-Measured cost of carrying the ns currency: none. 212,654 req/s with it,
-198,905 without.
+Measured cost of carrying the ns currency: none. 212,654 req/s with it, 198,905 without.
 
 ---
 
@@ -193,8 +173,7 @@ r.watching(task) bool;
 r.wait(&sched, timeout_ms) usize;   // marks ready tasks runnable
 ```
 
-`reactor_uring2.zig` adds a completion queue, because it reports data rather
-than readiness:
+`reactor_uring2.zig` adds a completion queue, because it reports data rather than readiness:
 
 ```zig
 r.armRecv(task, fd);          // ONE multishot submission per connection lifetime
@@ -203,10 +182,7 @@ r.next() ?Completion;         // { task, kind: data|eof|err|writable|sent, data 
 r.release(comp);
 ```
 
-That is the interface break worth knowing about before committing to an effect
-vocabulary: **`perform Read(fd, buf) -> n` maps onto readiness and cannot
-express submit-N/complete-N.** A completion-based runtime wants
-`perform Recv() -> (buf, len)`, where the buffer comes *from* the operation.
+That is the interface break worth knowing about before committing to an effect vocabulary: **`perform Read(fd, buf) -> n` maps onto readiness and cannot express submit-N/complete-N.** A completion-based runtime wants `perform Recv() -> (buf, len)`, where the buffer comes *from* the operation.
 
 ### Completion keys must be generational
 
@@ -215,32 +191,20 @@ const gen_shift: u6 = 20;
 fn key(tag: u64, task: TaskId, gen: u32) u64;
 ```
 
-A completion can be queued before the task that owns it is released. If the
-slot is reused first, its bytes are delivered to whoever inherited it. On Linux
-that needs a close/reuse race; **on IOCP it is the normal shutdown path**,
-because `CancelIoEx` does not complete synchronously and a cancelled `WSARecv`
-still posts a completion with `ERROR_OPERATION_ABORTED`. Costs nothing
-measurable; A/B was within noise.
+A completion can be queued before the task that owns it is released. If the slot is reused first, its bytes are delivered to whoever inherited it. On Linux that needs a close/reuse race; **on IOCP it is the normal shutdown path**, because `CancelIoEx` does not complete synchronously and a cancelled `WSARecv` still posts a completion with `ERROR_OPERATION_ABORTED`. Costs nothing measurable; A/B was within noise.
 
 ### What "unfair" actually turned out to mean
 
-The fairness work below was chasing a badly chosen metric, and the correction is
-worth reading before any of it.
+The fairness work below was chasing a badly chosen metric, and the correction is worth reading before any of it.
 
-**Share of total requests served is not a fairness metric** when clients differ
-in concurrency. A client with 256 requests in flight completes more than one
-with 1 in flight; that is Little's Law, not starvation. Measured, polite
-(depth 1) against greedy (depth 256), fairness OFF:
+**Share of total requests served is not a fairness metric** when clients differ in concurrency. A client with 256 requests in flight completes more than one with 1 in flight; that is Little's Law, not starvation. Measured, polite (depth 1) against greedy (depth 256), fairness OFF:
 
 ```
 polite   20,964 req/s   p50  0.327ms   p99  19.9ms
 greedy  124,590 req/s   p50 15.97ms    p99 101.7ms
 ```
 
-The "starved" client has **48x better median latency**. It is served in ~0.3ms
-every time it asks; it simply asks less often. And enabling the fairness cap
-drives the greedy client's p50 to 102ms to move a share number that was not
-measuring service quality.
+The "starved" client has **48x better median latency**. It is served in ~0.3ms every time it asks; it simply asks less often. And enabling the fairness cap drives the greedy client's p50 to 102ms to move a share number that was not measuring service quality.
 
 The right question is whether the greedy client HARMS the polite one:
 
@@ -249,8 +213,7 @@ polite alone      91,970 req/s   p50 0.280ms   p99  1.09ms
 polite + greedy   17,141 req/s   p50 0.389ms   p99 19.10ms
 ```
 
-p50 is essentially unaffected. The real harm is the **tail**, and it is not
-queueing behind the other client's work -- it is the drain bound:
+p50 is essentially unaffected. The real harm is the **tail**, and it is not queueing behind the other client's work -- it is the drain bound:
 
 ```
 tick    40ms  20ms  10ms   5ms   2ms
@@ -258,96 +221,49 @@ p99     23.5  19.7  10.6   6.7   5.0    bounded_drain=1
 p99     23.5    --    --    --  22.6    bounded_drain=0
 ```
 
-Almost linear with the tick, and flat without the drain bound. `bounded_drain`
-is the mechanism, the tick is its resolution, and raw throughput is unchanged
-across the whole range (91-103k). **The default tick is now 2ms**, which takes
-the competing client's p99 from ~19.7ms to ~5ms and raises its throughput too.
+Almost linear with the tick, and flat without the drain bound. `bounded_drain` is the mechanism, the tick is its resolution, and raw throughput is unchanged across the whole range (91-103k). **The default tick is now 2ms**, which takes the competing client's p99 from ~19.7ms to ~5ms and raises its throughput too.
 
-One knob, already present, no new machinery -- against a fairness subsystem that
-cost six failed attempts and 30k req/s.
+One knob, already present, no new machinery -- against a fairness subsystem that cost six failed attempts and 30k req/s.
 
 ### Byte fairness as a passive server (reactor client table)
 
-The reactor keeps a PRIVATE per-client table -- deficit, throttled, backlogged
--- and owns the `read`. That single change is what made byte fairness work on
-epoll after six failures with a shared `drr.zig`.
+The reactor keeps a PRIVATE per-client table -- deficit, throttled, backlogged -- and owns the `read`. That single change is what made byte fairness work on epoll after six failures with a shared `drr.zig`.
 
 Two things had to be true, and only the second is obvious in hindsight:
 
-**1. One owner.** A readiness reactor that hands out `watch` and lets the
-caller read has no idea how much anyone consumed, so accounting lived in the
-application and enforcement (arming) lived in the reactor. Neither owned "has a
-round elapsed", which is why every round policy failed differently. Now the
-reactor does the syscall, so it sees the bytes, so it owns both halves. Pause
-and resume cannot race because they are the same code.
+**1. One owner.** A readiness reactor that hands out `watch` and lets the caller read has no idea how much anyone consumed, so accounting lived in the application and enforcement (arming) lived in the reactor. Neither owned "has a round elapsed", which is why every round policy failed differently. Now the reactor does the syscall, so it sees the bytes, so it owns both halves. Pause and resume cannot race because they are the same code.
 
-**2. A round rate the quantum cannot influence.** Advancing a round when the
-loop is about to block makes the rate a function of pending work, which is a
-function of the quantum -- the knob cancels itself. Measured with the reactor
-already owning everything: quantum 1024 -> 16384 moved `rounds` 1088 -> 305 and
-the fairness share not at all (6-10% throughout). Advancing on the TICK gives
-`quantum / tick_period`, which is controllable.
+**2. A round rate the quantum cannot influence.** Advancing a round when the loop is about to block makes the rate a function of pending work, which is a function of the quantum -- the knob cancels itself. Measured with the reactor already owning everything: quantum 1024 -> 16384 moved `rounds` 1088 -> 305 and the fairness share not at all (6-10% throughout). Advancing on the TICK gives `quantum / tick_period`, which is controllable.
 
-Measured, polite(32 conns, depth 1) vs greedy(32 conns, depth 256), four
-interleaved trials each:
+Measured, polite(32 conns, depth 1) vs greedy(32 conns, depth 256), four interleaved trials each:
 
 ```
 off  8.4%  7.8%  6.3%  5.9%
 on  37.9% 37.7% 37.7% 37.6%     (quantum 1024, tick 20ms)
 ```
 
-Ranges nowhere near overlapping, and the "on" numbers are stable to one decimal
-place -- `throttles` and `resumes` match exactly every run. Throughput cost
-91.5k -> 89.2k.
+Ranges nowhere near overlapping, and the "on" numbers are stable to one decimal place -- `throttles` and `resumes` match exactly every run. Throughput cost 91.5k -> 89.2k.
 
-Not yet 50%: the greedy client is rate-capped at `quantum/tick` while the
-polite one is under its cap and unconstrained, so this is a cap rather than a
-proportional share.
+Not yet 50%: the greedy client is rate-capped at `quantum/tick` while the polite one is under its cap and unconstrained, so this is a cap rather than a proportional share.
 
-**Self-tuning was attempted (`drr_quantum=-1`) and is not usable.** It reaches a
-fair share -- 48.3%, stable to 0.1 across trials -- and pays 15x throughput for
-it: 6.3k req/s against 97.8k unthrottled and 74k at a fixed quantum of 1024.
+**Self-tuning was attempted (`drr_quantum=-1`) and is not usable.** It reaches a fair share -- 48.3%, stable to 0.1 across trials -- and pays 15x throughput for it: 6.3k req/s against 97.8k unthrottled and 74k at a fixed quantum of 1024.
 
-The blocker is **work conservation**, not the estimator. Every client is
-credited `quantum` per tick whether it wants it or not, and unused allowance is
-discarded rather than redistributed, so a polite client leaves most of its share
-on the floor and nobody picks it up. Dividing by the demanding set instead of by
-every client is the obvious fix and did not move the number, which says
-redistribution has to happen WITHIN a round rather than by adjusting the divisor
-between rounds.
+The blocker is **work conservation**, not the estimator. Every client is credited `quantum` per tick whether it wants it or not, and unused allowance is discarded rather than redistributed, so a polite client leaves most of its share on the floor and nobody picks it up. Dividing by the demanding set instead of by every client is the obvious fix and did not move the number, which says redistribution has to happen WITHIN a round rather than by adjusting the divisor between rounds.
 
 Three estimator bugs were found and fixed on the way, each worth avoiding:
 
-* **peak-hold on a bursty signal** latches 10-30x above the mean -- quantum came
-  out at 1670-6920 where ~170 binds.
-* **an EWMA of throughput you are limiting is a closed loop.** It fed its own
-  suppression back in, walked the quantum to the floor, and collapsed throughput
-  while the share looked beautiful. Only sample rounds where you throttled
-  nobody: those are demand-limited and honest.
-* **the estimate starts at zero**, so the first round clamps the quantum to the
-  floor, everything throttles, and no honest sample is ever taken again. Needs a
-  warmup before it is trusted.
+* **peak-hold on a bursty signal** latches 10-30x above the mean -- quantum came out at 1670-6920 where ~170 binds.
+* **an EWMA of throughput you are limiting is a closed loop.** It fed its own suppression back in, walked the quantum to the floor, and collapsed throughput while the share looked beautiful. Only sample rounds where you throttled nobody: those are demand-limited and honest.
+* **the estimate starts at zero**, so the first round clamps the quantum to the floor, everything throttles, and no honest sample is ever taken again. Needs a warmup before it is trusted.
 
-**Service-counted rounds were also attempted (`service_rounds=1`) and do not
-work.** The idea: `epoll_wait` already reports the backlogged set, which should
-supply the service-counted round classic DRR needs. Two failures:
+**Service-counted rounds were also attempted (`service_rounds=1`) and do not work.** The idea: `epoll_wait` already reports the backlogged set, which should supply the service-counted round classic DRR needs. Two failures:
 
-* counting throttled clients as backlogged **deadlocks** -- they are exactly the
-  ones we refuse to serve, so `served >= backlogged` never holds. 8 rounds in 5
-  seconds, everything stalled.
-* counting only the ready set gives **no fairness at all** (3.5-6.7% share
-  against 7.2% with fairness off). The ready set is "who has data at this
-  instant", not "who is competing": with 64 clients and fast service only a
-  handful are ready at once, so a round completes after a few reads and credits
-  everyone almost continuously.
+* counting throttled clients as backlogged **deadlocks** -- they are exactly the ones we refuse to serve, so `served >= backlogged` never holds. 8 rounds in 5 seconds, everything stalled.
+* counting only the ready set gives **no fairness at all** (3.5-6.7% share against 7.2% with fairness off). The ready set is "who has data at this instant", not "who is competing": with 64 clients and fast service only a handful are ready at once, so a round completes after a few reads and credits everyone almost continuously.
 
-Both leave the round rate emergent from the reactor's wake pattern, which is the
-same root cause the tick was introduced to fix.
+Both leave the round rate emergent from the reactor's wake pattern, which is the same root cause the tick was introduced to fix.
 
-**The fixed quantum remains the recommended operating point**, and the open
-problem is now stated precisely: what is needed is a notion of "competing" that
-spans time, rather than an instantaneous readiness snapshot or a capacity
-estimate derived from throughput you are limiting.
+**The fixed quantum remains the recommended operating point**, and the open problem is now stated precisely: what is needed is a notion of "competing" that spans time, rather than an instantaneous readiness snapshot or a capacity estimate derived from throughput you are limiting.
 
 ### Byte fairness (drr.zig, superseded on epoll)
 
@@ -359,18 +275,11 @@ Three currencies, three shapes:
 | buffers | level (returns on release) | you | terminal -- 503 | `acquire` |
 | **bytes** | **flow** | **the peer** | throttle the source | **recv arming** |
 
-Bytes are the only one the peer controls, which makes them the only account
-that can bound a greedy client -- capping compute after the bytes have landed
-is closing the barn door.
+Bytes are the only one the peer controls, which makes them the only account that can bound a greedy client -- capping compute after the bytes have landed is closing the barn door.
 
-`drr.zig` is deficit round robin: one integer per flow, O(1), provably max-min
-fair. Credit active flows one quantum per round; RESET quiet flows rather than
-crediting them, so an idle flow cannot bank allowance and burst on return.
-Enforcement is `pauseRecv` -- cancel the multishot so the kernel stops reading
-and the peer's window closes.
+`drr.zig` is deficit round robin: one integer per flow, O(1), provably max-min fair. Credit active flows one quantum per round; RESET quiet flows rather than crediting them, so an idle flow cannot bank allowance and burst on return. Enforcement is `pauseRecv` -- cancel the multishot so the kernel stops reading and the peer's window closes.
 
-Measured, polite (32 conns, depth 1) vs greedy (32 conns, depth 256), five
-interleaved trials each:
+Measured, polite (32 conns, depth 1) vs greedy (32 conns, depth 256), five interleaved trials each:
 
 ```
 off : mean 22.0%  median 19.7%  range 14.3-33.5
@@ -434,34 +343,19 @@ Non-overlapping. A solo client is unaffected (86k req/s, work-conserving).
 
 ### -ENOBUFS terminates a multishot recv
 
-The single worst bug in this file. **A multishot recv ENDS on -ENOBUFS.** If
-nothing re-arms it, the connection is dead forever: it is not runnable, so no
-task ever runs to notice, and a peer waiting on a response waits for good.
+The single worst bug in this file. **A multishot recv ENDS on -ENOBUFS.** If nothing re-arms it, the connection is dead forever: it is not runnable, so no task ever runs to notice, and a peer waiting on a response waits for good.
 
-It presented as a *bimodal fairness result* -- one client getting exactly 0
-requests in some trials and a fair share in others, depending on whether the
-buffer ring ran dry at the wrong moment (`enobufs=52` in the failing runs, 20
-in the healthy ones). It was initially misattributed to DRR, which was
-disabled in the failing runs.
+It presented as a *bimodal fairness result* -- one client getting exactly 0 requests in some trials and a fair share in others, depending on whether the buffer ring ran dry at the wrong moment (`enobufs=52` in the failing runs, 20 in the healthy ones). It was initially misattributed to DRR, which was disabled in the failing runs.
 
-Re-arming is deferred to the top of the next kernel step, not done on the spot:
-on the spot the ring is still empty and it would terminate again in a tight
-loop. By the next step the completions in hand have been processed and their
-buffers returned.
+Re-arming is deferred to the top of the next kernel step, not done on the spot: on the spot the ring is still empty and it would terminate again in a tight loop. By the next step the completions in hand have been processed and their buffers returned.
 
 ### Backpressure, and why completion mode does not get it free
 
-Readiness mode has flow control by construction: `read(fd, b.in[b.in_len..])`
-takes **only what fits**, and the rest stays in the socket buffer. The peer's
-window closes on its own.
+Readiness mode has flow control by construction: `read(fd, b.in[b.in_len..])` takes **only what fits**, and the rest stays in the socket buffer. The peer's window closes on its own.
 
-Completion mode has none. By the time you hear about a multishot recv the
-kernel has *already read the bytes*, so the app either takes them or loses
-them.
+Completion mode has none. By the time you hear about a multishot recv the kernel has *already read the bytes*, so the app either takes them or loses them.
 
-The obvious fix -- refuse the completion and keep its ring buffer out of the
-ring -- does not work per connection, and this is worth knowing before
-designing around it:
+The obvious fix -- refuse the completion and keep its ring buffer out of the ring -- does not work per connection, and this is worth knowing before designing around it:
 
 > **A provided buffer ring is a GLOBAL resource.** Holding a buffer does not
 > stop the kernel delivering to *that* socket; multishot recv simply uses a
@@ -472,28 +366,15 @@ designing around it:
 
 What works instead:
 
-1. **Size the inbound buffer so a single completion always fits** --
-   `>= uring_buf_size + max_request_bytes`. Then refusing a completion never
-   arises from one arrival.
-2. **Treat real accumulation as the resource limit it is.** Reaching the limit
-   now means the peer is sending faster than we serve while the connection is
-   busy. That is a 503 (`.overloaded`), not a 400 (`.bad_request`) -- conflating
-   them makes the metric lie.
-3. **Per-connection throttling needs the recv stopped**, not a buffer withheld:
-   cancel the multishot recv for that connection and re-arm when drained. Not
-   implemented; it is the remaining piece.
+1. **Size the inbound buffer so a single completion always fits** -- `>= uring_buf_size + max_request_bytes`. Then refusing a completion never arises from one arrival.
+2. **Treat real accumulation as the resource limit it is.** Reaching the limit now means the peer is sending faster than we serve while the connection is busy. That is a 503 (`.overloaded`), not a 400 (`.bad_request`) -- conflating them makes the metric lie.
+3. **Per-connection throttling needs the recv stopped**, not a buffer withheld: cancel the multishot recv for that connection and re-arm when drained. Not implemented; it is the remaining piece.
 
-Result: no connection failures at any pipeline depth from 1 to 256, where the
-previous version lost 31 of 64 connections at depth 64. But throughput stays
-flat at 44-53k across depths 32-256 while epoll climbs to 198k, because without
-(3) a busy connection cannot be individually slowed and the shared ring is the
-only lever.
+Result: no connection failures at any pipeline depth from 1 to 256, where the previous version lost 31 of 64 connections at depth 64. But throughput stays flat at 44-53k across depths 32-256 while epoll climbs to 198k, because without (3) a busy connection cannot be individually slowed and the shared ring is the only lever.
 
 ### Buffer rings
 
-`reactor_uring2` builds its own ring with `.inc = false` rather than using
-`std`'s `BufferGroup`, which hardcodes incremental consumption. See LESSONS.md —
-that mode caused one connection to receive another connection's bytes.
+`reactor_uring2` builds its own ring with `.inc = false` rather than using `std`'s `BufferGroup`, which hardcodes incremental consumption. See LESSONS.md — that mode caused one connection to receive another connection's bytes.
 
 ---
 
@@ -506,18 +387,11 @@ p.reset();
 p.isIdle() bool;        // holds nothing
 ```
 
-No fd, no allocator, no suspension point. A pure function of (state, input),
-which is why it needs no budget, no cancellation and no effects — all three are
-driver concerns.
+No fd, no allocator, no suspension point. A pure function of (state, input), which is why it needs no budget, no cancellation and no effects — all three are driver concerns.
 
-`feed` consuming less than it was given is the normal pipelined case, not an
-error. **The caller must keep the remainder**; dropping it silently loses the
-next request.
+`feed` consuming less than it was given is the normal pipelined case, not an error. **The caller must keep the remainder**; dropping it silently loses the next request.
 
-Because nothing here performs I/O, byte-at-a-time input must produce results
-identical to whole-message input. `parser_test.zig` asserts that over every
-split point, plus 20,000 random inputs for the buffer bound. That is the test a
-fused parser cannot have.
+Because nothing here performs I/O, byte-at-a-time input must produce results identical to whole-message input. `parser_test.zig` asserts that over every split point, plus 20,000 random inputs for the buffer bound. That is the test a fused parser cannot have.
 
 > **Gotcha.** `Request` slices point into the parser's buffer and are valid
 > until the next `reset`. The parser must outlive the `Event`. The first
@@ -534,17 +408,11 @@ p.release(h);
 p.get(h) ?*IoBuf;       // null if the handle is stale
 ```
 
-Generational handles: a handle for a released buffer fails a check rather than
-aliasing whoever got the slot next.
+Generational handles: a handle for a released buffer fails a check rather than aliasing whoever got the slot next.
 
-Sizing the pool **is** the memory budget, and exhaustion is an admission
-decision with a real answer (503), not an allocation failure. With `io_bufs=64`
-and 256 connections attacking, 192 got a clean 503 and the server kept serving.
+Sizing the pool **is** the memory budget, and exhaustion is an admission decision with a real answer (503), not an allocation failure. With `io_bufs=64` and 256 connections attacking, 192 got a clean 503 and the server kept serving.
 
-Also, unexpectedly, it is a latency knob: fewer buffers means fewer connections
-with I/O in flight, a shorter queue, and a working set that fits cache
-(32 x 2904 B = 93 KB vs 3 MB at 1024). p50 1.40 ms -> 168 us with throughput
-flat and nothing shed.
+Also, unexpectedly, it is a latency knob: fewer buffers means fewer connections with I/O in flight, a shorter queue, and a working set that fits cache (32 x 2904 B = 93 KB vs 3 MB at 1024). p50 1.40 ms -> 168 us with throughput flat and nothing shed.
 
 > **Gotcha.** Release only when the connection truly holds nothing. The guard
 > must include `parser.isIdle()` — a partial request lives *only* in the
@@ -570,13 +438,9 @@ c.ms(); c.ns();
 c.advanceTo(ns); c.advanceBy(d);   // virtual only
 ```
 
-The scheduler needed no changes to accept this: every time-taking function
-already took `now` as a parameter. Only the application read a clock.
+The scheduler needed no changes to accept this: every time-taking function already took `now` as a parameter. Only the application read a clock.
 
-`tests/sim.zig` drives the **unmodified** scheduler on a virtual clock. Same
-seed gives a byte-identical trace hash over a million dispatches; different
-seed, quantum or quota each change it. Six hours of virtual time in 35 seconds
-of wall clock, because time jumps to the next scheduled event.
+`tests/sim.zig` drives the **unmodified** scheduler on a virtual clock. Same seed gives a byte-identical trace hash over a million dispatches; different seed, quantum or quota each change it. Six hours of virtual time in 35 seconds of wall clock, because time jumps to the next scheduled event.
 
 ---
 
@@ -610,22 +474,15 @@ All are `key=value` on the command line.
 
 ## Control surface
 
-A dedicated listener on `port+1`, tasks at `prio_ctrl` (above accept),
-echo-only: no parsing, no budget, no work phase. A control surface that can be
-made to do arbitrary work is not a control surface.
+A dedicated listener on `port+1`, tasks at `prio_ctrl` (above accept), echo-only: no parsing, no budget, no work phase. A control surface that can be made to do arbitrary work is not a control surface.
 
-Priority alone is **not** enough. With an unbounded drain, a keypress waits
-behind every runnable connection: p50 38.7 ms at 4096 connections, 1300x worse
-than idle. The fix is to make the tick a deadline for **re-entering the
-reactor**:
+Priority alone is **not** enough. With an unbounded drain, a keypress waits behind every runnable connection: p50 38.7 ms at 4096 connections, 1300x worse than idle. The fix is to make the tick a deadline for **re-entering the reactor**:
 
 ```zig
 if (K.bounded_drain != 0 and shared.pending.load(.acquire) != 0) break;
 ```
 
-That bounds control latency at `tick_period + one quantum`, independent of
-load. p99 56 ms -> 5.8 ms for 14% throughput. There is a floor around 2.2 ms
-that more tick does not fix.
+That bounds control latency at `tick_period + one quantum`, independent of load. p99 56 ms -> 5.8 ms for 14% throughput. There is a floor around 2.2 ms that more tick does not fix.
 
 > **Gotcha.** `pending` is cleared once per step. An earlier version put this
 > check in a second drain loop that ran *after* the block, so a tick that fired
@@ -641,30 +498,15 @@ pub inline fn yieldCheck() bool;   // true = give the turn back
 pub inline fn yieldMark() void;    // record progress without being asked
 ```
 
-The cooperative contract: long-running loops call `yieldCheck()` often and
-cheaply. Fast path is one load of a usually-zero word and a branch that is
-usually not taken -- the same load the caller would do anyway to ask "should I
-stop?". Nothing is incremented unless the tick actually asked.
+The cooperative contract: long-running loops call `yieldCheck()` often and cheaply. Fast path is one load of a usually-zero word and a branch that is usually not taken -- the same load the caller would do anyway to ask "should I stop?". Nothing is incremented unless the tick actually asked.
 
-The tick's job changes accordingly. It stops *enforcing* anything and becomes a
-**watchdog**: if it fires and the running task has not passed a yield point
-since the last tick, someone broke the contract.
+The tick's job changes accordingly. It stops *enforcing* anything and becomes a **watchdog**: if it fires and the running task has not passed a yield point since the last tick, someone broke the contract.
 
-The property checked is deliberately NOT "did a task switch happen". A
-long-running task that yields diligently but is never preempted -- because
-nothing higher priority wanted to run -- produces zero switches and is behaving
-perfectly. So the *yield* is instrumented, not the dispatch.
+The property checked is deliberately NOT "did a task switch happen". A long-running task that yields diligently but is never preempted -- because nothing higher priority wanted to run -- produces zero switches and is behaving perfectly. So the *yield* is instrumented, not the dispatch.
 
-`yield_seq` is monotonic and only ever incremented by the mutator; the handler
-only READS it and compares against handler-private state, so there is no
-read-modify-write in signal context and no race. The kernel publishes
-`(dispatch_seq << 20) | task_id` at each dispatch so the watchdog names the
-culprit rather than just reporting that someone broke the contract.
+`yield_seq` is monotonic and only ever incremented by the mutator; the handler only READS it and compares against handler-private state, so there is no read-modify-write in signal context and no race. The kernel publishes `(dispatch_seq << 20) | task_id` at each dispatch so the watchdog names the culprit rather than just reporting that someone broke the contract.
 
-Escalation is a warning on the first missed tick and a fault after
-`stall_fault_after` consecutive ones. **Not a kill** -- the seL4 timeout-fault
-shape: the task is not destroyed, its state is intact, and the supervisor
-decides.
+Escalation is a warning on the first missed tick and a fault after `stall_fault_after` consecutive ones. **Not a kill** -- the seL4 timeout-fault shape: the task is not destroyed, its state is intact, and the supervisor decides.
 
 Measured (5 ms tick, background task with and without the contract):
 
@@ -673,9 +515,7 @@ Measured (5 ms tick, background task with and without the contract):
 | honours yield | 0.17 ms | 0.26 ms | 22 us | 0 | 0 |
 | never yields | 43.60 ms | 50.49 ms | 55,808 us | 281 | 281 |
 
-**2500x on tick deferral, 256x on control p50**, and the watchdog names task 1
-as the culprit in the second case. Cost on the fast path: within noise
-(137-140k req/s with, 140-146k without).
+**2500x on tick deferral, 256x on control p50**, and the watchdog names task 1 as the culprit in the second case. Cost on the fast path: within noise (137-140k req/s with, 140-146k without).
 
 > **Gotcha.** A thread parked in the reactor legitimately passes no yield
 > points, so the watchdog must only run while `in_kernel` is false. `lazy_tick`
@@ -695,12 +535,9 @@ fn onTick(_: posix.SIG) callconv(.c) void {
 }
 ```
 
-Four atomics and `clock_gettime`. Nothing else in the program has to be
-async-signal-safe, because `in_kernel` plus a pending **counter** defers all
-real work to the next kernel entry.
+Four atomics and `clock_gettime`. Nothing else in the program has to be async-signal-safe, because `in_kernel` plus a pending **counter** defers all real work to the next kernel entry.
 
-`pending` is a counter, not a flag: under a long quantum many ticks coalesce
-(34 into one delivery, measured), and a budget scheme has to charge all of them.
+`pending` is a counter, not a flag: under a long quantum many ticks coalesce (34 into one delivery, measured), and a budget scheme has to charge all of them.
 
 > **Gotcha.** `std.atomic.Value(i128)` segfaults in Debug on x86_64 with Zig
 > 0.16 — six-line repro, no signals involved, works in ReleaseFast. Timestamps
