@@ -10,7 +10,7 @@ zig build sim        -- 42 64 600
 zig build chunkfuzz  -- 200000 0xBADF00D
 ```
 
-They import the kernel as `@import("coopkernel")`. There is nothing to link or
+They import the kernel as `@import("budgie")`. There is nothing to link or
 copy first -- an earlier version of this directory kept a farm of symlinks
 back to `../src`, which `build.zig` now replaces.
 

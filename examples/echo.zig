@@ -10,12 +10,12 @@
 //! lines, and none of them are about the platform.
 
 const std = @import("std");
-const ck = @import("coopkernel");
+const budgie = @import("budgie");
 
-const sched = ck.sched;
-const http = ck.http;
-const sys = ck.sys;
-const Reactor = ck.reactor.Reactor;
+const sched = budgie.sched;
+const http = budgie.http;
+const sys = budgie.sys;
+const Reactor = budgie.reactor.Reactor;
 const TaskId = sched.TaskId;
 
 /// Task 0 is the listener; 1..max_conns are connections. Task ids double as

@@ -1,32 +1,15 @@
-# The story
+# Lessons
 
-How this got built, what went wrong, and what it taught. The bugs are the
-interesting part; the code is mostly a record of having found them.
+What went wrong while building this, and what each thing taught. The bugs are
+the interesting part. The code is mostly a record of having found them.
 
-Written from one session. Every number quoted was measured on a **single
-shared vCPU** with the load generator on the same core.
-
----
-
-## 1. It started as a code review
-
-The session opened by analysing an unrelated Zig document-conversion project.
-Three findings from that review turned out to matter later, because the same
-mistakes recurred in our own code:
-
-- Its XML parser handed out slices into a buffer that the next call
-  invalidated, with nothing in the type saying so.
-- Its `docx` reader silently degraded on a malformed `styles.xml` — headings
-  became plain paragraphs with no diagnostic.
-- Its correctness story was "the reader author wrote a report for what they
-  knew they skipped". Nothing in the test suite would catch a reader that was
-  confidently *wrong* rather than admittedly incomplete.
-
-All three reappeared here in different clothes.
+Written from one session. Every number quoted was measured on a single shared
+vCPU with the load generator running on the same core, so read them as a diary
+rather than a benchmark.
 
 ---
 
-## 2. A tick, then a kernel
+## 1. A tick, then a kernel
 
 The first artifact was ~400 lines: a cooperative kernel with an `in_kernel`
 flag, a SIGALRM tick, and two tasks (a counter and a primality test) so the
@@ -54,7 +37,7 @@ This became a theme.
 
 ---
 
-## 3. The server, and the first big win
+## 2. The server, and the first big win
 
 Then a real server: connections as state machines, budgets, a cleanup reserve,
 deadlines as the `poll` timeout rather than a watchdog.
@@ -76,7 +59,7 @@ said "slow". The step counter said exactly why.
 
 ---
 
-## 4. Separating scheduler from reactor
+## 3. Separating scheduler from reactor
 
 Everything was fused in one `step()`. Splitting into `sched.zig` (no fds) and
 `reactor.zig` (no budgets) gave another **4x at 1024 connections**, because
@@ -92,7 +75,7 @@ io_uring completion.
 
 ---
 
-## 5. Things that were built and mostly just worked
+## 4. Things that were built and mostly just worked
 
 Not everything was a disaster. These landed cleanly:
 
@@ -116,7 +99,7 @@ Not everything was a disaster. These landed cleanly:
 
 ---
 
-## 6. Memory: the same bug three times
+## 5. Memory: the same bug three times
 
 RSS was 13.1 MB and completely insensitive to load — identical at zero
 connections and at 4096. The cause was one line:
@@ -142,7 +125,7 @@ Worth a lint. It is the single most repeated error in this codebase.
 
 ---
 
-## 7. Background work, and being wrong about priority
+## 6. Background work, and being wrong about priority
 
 The background task got a refilling budget, and the rate limiter was exact:
 `bg_iters` tracked `bg_budget` linearly with zero drift at every scale, with
@@ -171,7 +154,7 @@ slack".
 
 ---
 
-## 8. io_uring: four hours of confident wrong answers
+## 7. io_uring: four hours of confident wrong answers
 
 This is the part worth reading.
 
@@ -239,7 +222,7 @@ depth 1.
 
 ---
 
-## 9. The load generator was the bottleneck
+## 8. The load generator was the bottleneck
 
 Partway through, the measurements stopped meaning anything, and it took too
 long to notice. `bench.zig` had two defects:
@@ -267,7 +250,7 @@ benchmark result is a claim about two programs, not one.
 
 ---
 
-## 10. Claiming bugs that were not bugs
+## 9. Claiming bugs that were not bugs
 
 Twice I "fixed" something and called it a real bug when it was not.
 
@@ -290,7 +273,7 @@ evidence.** Test the old code before declaring it broken.
 
 ---
 
-## 11. Disk, and what io_uring is actually for
+## 10. Disk, and what io_uring is actually for
 
 Late on, the right benchmark. O_DIRECT random 4K reads, so real device latency
 and no page cache to hide behind:
@@ -319,7 +302,7 @@ order of magnitude.
 
 ---
 
-## 12. The buffer pool turned out to be a latency knob
+## 11. The buffer pool turned out to be a latency knob
 
 Sweeping `io_bufs` with wrk, expecting a memory/throughput tradeoff:
 
@@ -344,7 +327,7 @@ about the code suggested it.
 
 ---
 
-## 13. And then the box drifted
+## 12. And then the box drifted
 
 Near the end, a change appeared to cost 22% throughput. I A/B'd it with a
 runtime flag: identical. Then re-measured *unchanged* epoll code that had read

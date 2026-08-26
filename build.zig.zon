@@ -1,7 +1,7 @@
 .{
-    .name = .coopkernel,
+    .name = .budgie,
     .version = "0.1.0",
-    .fingerprint = 0x5333c044059b01d1,
+    .fingerprint = 0xb5f79885987741c6,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{

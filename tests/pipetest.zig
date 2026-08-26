@@ -1,5 +1,5 @@
 const std = @import("std");
-const http = @import("coopkernel").http;
+const http = @import("budgie").http;
 
 // Reproduce exactly what onData does: feed a concatenated burst, parse one
 // request, stash the tail, reset, repeat.

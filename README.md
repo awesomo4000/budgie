@@ -1,85 +1,90 @@
-# coopkernel
+# budgie
 
-<img src="img/budgie-small.png" alt="coopkernel" width="180" align="right">
+<img src="img/budgie-small.png" alt="budgie" width="180" align="right">
 
-A cooperative scheduler for one thread, in Zig 0.16, built by applying seL4's
-resource model to a userspace async runtime.
+An experiment: build an async runtime by copying the architecture of a
+microkernel instead of the architecture of a promise library.
 
-This is a research artifact. It runs, it is tested, and the gaps are listed at
-the bottom. The interesting part is the shape of it, and `docs/STORY.md`,
-which records what went wrong on the way.
+## The observation
 
-Two questions drove the design. What should a scheduler be allowed to know
-about the work it schedules? And when a connection misbehaves, who is holding
-the number that proves it?
+Stare at an async runtime long enough and it starts to look like an operating
+system that has been told it is not allowed to say so.
 
----
+Both multiplex reads and writes over descriptors nobody owns exclusively. Both
+run computation over whatever arrives, in pieces, without knowing in advance
+which piece comes next. Both keep a pile of independent handlers alive at once
+and switch between them. Both have background work that should happen when
+nothing more urgent wants the machine. And both, at the bottom, answer the
+same question a few million times a second: given everything that could run
+right now, what runs next?
 
-## What it borrows from seL4
+That is a scheduler. We just do not usually call it one. We call it an
+executor, or a reactor, or a task queue, and we give it an API shaped like
+function calls so it feels like ordinary code. The kernel underneath is real
+either way. It is simply undocumented, and it usually has no notion of a
+budget, so any task can eat the machine and the runtime's only recourse is to
+hope.
 
-seL4 gives a thread a scheduling context: a budget and a period. The kernel
-enforces the thread from those two numbers alone. Memory comes from untyped
-capabilities that a process carves up itself, and the kernel tracks the
-derivation tree while the meaning of the memory stays with the process.
+## The idea
 
-Both ideas show up here.
+Operating systems people have been at this for fifty years, and one branch of
+that work went somewhere unusual. seL4 is a microkernel small enough that its
+implementation has been proved to match its specification. It flies drones and
+sits inside medical devices. It is about ten thousand lines.
 
-`sched.zig` gives each task one opaque execution budget. Its whole vocabulary
-is task ids, priorities, budgets, deadlines, and a cancel bit. An earlier
-version had an `Account` enum inside the scheduler listing `{accept, parse,
-work, write}`, which is a web server's phases compiled into a CPU scheduler.
-Those labels now live in `accounts.zig`, where the application defines them
-and reads them back.
+So the thought that started this. What if you opened the hood of one of those,
+lifted the engine out, and dropped it into an ordinary userspace process as an
+async runtime?
 
-`quota.zig` is the derivation tree. A parent hands budget to children, a draw
-deducts from every ancestor, and it is all or nothing. It is generic over the
-unit, and refill is a policy field. It sits beside the scheduler, the way seL4
-keeps capability derivation separate from scheduling.
+Not the proofs. Those belong to seL4's specification and do not survive being
+transplanted. What transplants is the shape, and seL4's shape is unusual in
+two ways worth stealing.
 
-Where the borrowing stops: seL4 is a verified kernel with hardware protection,
-and this is a cooperative loop in one userspace thread. A task that holds the
-CPU is a problem capabilities leave open. The watchdog covers it by reporting,
-described below.
+A thread there gets a *scheduling context*: a budget and a period. The kernel
+enforces the thread from those two numbers and knows nothing else about it.
+Memory comes from untyped capabilities the process carves up itself, and the
+kernel tracks the derivation tree while the meaning of the memory stays with
+whoever asked for it. In both cases the kernel holds an accounting structure
+and refuses to hold a semantic one.
 
----
+Apply that to a runtime and you get a scheduler whose entire vocabulary is
+task ids, priorities, budgets, deadlines, and a cancel bit. It has never heard
+of a socket. It cannot read the clock. Ask it what a request is and it has
+nothing to say.
 
-## What the scheduler holds
+## Whether that is a good idea
 
-Strict priority classes, with the highest non-empty one picked by `@ctz` on a
-bitmask.
+I do not know yet. That is what building it was for.
 
-Three budget levels that answer different questions. A per-request `cap`, the
-`budget` a task currently holds, and a supervisor tree where `topUp` deducts
-from every ancestor. The third one earns its keep, because it makes "all
-connections together may spend X per period" expressible.
+The honest description of what is here: a cooperative scheduler with budgets
+and cancellation, deliberately kept ignorant of I/O, plus a reactor that knows
+about I/O and nothing about scheduling policy. One thread. No proofs. Calling
+it a kernel is a claim about how the pieces are arranged, and about nothing
+having been verified.
 
-A cleanup reserve that only the unwind path can spend, so releasing a
-connection stays funded after the work that overran it.
+What I wanted was a read on how it *feels* to write programs this way, next to
+the alternatives:
 
-Generational cancel tokens. Cancellation lives in scheduler state, so it
-survives whatever error handling the task does on the way out.
+- **async/await** colours your functions and hands back cancellation as a
+  value, so any `catch` along the path can swallow it.
+- **Goroutines and channels** give you cheap concurrency and no answer at all
+  to "this handler is eating the machine".
+- **BEAM processes** are the closest relative and got there decades earlier:
+  isolation, preemption, supervision trees. Erlang solved the runaway task by
+  preempting it. This meters instead, and stays cooperative, which is a
+  weaker guarantee bought at a lower price.
+- **Zig's `std.Io`** threads an explicit `Io` through every caller, a
+  different and defensible answer to the same question about who owns effects.
 
-An intrusive timer wheel with O(1) arm, disarm, and rearm.
+Against those, what feels different here is that a budget is a number the
+scheduler holds, so overrun becomes a fact the runtime observes rather than a
+property you hope your code has. Whether that pays for the ceremony is exactly
+what I am still unsure about. `docs/LESSONS.md` is the running record.
 
-Two currencies with separate jobs. Work units enforce, and they are
-deterministic. Nanoseconds are recorded for telemetry. Keeping the clock out
-of control flow is what lets the simulator run the real scheduler on a virtual
-clock and get the same trace every time.
+## What it looks like to use
 
-A `yieldCheck()` and a stall watchdog. If the running task has passed no yield
-point since the last tick, the supervisor gets a fault naming the task. That
-turns "we are careful about yielding" from a convention into something
-measured.
-
----
-
-## Writing a server against it
-
-`examples/echo.zig` is about 120 lines of code whose only imports are the
-kernel and `std`. Build it on Linux and the reactor underneath is epoll. Build
-it on macOS and it is kqueue. The same file compiles for both.
-
-The loop is the whole contract:
+`examples/echo.zig` is about 120 lines whose only imports are this kernel and
+`std`. The loop is the whole contract:
 
 ```zig
 while (true) {
@@ -90,7 +95,7 @@ while (true) {
 ```
 
 A task is a state machine the scheduler hands control to. It runs until it
-would block, parks itself against an fd, and returns:
+would block, parks itself against a descriptor, and returns:
 
 ```zig
 fn step(t: TaskId) void {
@@ -111,36 +116,67 @@ fn step(t: TaskId) void {
 }
 ```
 
-Notice that `r.read` is the reactor's call. That placement is the answer to
-the second question at the top. The reactor does the read, so it sees the byte
-count, so it owns the accounting and the arming together, and a pause happens
-in the same code that will resume it. Six attempts at a byte-fairness policy
-came apart before the read moved inside, each of them splitting the count from
-the decision that used it.
+Two things in there are load-bearing and easy to miss.
 
-Run it with `zig build echo`, then `curl localhost:8080`.
+`r.read` is the *reactor's* call, not the task's. A readiness reactor that
+hands out `watch` and lets the application do the read never learns how many
+bytes anyone consumed, so any fairness policy has to live somewhere else and
+coordinate with it. Six attempts came apart that way before the read moved
+inside. Now the reactor sees the byte count, so it owns the accounting and the
+arming together, and a pause happens in the same code that will resume it.
 
----
+The second is that the file names no operating system. Build it on Linux and
+the reactor underneath is epoll. Build it on macOS and it is kqueue. The same
+file compiles for both. `zig build echo`, then `curl localhost:8080`.
 
-## Reactors
+## What the scheduler holds
+
+Strict priority classes, with the highest non-empty one picked by `@ctz` on a
+bitmask.
+
+Three budget levels answering different questions: a per-request `cap`, the
+`budget` a task currently holds, and a supervisor tree where `topUp` deducts
+from every ancestor. The third is the interesting one, because it makes "all
+connections together may spend X per period" expressible.
+
+A cleanup reserve only the unwind path can spend, so releasing a connection
+stays funded after the work that overran it.
+
+Generational cancel tokens. Cancellation lives in scheduler state, so it
+survives whatever error handling the task does on the way out.
+
+An intrusive timer wheel with O(1) arm, disarm, and rearm.
+
+Two currencies with separate jobs. Work units enforce, and they are
+deterministic. Nanoseconds are recorded for telemetry. Keeping the clock out
+of control flow is what lets the simulator run the real scheduler on a virtual
+clock and get the same trace every time.
+
+A `yieldCheck()` and a stall watchdog. Cooperative scheduling has one classic
+failure, the task that never yields, and capabilities do nothing about it. So
+the tick stops enforcing and starts reporting: if the running task has passed
+no yield point since the last tick, the supervisor gets a fault naming it.
+That turns "we are careful about yielding" from a convention into something
+measured.
+
+## Reactors, and what swapping them proved
 
 Five backends have been written against the same contract: poll, epoll,
 io_uring readiness, io_uring completion, and kqueue. `sched.zig` stayed
-byte-identical through all of them.
+byte-identical through all of them, which is the strongest evidence I have
+that the separation is real rather than decorative.
 
 The kqueue port reused the reactor whole. Of `reactor.zig`'s 400 lines, about
 15 were epoll-specific, and those 15 are now `backend_epoll.zig` and
 `backend_kqueue.zig`. The client table, the byte accounting, and the round
 policy stay shared. The semantics line up because `EV_ONESHOT` and
-`EPOLLONESHOT` mean the same thing. An event fires, the registration is gone,
+`EPOLLONESHOT` mean the same thing: an event fires, the registration is gone,
 and the task stays parked until something rearms it.
 
-That interchangeability covers the readiness backends, and `examples/echo.zig`
-is the proof. The io_uring completion build asks for a different application
-shape, since the kernel fills buffers and hands back completions, so
-`app/server_uring2.zig` is its own file.
-
----
+That interchangeability covers the readiness backends. The io_uring completion
+build asks for a different application shape, since there the kernel fills
+buffers and hands back completions, so `app/server_uring2.zig` is its own
+file. Worth knowing before anyone reads "portable" too generously.
 
 ## Determinism
 
@@ -148,11 +184,10 @@ shape, since the kernel fills buffers and hands back completions, so
 clock. The same seed gives a byte-identical trace hash over a million
 dispatches, and six hours of virtual time takes seconds of real time.
 
-The hash also matches across macOS on arm64 and Linux on x86_64, so the
-determinism holds across architecture and operating system as well as across
-runs.
-
----
+The hash also matches across macOS on arm64 and Linux on x86_64. I did not
+expect that to hold the first time I tried it. It falls out of keeping the
+clock away from control flow: once nothing branches on time, there is nothing
+left for the platform to influence.
 
 ## Layout
 
@@ -179,16 +214,15 @@ app/         the two servers, epoll/kqueue and io_uring completion
 examples/    echo.zig, the small backend-independent server
 tests/       parser, cancellation, pipelining, chunk fuzzing, the simulator
 bench/       load generators and microbenchmarks (Linux only)
-docs/        APIGUIDE.md, STORY.md, architecture diagram
+docs/        APIGUIDE.md, LESSONS.md, architecture diagram
 results/     CSVs and plots from the original measurements
 stages/      srv..srv14, every checkpoint, kept as history
 ```
 
----
-
 ## Build and run
 
-Requires Zig 0.16.0.
+Requires Zig 0.16.0. Use `-Drelease`, which Zig 0.16 exposes in place of
+`-Doptimize`.
 
 ```sh
 zig build -Drelease        # servers and the example into zig-out/bin
@@ -196,8 +230,6 @@ zig build echo             # run the example server
 zig build test             # six test programs
 zig build check            # typecheck everything for Linux without running
 ```
-
-Use `-Drelease`. Zig 0.16 exposes that flag and rejects `-Doptimize`.
 
 |  | Linux | macOS |
 |---|---|---|
@@ -216,20 +248,18 @@ because there is no stable syscall ABI there.
 without running it, which is how a change made on a Mac gets checked against
 the Linux path.
 
----
-
 ## Status
 
 Working: the scheduler, all five reactors, supervisors, cancellation, the
 timer wheel, the parser, the simulator, the buffer pool, and the control
 surface.
 
-Gaps, in the order I would fix them:
+Open, roughly in the order I would take them:
 
 - One carrier, single threaded. Multi-core is designed as sharding, and still
   on paper.
 - Tasks are hand-rolled state machines. Fibers, `perform` and `around` are
-  still open.
+  still open, and are the part most likely to change how this feels to use.
 - The io_uring completion build stays flat as queue depth rises. A provided
   buffer ring gives global backpressure, so per-connection flow control has to
   come from somewhere else. See APIGUIDE.
@@ -240,8 +270,8 @@ Gaps, in the order I would fix them:
 - `bench/diskbench.zig` uses a raw `open` syscall, so it compiles for x86_64
   Linux only. arm64 is openat only.
 
-Numbers from the original measurements are in `results/` and discussed in
-`docs/STORY.md`. Read them as a record of one session on one shared vCPU with
+Numbers from the original measurements live in `results/` and are discussed in
+`docs/LESSONS.md`. Read them as a diary of one session on one shared vCPU with
 the load generator running on the same core.
 
 ### A kernel bug worth knowing about
@@ -267,11 +297,9 @@ kernel succeeds on the first call and stays on the spec-correct path. When the
 fallback runs, the server says so in its stats. 6.8.0-134 is the last version
 known to be unaffected.
 
----
-
 ## Reading order
 
-1. `docs/STORY.md`. What happened and what it taught. Start here.
+1. `docs/LESSONS.md`. What went wrong and what each thing taught. Start here.
 2. `examples/echo.zig`. The smallest thing that uses the kernel.
 3. `docs/APIGUIDE.md`. How the pieces fit, and every knob.
 4. `src/sched.zig`. The core, and the one file that touches no I/O.

@@ -12,15 +12,15 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const Sched = @import("coopkernel").sched.Sched;
-const TaskId = @import("coopkernel").sched.TaskId;
-const max_tasks = @import("coopkernel").sched.max_tasks;
-const Reactor = @import("coopkernel").reactor.Reactor;
-const quota = @import("coopkernel").quota;
-const acct = @import("coopkernel").accounts;
+const Sched = @import("budgie").sched.Sched;
+const TaskId = @import("budgie").sched.TaskId;
+const max_tasks = @import("budgie").sched.max_tasks;
+const Reactor = @import("budgie").reactor.Reactor;
+const quota = @import("budgie").quota;
+const acct = @import("budgie").accounts;
 const Label = acct.Label;
-const prio_idle = @import("coopkernel").sched.prio_idle;
-const sched = @import("coopkernel").sched;
+const prio_idle = @import("budgie").sched.prio_idle;
+const sched = @import("budgie").sched;
 
 // Supervisor tree. root bounds the whole process; the classes below it can be
 // tuned against each other without any of them being able to exceed the root.
@@ -29,10 +29,10 @@ const sup_conn: quota.Id = 1;   // ALL connections together
 const sup_bg: quota.Id = 2;
 const sup_ctrl: quota.Id = 3;
 const posix = std.posix;
-const http = @import("coopkernel").http;
-const Clock = @import("coopkernel").clock.Clock;
-const iobuf = @import("coopkernel").iobuf;
-const sys = @import("coopkernel").sys;
+const http = @import("budgie").http;
+const Clock = @import("budgie").clock.Clock;
+const iobuf = @import("budgie").iobuf;
+const sys = @import("budgie").sys;
 
 /// Every knob is runtime-settable so a sweep needs no recompile. Defaults
 /// match the values the earlier runs used.
@@ -256,7 +256,7 @@ fn nowNs() i64 {
 }
 
 fn realNowMs() i64 {
-    return @divTrunc(@import("coopkernel").clock.monotonicNs(), 1_000_000);
+    return @divTrunc(@import("budgie").clock.monotonicNs(), 1_000_000);
 }
 
 /// The yield primitive.
@@ -574,7 +574,7 @@ const App = struct {
 
     // --------------------------------------------------------------- phases
 
-    fn park(a: *App, t: TaskId, c: *Conn, i: @import("coopkernel").reactor.Interest) void {
+    fn park(a: *App, t: TaskId, c: *Conn, i: @import("budgie").reactor.Interest) void {
         a.r.watch(t, c.fd, i);
     }
 

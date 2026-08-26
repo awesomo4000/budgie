@@ -12,15 +12,15 @@
 
 const std = @import("std");
 const linux = std.os.linux;
-const Sched = @import("coopkernel").sched.Sched;
-const TaskId = @import("coopkernel").sched.TaskId;
-const max_tasks = @import("coopkernel").sched.max_tasks;
-const Reactor = @import("coopkernel").reactor_uring2.Reactor;
-const quota = @import("coopkernel").quota;
-const acct = @import("coopkernel").accounts;
+const Sched = @import("budgie").sched.Sched;
+const TaskId = @import("budgie").sched.TaskId;
+const max_tasks = @import("budgie").sched.max_tasks;
+const Reactor = @import("budgie").reactor_uring2.Reactor;
+const quota = @import("budgie").quota;
+const acct = @import("budgie").accounts;
 const Label = acct.Label;
-const prio_idle = @import("coopkernel").sched.prio_idle;
-const sched = @import("coopkernel").sched;
+const prio_idle = @import("budgie").sched.prio_idle;
+const sched = @import("budgie").sched;
 
 // Supervisor tree. root bounds the whole process; the classes below it can be
 // tuned against each other without any of them being able to exceed the root.
@@ -29,10 +29,10 @@ const sup_conn: quota.Id = 1;   // ALL connections together
 const sup_bg: quota.Id = 2;
 const sup_ctrl: quota.Id = 3;
 const posix = std.posix;
-const http = @import("coopkernel").http;
-const Clock = @import("coopkernel").clock.Clock;
-const iobuf = @import("coopkernel").iobuf;
-const Drr = @import("coopkernel").drr.Drr;
+const http = @import("budgie").http;
+const Clock = @import("budgie").clock.Clock;
+const iobuf = @import("budgie").iobuf;
+const Drr = @import("budgie").drr.Drr;
 
 /// Every knob is runtime-settable so a sweep needs no recompile. Defaults
 /// match the values the earlier runs used.
@@ -613,7 +613,7 @@ const App = struct {
 
     // --------------------------------------------------------------- phases
 
-    fn park(a: *App, t: TaskId, c: *Conn, i: @import("coopkernel").reactor_uring2.Interest) void {
+    fn park(a: *App, t: TaskId, c: *Conn, i: @import("budgie").reactor_uring2.Interest) void {
         a.r.watch(t, c.fd, i);
     }
 
@@ -652,7 +652,7 @@ const App = struct {
     /// Returns true if the completion's buffer may go back to the ring.
     /// False means we could not take the bytes, so the buffer stays out and
     /// the kernel stops delivering on that socket -- backpressure.
-    fn onCompletion(a: *App, comp: @import("coopkernel").reactor_uring2.Completion) bool {
+    fn onCompletion(a: *App, comp: @import("budgie").reactor_uring2.Completion) bool {
         const t = comp.task;
         if (!a.live_conn[t]) return true;
         const c = &a.conn_store[t];
@@ -1000,11 +1000,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     app_storage = .{ .listener = sock };
     const a = &app_storage;
-    @import("coopkernel").reactor_uring2.defer_taskrun = K.defer_taskrun != 0;
-    @import("coopkernel").reactor_uring2.coop_taskrun = K.coop_taskrun != 0;
+    @import("budgie").reactor_uring2.defer_taskrun = K.defer_taskrun != 0;
+    @import("budgie").reactor_uring2.coop_taskrun = K.coop_taskrun != 0;
     try a.r.init(@intCast(K.io_bufs), @intCast(K.uring_buf_size));
     a.r.cqe_batch = @intCast(K.uring_cqe_batch);
-    @import("coopkernel").reactor_uring2.use_gen = K.gen_keys != 0;
+    @import("budgie").reactor_uring2.use_gen = K.gen_keys != 0;
     a.r.batch_target = @intCast(K.uring_batch);
     a.drr.quantum = K.drr_quantum;
     a.drr.policy = switch (K.drr_policy) { 0 => .on_block, 2 => .on_tick, else => .on_service };
@@ -1099,7 +1099,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Say it out loud. A run that silently worked around a kernel bug and one
     // that did not are different runs, and the difference belongs in the
     // stats rather than in whoever remembers the kernel version.
-    if (@import("coopkernel").uring_bufring.used_workaround)
+    if (@import("budgie").uring_bufring.used_workaround)
         std.debug.print("NOTE: buffer ring needed the inverted-resv workaround -- this kernel has Launchpad #2162843 (Ubuntu 6.8.0-136/-137). Upgrade past it.\n", .{});
     std.debug.print("uring: enters={d} cqes={d} recv_arms={d} multishot_ended={d} rearmed={d} stale_completions={d} enobufs={d} bytes_in={d}\n", .{
         a.r.enters, a.r.cqes_total, a.r.recv_arms, a.r.multishot_reups, a.r.rearms_after_end, a.r.stale_completions, a.r.enobufs, a.r.bytes_in,

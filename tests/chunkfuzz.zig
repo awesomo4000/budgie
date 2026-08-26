@@ -17,7 +17,7 @@
 //! usage: chunkfuzz [iterations] [seed]
 
 const std = @import("std");
-const http = @import("coopkernel").http;
+const http = @import("budgie").http;
 
 const in_cap = 2048;
 

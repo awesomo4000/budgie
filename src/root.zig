@@ -1,17 +1,18 @@
-//! coopkernel — a single-threaded cooperative kernel in userspace.
+//! budgie, a cooperative kernel for one userspace thread.
 //!
-//! This is the library root. It re-exports the ten files that make up the
-//! kernel proper; consumers reach them as `@import("coopkernel").sched` and so
-//! on. Inside this directory the files still import each other by path, which
-//! keeps the dependency graph visible at the top of each file.
+//! The library root. It re-exports the files that make up the kernel, which
+//! consumers reach as `@import("budgie").sched` and so on. Inside this
+//! directory the files still import each other by path, which keeps each
+//! file's dependencies visible at its top.
 //!
-//! The dependency graph is a DAG and every edge is listed here:
+//! The graph is a DAG and every edge is here:
 //!
 //!     quota   <- sched <- drr, reactor, reactor_uring, reactor_uring2
 //!     http    <- iobuf <- reactor_uring2
-//!     accounts, clock  (leaves)
+//!     interest <- reactor <- backend_epoll, backend_kqueue
+//!     accounts, clock, sys  (leaves)
 //!
-//! `sched` is the only file with no I/O in it. The readiness reactor runs on
+//! `sched` is the one file that touches no I/O. The readiness reactor runs on
 //! epoll or kqueue; the io_uring reactors are Linux-only and gated as such.
 
 const builtin = @import("builtin");

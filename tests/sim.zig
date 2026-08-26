@@ -16,13 +16,13 @@
 //! usage: sim <seed> <tasks> <virtual_seconds> [conn_quota] [work_budget]
 
 const std = @import("std");
-const sched = @import("coopkernel").sched;
-const Clock = @import("coopkernel").clock.Clock;
-const quota = @import("coopkernel").quota;
+const sched = @import("budgie").sched;
+const Clock = @import("budgie").clock.Clock;
+const quota = @import("budgie").quota;
 /// Wall time, used only to report how long the run took. The simulation
 /// itself never reads this -- it runs on the virtual clock, which is the
 /// whole point -- so this is a stopwatch and nothing branches on it.
-const wallNs = @import("coopkernel").clock.monotonicNs;
+const wallNs = @import("budgie").clock.monotonicNs;
 
 const Sched = sched.Sched;
 const TaskId = sched.TaskId;

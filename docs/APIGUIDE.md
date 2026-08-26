@@ -33,7 +33,7 @@ a.s.expire(a.clock.ms());
 The completion-mode server (`server_uring2.zig`) adds an inner loop that
 alternates "convert completions into work" and "drain the work" until neither
 remains, and only then blocks. Getting that order wrong costs a syscall per
-request — see STORY.md.
+request — see LESSONS.md.
 
 ---
 
@@ -492,7 +492,7 @@ only lever.
 ### Buffer rings
 
 `reactor_uring2` builds its own ring with `.inc = false` rather than using
-`std`'s `BufferGroup`, which hardcodes incremental consumption. See STORY.md —
+`std`'s `BufferGroup`, which hardcodes incremental consumption. See LESSONS.md —
 that mode caused one connection to receive another connection's bytes.
 
 ---
@@ -704,7 +704,7 @@ real work to the next kernel entry.
 
 > **Gotcha.** `std.atomic.Value(i128)` segfaults in Debug on x86_64 with Zig
 > 0.16 — six-line repro, no signals involved, works in ReleaseFast. Timestamps
-> here are `i64`. See STORY.md.
+> here are `i64`. See LESSONS.md.
 
 > **Gotcha.** `lazy_tick` disarms the itimer before a real sleep, because the
 > tick bounds *compute* and a thread parked in the reactor is running none.

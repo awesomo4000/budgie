@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
         "Optimize mode for the test programs (default: ReleaseSafe)",
     ) orelse .ReleaseSafe;
 
-    const coopkernel = b.addModule("coopkernel", .{
+    const budgie = b.addModule("budgie", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(b.fmt("app/{s}.zig", .{name})),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "coopkernel", .module = coopkernel }},
+                .imports = &.{.{ .name = "budgie", .module = budgie }},
             }),
         });
         b.installArtifact(exe);
@@ -88,7 +88,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("examples/echo.zig"),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "coopkernel", .module = coopkernel }},
+                .imports = &.{.{ .name = "budgie", .module = budgie }},
             }),
         });
         b.installArtifact(exe);
@@ -129,7 +129,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(b.fmt("tests/{s}.zig", .{t.name})),
                 .target = target,
                 .optimize = if (t.fast) optimize else test_optimize,
-                .imports = &.{.{ .name = "coopkernel", .module = coopkernel }},
+                .imports = &.{.{ .name = "budgie", .module = budgie }},
             }),
         });
 
@@ -188,7 +188,7 @@ pub fn build(b: *std.Build) void {
                     .root_source_file = b.path(b.fmt("{s}/{s}.zig", .{ dir, name })),
                     .target = check_target,
                     .optimize = optimize,
-                    .imports = &.{.{ .name = "coopkernel", .module = check_mod }},
+                    .imports = &.{.{ .name = "budgie", .module = check_mod }},
                 }),
             });
             check_step.dependOn(&exe.step);

@@ -1,6 +1,6 @@
-const quota = @import("coopkernel").quota;
+const quota = @import("budgie").quota;
 const std = @import("std");
-const S = @import("coopkernel").sched;
+const S = @import("budgie").sched;
 
 // Reproduces the bug the fix addresses, at the scheduler level.
 var q: quota.Tree = .{};

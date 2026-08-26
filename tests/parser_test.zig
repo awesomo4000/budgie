@@ -1,5 +1,5 @@
 const std = @import("std");
-const http = @import("coopkernel").http;
+const http = @import("budgie").http;
 
 // NOTE: the parser must outlive the Event. Request slices point into
 // `p.buf`, so `p` is passed in rather than being a local whose frame dies
