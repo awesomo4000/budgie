@@ -79,6 +79,25 @@ pub fn build(b: *std.Build) void {
         b.step(name, b.fmt("Run {s}", .{name})).dependOn(&run.step);
     }
 
+    // The example is built by `zig build` like anything else, so it cannot rot
+    // into pseudocode while nobody is looking.
+    {
+        const exe = b.addExecutable(.{
+            .name = "echo",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/echo.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "coopkernel", .module = coopkernel }},
+            }),
+        });
+        b.installArtifact(exe);
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        if (b.args) |args| run.addArgs(args);
+        b.step("echo", "Run the example server from examples/echo.zig").dependOn(&run.step);
+    }
+
     const bench_step = b.step("bench", "Build the load generators and microbenchmarks");
     if (!is_linux) {
         // Say so rather than failing with a page of errors from inside the
@@ -155,9 +174,11 @@ pub fn build(b: *std.Build) void {
         .target = check_target,
         .optimize = optimize,
     });
-    for ([_][]const u8{ "app", "tests" }) |dir| {
+    for ([_][]const u8{ "app", "tests", "examples" }) |dir| {
         const names: []const []const u8 = if (std.mem.eql(u8, dir, "app"))
             &apps
+        else if (std.mem.eql(u8, dir, "examples"))
+            &.{"echo"}
         else
             &.{ "parser_test", "pipetest", "cancel_test", "feedcmp", "chunkfuzz", "sim" };
         for (names) |name| {

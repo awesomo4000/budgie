@@ -1,20 +1,160 @@
 # coopkernel
 
-<img src="img/logo.png" alt="coopkernel" width="180" align="right">
+<img src="img/budgie-small.png" alt="coopkernel" width="180" align="right">
 
-A single-threaded cooperative kernel in userspace, written in Zig 0.16, built
-in one session as an exploration of seL4-style scheduling ideas applied to a
-hosted async runtime.
+A cooperative scheduler for one thread, in Zig 0.16, built by applying seL4's
+resource model to a userspace async runtime.
 
-It is a scheduler with budgets, priorities, supervisors, deadlines and
-cancellation; a swappable I/O reactor (poll / epoll / io_uring readiness /
-io_uring completion); a sans-I/O HTTP parser; a deterministic simulator that
-drives the real scheduler on a virtual clock; and a set of load generators and
-benchmarks.
+It is a research artifact, not a library. It runs, it is tested, and it has
+real gaps listed at the bottom. What is worth your time here is the shape of
+it, and `docs/STORY.md`, which records what went wrong on the way.
 
-It is a **research artifact**, not a library. It has known gaps (see
-"Status"). The value is in the design and in `docs/STORY.md`, which records
-what went wrong and why.
+Two questions drove the design. What should a scheduler be allowed to know
+about the work it schedules? And when a connection misbehaves, who is holding
+the number that proves it?
+
+---
+
+## What it borrows from seL4
+
+seL4 gives a thread a scheduling context: a budget, a period, and nothing
+else. The kernel enforces it without knowing what the thread does. Separately,
+memory comes from untyped capabilities that a process carves up itself, and
+the kernel tracks the derivation tree without knowing what the memory is for.
+
+Both ideas show up here.
+
+`sched.zig` gives each task one opaque execution budget. It has no fd, no
+syscall, no clock read, and no idea what a buffer, a byte, or a protocol phase
+is. An earlier version had an `Account` enum inside the scheduler listing
+`{accept, parse, work, write}`, which is a web server's phases compiled into a
+CPU scheduler. Those labels now live in `accounts.zig`, where the application
+defines them and the scheduler never sees them.
+
+`quota.zig` is the derivation tree. A parent hands budget to children, a draw
+deducts from every ancestor, and it is all or nothing. It is generic over the
+unit, and refill is a policy field. It is deliberately not a scheduler
+concept, because in seL4 it is not one either.
+
+Where it stops borrowing: seL4 is a verified kernel with hardware protection,
+and this is a cooperative loop in one userspace thread. A task that refuses to
+yield is a problem no capability model solves. There is a watchdog for that,
+and it reports rather than enforces.
+
+---
+
+## What the scheduler holds
+
+Strict priority classes, with the highest non-empty one picked by `@ctz` on a
+bitmask.
+
+Three budget levels that answer different questions. A per-request `cap`, the
+`budget` a task currently holds, and a supervisor tree where `topUp` deducts
+from every ancestor. The third is the one that earns its keep, because it
+makes "all connections together may spend X per period" expressible rather
+than only per-connection limits.
+
+A cleanup reserve the task body cannot touch, so an unwind is funded even when
+the work that overran was not.
+
+Generational cancel tokens. Cancellation is scheduler state, never a return
+value, so no `catch {}` can swallow it.
+
+An intrusive timer wheel with O(1) arm, disarm, and rearm, and no stale
+entries.
+
+Two currencies that never mix. Work units enforce and are deterministic.
+Nanoseconds are observed and never read by control flow. That separation is
+what lets the simulator run the real scheduler on a virtual clock and get the
+same trace every time.
+
+A `yieldCheck()` and a stall watchdog. If the running task has not passed a
+yield point since the last tick, the supervisor gets a fault naming the task.
+That turns "we are careful about yielding" from a convention into something
+measured.
+
+---
+
+## Writing a server against it
+
+`examples/echo.zig` is about 120 lines and names no operating system. Build it
+on Linux and the reactor underneath is epoll. Build it on macOS and it is
+kqueue. Nothing in the file changes.
+
+The loop is the whole contract:
+
+```zig
+while (true) {
+    while (s.popRunnable()) |t| step(t);   // run what is runnable
+    _ = r.wait(&s, 1000);                  // block until an fd is ready
+    s.expire(nowMs());                     // fire expired timers
+}
+```
+
+A task is a state machine the scheduler hands control to. When it cannot make
+progress, it parks itself against an fd and returns:
+
+```zig
+fn step(t: TaskId) void {
+    const c = &conns[t];
+    const n = r.read(t, c.fd, c.in[c.in_len..]);
+    if (n < 0) return r.watch(t, c.fd, .read);   // would block, park again
+    if (n == 0) return finish(t, c);             // peer hung up
+    c.in_len += @intCast(n);
+
+    const used = c.parser.feed(c.in[0..c.in_len]);
+    consume(c, used);                            // keep any pipelined remainder
+
+    switch (c.parser.poll()) {
+        .need_input => r.watch(t, c.fd, .read),
+        .protocol_error => finish(t, c),
+        .request => |req| respond(t, c, req),
+    }
+}
+```
+
+`r.read` belongs to the reactor rather than the caller, and that is not an
+accident. A readiness reactor that hands out `watch` and lets the application
+do the read never learns how many bytes anyone consumed, so fairness has to
+live somewhere else and coordinate with it. Six attempts at a byte-fairness
+policy failed that way before the read moved inside. The reactor owns the
+read, so it owns the bytes, so it owns both the accounting and the arming, and
+a pause cannot race its own resume.
+
+Run it with `zig build echo`, then `curl localhost:8080`.
+
+---
+
+## Reactors
+
+Five backends have been written against the same contract: poll, epoll,
+io_uring readiness, io_uring completion, and kqueue. `sched.zig` was unchanged
+across every one of them.
+
+The kqueue port did not need a fifth copy of the reactor. Of `reactor.zig`'s
+400 lines, about 15 were ever epoll-specific, and those are now
+`backend_epoll.zig` and `backend_kqueue.zig`. The client table, the byte
+accounting, and the round policy stay shared. The semantics line up because
+`EV_ONESHOT` and `EPOLLONESHOT` mean the same thing. An event fires, the
+registration is gone, and the task stays parked until something rearms it.
+
+Be careful with the word portable here. The readiness backends really are
+interchangeable, and `examples/echo.zig` is the proof. The io_uring completion
+build is not. It needs a different application shape, which is why
+`app/server_uring2.zig` is a separate file from `app/server.zig` rather than
+the same file with a flag.
+
+---
+
+## Determinism
+
+`tests/sim.zig` imports the unmodified scheduler and runs it on a virtual
+clock. The same seed gives a byte-identical trace hash over a million
+dispatches, and six hours of virtual time takes seconds of real time.
+
+The hash also matches across macOS on arm64 and Linux on x86_64, so the
+scheduler is deterministic across architecture and operating system, not only
+across runs on one machine.
 
 ---
 
@@ -22,83 +162,31 @@ what went wrong and why.
 
 ```
 src/
-  sched.zig            scheduler: priority classes, timer wheel, generational
-                       cancellation, ONE opaque execution budget per task.
-                       No fd, no syscall, no clock read, and no idea what a
-                       buffer, a byte or a protocol phase is.
-  quota.zig            conservation trees over a resource. Parent/child, draw
-                       deducts from every ancestor, all-or-nothing. Generic
-                       over the unit; refill is a policy field (periodic /
-                       on_return / never). NOT a scheduler concept -- seL4
-                       derives scheduling contexts and untypeds from the same
-                       capability tree and the kernel does not know what the
-                       memory is for.
-  accounts.zig         per-phase telemetry with APPLICATION-defined labels.
-                       This was an `Account` enum inside the scheduler reading
-                       {accept, parse, work, write, ...} -- HTTP server phases
-                       in a CPU scheduler.
-  reactor.zig          readiness reactor: client table, byte accounting and
-                       round policy. Platform-free; the wakeup primitive is a
-                       backend.
+  sched.zig            the scheduler. The only file with no I/O in it.
+  quota.zig            conservation trees over a resource
+  accounts.zig         per-phase telemetry, labels defined by the application
+  reactor.zig          readiness reactor: client table, byte accounting, rounds
   backend_epoll.zig    the epoll half of it (Linux)
-  backend_kqueue.zig   the kqueue half of it (macOS, BSD)
-  interest.zig         what a task waits for; shared by the two above
-  sys.zig              sockets, tick timer, process introspection -- the
-                       platform seam for the application
-  reactor_uring.zig    io_uring reactor, IORING_OP_POLL_ADD (readiness)
-  reactor_uring2.zig   io_uring reactor, multishot recv + buffer ring
-                       (completion). Registered files and buffers.
-  http.zig             sans-I/O HTTP request parser: bytes in, events out.
-                       No fd, no allocator, no suspension point.
+  backend_kqueue.zig   the kqueue half of it (macOS)
+  interest.zig         what a task waits for
+  reactor_uring.zig    io_uring, IORING_OP_POLL_ADD (readiness)
+  reactor_uring2.zig   io_uring, multishot recv and a buffer ring (completion)
+  uring_bufring.zig    buffer ring registration, around a broken kernel
+  http.zig             sans-I/O request parser: bytes in, events out
   iobuf.zig            generational pool of I/O buffers
+  drr.zig              deficit round robin over byte flows, off by default
   clock.zig            real or virtual time, injected
-  drr.zig              deficit round robin over byte flows; off by default
-  root.zig             module root, re-exporting the ten files above
+  sys.zig              sockets and process introspection, per platform
+  root.zig             module root
 
-app/
-  server.zig           application driving sched + reactor.zig (epoll)
-  server_uring2.zig    application driving sched + reactor_uring2 (completion)
-
-tests/
-  sim.zig              deterministic simulation of the REAL scheduler
-  parser_test.zig      split-invariance, pipelining, malformed input, fuzz
-  pipetest.zig         pipelined burst walked through the parser
-  chunkfuzz.zig        byte-stream invariant under adversarial chunk
-                       boundaries -- the class of bug the scheduler DST
-                       cannot see and real I/O finds only by luck
-  cancel_test.zig      cancellation semantics
-  feedcmp.zig          old vs new parser feed(), for the record
-
-bench/
-  gen.zig              io_uring load generator, correct HTTP framing
-  bench.zig            original poll load generator (kept; see STORY.md)
-  bench2.zig           pipelining poll load generator (kept; see STORY.md)
-  hold.zig             opens N idle keep-alive connections (memory tests)
-  ctrl.zig             control-surface latency probe
-  diskbench.zig        O_DIRECT random reads, pread vs io_uring queue depth
-  iobench.zig          page-cached reads (shows what NOT to measure)
-  sysc.zig             raw syscall cost
-  *.sh                 sweep drivers
-
-build.zig              module, executables, and the test/bench/check steps
-stages/                every intermediate version, srv .. srv14, in order
-results/               CSVs and plots from the measurements
-docs/                  architecture diagram, API guide, the story
+app/         the two servers, epoll/kqueue and io_uring completion
+examples/    echo.zig, the small backend-independent server
+tests/       parser, cancellation, pipelining, chunk fuzzing, the simulator
+bench/       load generators and microbenchmarks (Linux only)
+docs/        APIGUIDE.md, STORY.md, architecture diagram
+results/     CSVs and plots from the original measurements
+stages/      srv..srv14, every checkpoint, kept as history
 ```
-
-`src/` is the kernel and nothing else: ten files with no `main` between them,
-exported as the `coopkernel` module. `app/`, `tests/` and `bench/` are
-consumers of it and reach it as `@import("coopkernel").sched`. Inside `src/`
-the files still import each other by path, so each one's dependencies stay
-visible at the top of the file.
-
-Every program under `bench/` imports only `std`. They are standalone by
-design, so a load generator can be built and copied to a separate load box
-without carrying the kernel with it.
-
-`stages/` is the history. Each directory is a working checkpoint; the
-progression is described in `docs/STORY.md`. It is kept for the record and is
-deliberately outside the build -- those files are snapshots, not sources.
 
 ---
 
@@ -106,269 +194,92 @@ deliberately outside the build -- those files are snapshots, not sources.
 
 Requires Zig 0.16.0.
 
-| | Linux | macOS |
+```sh
+zig build -Drelease        # servers and the example into zig-out/bin
+zig build echo             # run the example server
+zig build test             # six test programs
+zig build check            # typecheck everything for Linux without running
+```
+
+Use `-Drelease`. Zig 0.16 exposes that flag and rejects `-Doptimize`, and a
+Debug build of the server is 499 MB, because `iobuf.store` is a 135 MB
+`undefined` static pool that Debug fills with `0xAA`, which moves it out of
+`.bss` and into the binary. ReleaseFast leaves it uninitialised and the same
+build is 4.7 MB.
+
+|  | Linux | macOS |
 |---|---|---|
-| `zig build test` | 6/6 pass | 6/6 pass |
-| `server` (readiness reactor) | epoll | kqueue |
-| `server_uring2` (completion) | io_uring | not available |
+| `zig build test` | 6/6 | 6/6 |
+| `examples/echo.zig` | epoll | kqueue |
+| `app/server.zig` | epoll | kqueue |
+| `app/server_uring2.zig` | io_uring | not available |
 | `zig build bench` | yes | not ported |
 
-Both columns are measured, not assumed. The Linux side was built and run
-natively on Ubuntu 6.8.0 / x86_64 -- `zig build -Drelease`, `zig build test`,
-`zig build bench` and `zig build check` all pass there, and the bench step
-builds all eight generators.
-
-It also runs cross-compiled: binaries built on an arm64 Mac execute on that
-Linux box with nothing installed, because the Linux build links no libc at
-all. Nothing calls `linkLibC`, the ELF is static, and it carries zero libc
-symbols. macOS cannot say the same and never will -- there is no stable
-syscall ABI there, so every binary links `libSystem`.
-
-`sim` produces a **byte-identical trace hash on both** -- `663f011e3a5bb05c`
-for the default seed on macOS/arm64 and Linux/x86_64 alike. The scheduler is
-deterministic across architecture and operating system, not merely across
-runs on one machine.
-
-```sh
-zig build -Drelease                        # servers -> zig-out/bin
-zig build test                             # the six test programs
-zig build check                            # typecheck for Linux without running
-```
-
-`-Drelease` and not `-Doptimize=ReleaseFast`: 0.16's `standardOptimizeOption`
-exposes the former and rejects the latter outright. **Build with it.** A Debug
-server is ~500 MB, because `iobuf.store` is a 141 MB `undefined` static pool
-and Debug writes `0xAA` over it, which moves the whole thing out of `.bss` and
-into the binary. ReleaseFast leaves it uninitialised and the same binary is
-1.3 MB.
-
-The io_uring build is Linux-only and there is nothing to port it to: kqueue is
-a readiness interface, and that build exists precisely to exercise completion
-with a kernel-owned buffer ring. `build.zig` drops it from a non-Linux build
-rather than failing, and naming `reactor_uring2` on such a target is a one-line
-error instead of a wall of io_uring internals.
+The Linux build links no libc. Nothing calls `linkLibC`, the ELF is static,
+and it carries no libc symbols, so a binary cross-compiled on a Mac runs on a
+Linux box with nothing installed. macOS is the opposite and always will be,
+because there is no stable syscall ABI there.
 
 `zig build check` cross-compiles every executable for `x86_64-linux-gnu`
-without running anything, so a change made on a Mac is verified against the
-Linux path too. Pass `-Dcheck-target=` to aim it elsewhere -- note that
-`bench/diskbench.zig` issues a raw `open` syscall and so does not compile for
-arm64 Linux, which is openat-only.
-
-Run a server:
-
-```sh
-./zig-out/bin/server 8080 30            # port, seconds to run
-./zig-out/bin/server 8080 30 io_bufs=32 quantum_units=250 conn_quota=50000
-
-zig build server -- 8080 30             # or straight from the build system
-```
-
-Every knob is `key=value` on the command line; see `docs/APIGUIDE.md`.
-
-Tests:
-
-```sh
-zig build test                  # builds and runs all six; non-zero exit fails
-zig build sim -- 42 64 600      # or one at a time, with your own arguments
-```
-
-The test programs are ordinary executables with a `main`, not `test` blocks,
-because the fuzz and simulation drivers take a seed and an iteration count and
-re-running one by hand with a different seed is the point of them. They build
-at `ReleaseSafe` rather than at `-Doptimize`, since the suite checks its
-invariants with `std.debug.assert` and `ReleaseFast` compiles those out; use
-`-Dtest-optimize=` to override.
-
-Five of the six run on a non-Linux host as they are -- `sched`, `quota` and
-`http` genuinely contain no I/O, and Zig never analyses the reactors if
-nothing references them. Only `sim` needs Linux, and only for the stopwatch it
-uses to report how long the run took.
-
-Load:
-
-```sh
-zig build bench                 # all eight generators and probes -> zig-out/bin
-./zig-out/bin/gen <port> <conns> <secs> <depth> <units>
-# or just use wrk:
-wrk -t1 -c256 -d5s --latency http://127.0.0.1:8080/work/0
-```
-
-The toy protocol is `GET /work/<N>` where `N` is how many units of CPU work
-the request asks for. That makes request cost a parameter, which is what the
-budget experiments need.
-
----
-
-## What it does
-
-**Scheduler (`sched.zig`)**
-
-- Strict priority classes, highest non-empty selected with `@ctz` on a bitmask.
-- Three distinct budget levels: a per-request `cap`, the `budget` grant a task
-  currently holds, and a supervisor tree where `topUp` deducts from every
-  ancestor. "All connections together may spend X per period" is expressible,
-  not just per-connection limits.
-- A cleanup reserve the body can never touch, so an unwind is funded even when
-  the work that overran was not.
-- Generational cancel tokens. Cancellation is scheduler *state*, never a return
-  value, so there is no `catch {}` that can swallow it.
-- Intrusive timer wheel: O(1) arm / disarm / rearm, no stale entries.
-- Two currencies: work units enforce and are deterministic; nanoseconds are
-  observed and never read by control flow.
-- `drr.zig`: deficit round robin over byte flows, enforced by pausing a
-  connection's recv. Byte volume is the currency the *peer* controls, so it is
-  the only account that can bound a greedy client. Works on both backends and
-  is OFF BY DEFAULT on both, because the metric it improves turned out not to
-  measure service quality -- see APIGUIDE, "What unfair actually turned out to
-  mean". The real tail effect was `bounded_drain`'s resolution, fixed by a 2ms
-  default tick at no throughput cost.
-- A cooperative `yieldCheck()` plus a stall watchdog: the tick stops enforcing
-  and starts *reporting*. If the running task has not passed a yield point
-  since the last tick, the supervisor gets a fault naming the task. Turns "we
-  are careful about yielding" from a convention into a measured property.
-
-**Reactors** — same four-function interface, five implementations: poll,
-epoll, io_uring readiness, io_uring completion, and kqueue. `sched.zig` was
-byte-identical across all of them.
-
-The kqueue port did not need a fifth copy of the reactor. Only about fifteen
-of `reactor.zig`'s four hundred lines were ever epoll-specific -- arm, disarm,
-wait, and the read -- and those are now `backend_epoll.zig` and
-`backend_kqueue.zig`. The client table, the byte accounting and the round
-policy are shared, which is the part worth not having two of. The semantics
-line up because `EV_ONESHOT` is `EPOLLONESHOT`: an event fires, the
-registration is gone, and the task stays parked until something rearms it.
-
-**Determinism** — `sim.zig` imports the unmodified scheduler and runs it on a
-virtual clock. Same seed produces a byte-identical trace hash over a million
-dispatches; six hours of virtual time run in 35 seconds of wall clock.
-
----
-
-## Measurements
-
-All on a **single shared vCPU** with the load generator on the same core, so
-absolute numbers are low and only comparable within a run. See the caveat in
-`docs/STORY.md` — the box drifted ~30% over the session.
-
-| | epoll | io_uring (completion) |
-|---|---|---|
-| wrk, 256 conns | 91-99k req/s | 132-143k req/s |
-| p50 / p99 | 2.15-2.33 / 3.87-4.28 ms | 1.34-1.43 / 2.46-2.74 ms |
-| non-2xx | 0 | 0 |
-| idle RSS | 2.1 MB | 2.7 MB |
-| 4096 idle conns | +4 KB | +228 KB |
-| best `io_bufs` | ~1 per connection | ~64, far below conn count |
-
-Numbers are from the end of the session and are ~25% below ones taken earlier
-the same day on unchanged code -- the VM drifted. Only compare figures taken
-within the same few minutes; every A/B in this repo was interleaved for that
-reason.
-
-**`io_bufs` has opposite optima on the two backends, for a structural reason.**
-The readiness build acquires a buffer *before* reading, so every readable
-connection holds one simultaneously and it needs roughly one per connection:
-at 256 connections, `io_bufs=64` produced 95,522 `no_buffer` 503s and 16k
-req/s. The completion build acquires only once bytes have arrived and
-processes completions serially, so its high-water mark was 64 against 256 --
-and a small pool is also an 8x latency win there. Defaults are now set per
-build.
-
-**The buffer pool is a concurrency limiter.** Shrinking `io_bufs` from 1024 to
-32 took p50 from 1.40 ms to 168 us with throughput flat and *zero* requests
-shed. epoll cannot do this: its buffers are effectively per-connection, so the
-same sweep starves it to 7k req/s.
-
-**Disk is where io_uring actually wins.** O_DIRECT 4K random reads:
-
-```
-pread, 1 in flight            22,038 IOPS    1.00x
-io_uring, 1 in flight         26,217 IOPS    1.19x
-io_uring, 64 in flight       341,864 IOPS   15.51x
-io_uring, 128 in flight      367,778 IOPS   16.69x
-```
-
-The entire advantage is queue depth. On the network side the two reactors are
-within noise of each other; on storage it is an order of magnitude.
+without running it, which is how a change made on a Mac gets checked against
+the Linux path.
 
 ---
 
 ## Status
 
-Working: scheduler, all four reactors, supervisors, cancellation, timer wheel,
-sans-I/O parser, deterministic simulation, buffer pool, control surface.
+Working: the scheduler, all five reactors, supervisors, cancellation, the
+timer wheel, the parser, the simulator, the buffer pool, and the control
+surface.
 
-Known gaps:
+Gaps, in the order I would fix them:
 
-- Single carrier. No threads. Multi-core is designed (shard, don't steal) but
-  not built.
-- The benches still speak raw Linux syscalls and have not been ported, so load
-  generation on macOS needs an external tool such as `wrk`.
-- **Ubuntu 6.8.0-136 has an inverted check in `io_register_pbuf_ring`**
-  ([Launchpad #2162843](https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2162843),
-  reported independently, affecting 6.8.0-136 and -137; 6.8.0-134 and
-  mainline are fine). It
-  returns `EINVAL` when the `io_uring_buf_reg` reserved fields are correctly
-  zeroed, and succeeds when they are not -- so every spec-compliant io_uring
-  program, liburing and Zig's standard library included, is unable to
-  register a provided buffer ring on that kernel. That takes `server_uring2`
-  and `gen` with it, since both depend on one.
+- One carrier, no threads. Multi-core is designed, shard rather than steal,
+  and not built.
+- Tasks are hand-rolled state machines rather than fibers. There is no
+  `perform` or `around`.
+- The io_uring completion build does not scale with queue depth, because a
+  provided buffer ring gives global backpressure rather than per-connection
+  flow control. See APIGUIDE.
+- `iobuf` has no "the kernel owns this" state, which an IOCP port would need
+  first.
+- The benches still speak raw Linux syscalls and have not been ported, so
+  generating load on macOS needs an outside tool.
+- `bench/diskbench.zig` uses a raw `open` syscall and will not compile for
+  arm64 Linux, which is openat only.
 
-  This was traced rather than guessed. A `kretprobe` shows
-  `io_register_pbuf_ring` entered and returning `-22` before `io_pin_pages`
-  is ever reached, so it fails in the early validation block. Disassembling
-  the function from `/proc/kcore` shows `memchr_inv(&resv, 0, 24)` followed
-  by a `je` into the `EINVAL` path -- taken precisely when the reserved
-  fields are all zero. Directly: `resv` zeroed gives `EINVAL`, `resv[0]=1`
-  gives `SUCCESS`, and the result does not depend on ordering or buffer group
-  id. Everything around it is healthy -- `io_uring_setup` reports every
-  feature bit, `REGISTER_FILES`/`REGISTER_BUFFERS`/`REGISTER_PROBE`/
-  `REGISTER_IOWQ_MAX_WORKERS` all succeed, and `REGISTER_PROBE` reports
-  `PROVIDE_BUFFERS`, `RECV` and `POLL_ADD` supported up to `last_op=54`.
+Numbers from the original measurements are in `results/` and discussed in
+`docs/STORY.md`. Treat them as a record of one session on one shared vCPU with
+the load generator running on the same core, not as a claim about this design.
 
-  The cause is a botched backport of upstream commit `1724849`
-  ("io_uring/kbuf: use mem_is_zero()"), which rewrote
-  `if (reg.resv[0] || reg.resv[1] || reg.resv[2])` as
-  `if (!mem_is_zero(reg.resv, sizeof(reg.resv)))`. Since `mem_is_zero()` is
-  `memchr_inv(s, 0, n) == NULL`, upstream compiles to a `jne` into the
-  `EINVAL` path; the shipped kernel has a `je`, so the `!` was lost on the
-  way in. The Launchpad reporter suspected that commit; the disassembly above
-  is what confirms it.
+### A kernel bug worth knowing about
 
-  No fix is released as of this writing: the bug is still New and unassigned,
-  6.8.0-138 carries only networking CVEs, and while 6.8.0-139 pulls the
-  correct upstream commit in an stable patchset, nobody has confirmed it
-  resolves this. 6.8.0-134 is the last version known to work.
+Ubuntu 6.8.0-136 and -137 return `EINVAL` from `io_register_pbuf_ring` when
+the `io_uring_buf_reg` reserved fields are correctly zeroed, and succeed when
+they are not. The check is inverted, so every caller that follows the spec,
+liburing and Zig's standard library included, cannot register a provided
+buffer ring at all. That takes `app/server_uring2.zig` and `bench/gen.zig`
+with it.
 
-  `src/uring_bufring.zig` works around it so the completion build runs
-  meanwhile. It registers the ring the correct way first and falls back to
-  the inverted one **only** on `EINVAL`, so a correct kernel succeeds on the
-  first call and never sees a non-zero reserved field from this program; any
-  other errno is a real failure and is returned rather than retried. When the
-  fallback is used the server says so in its stats. It is a compatibility
-  shim rather than a temporary patch -- it stays while affected kernels are
-  still in circulation, costs one extra `io_uring_register` at startup on a
-  broken kernel and nothing on a working one, and lives in its own file so
-  retiring it is one `git rm` and one call site.
+It is [Launchpad #2162843](https://bugs.launchpad.net/ubuntu/+source/linux/+bug/2162843),
+still open. The cause is a mangled backport of upstream commit `1724849`,
+which rewrote `if (reg.resv[0] || reg.resv[1] || reg.resv[2])` as
+`if (!mem_is_zero(reg.resv, sizeof(reg.resv)))`. `mem_is_zero` is
+`memchr_inv(s, 0, n) == NULL`, so upstream compiles to a `jne` into the error
+path. The shipped kernel has a `je`. The negation was lost on the way in, and
+disassembling the function out of `/proc/kcore` is what confirmed it.
 
-  The completion reactor itself is fine. With the workaround in place,
-  `server_uring2` serves 1,102,349 requests at **91.9k req/s** against
-  epoll's 67-81k on the same two cores, with
-  multishot recv rearming cleanly, `enobufs=0`, and buffer acquires equal to
-  releases. So the io_uring advantage the table below claims does reproduce;
-  it is the kernel, not the reactor, that is broken here.
-- Tasks are hand-rolled state machines, not fibers. No `perform` / `around`.
-- io_uring completion build no longer *fails* at depth, but does not scale with
-  it: 44-53k req/s from depth 32 to 256, flat, while epoll climbs 66k -> 198k.
-  No connection errors at any depth. Cause is that a provided buffer ring gives
-  GLOBAL backpressure, not per-connection flow control -- see APIGUIDE.
-- `iobuf` has no "kernel owns this" state. Required before an IOCP port.
-- Numbers need re-measuring on a machine that is not also running the client.
+`src/uring_bufring.zig` works around it. It registers the ring correctly
+first and falls back to the inverted form only on `EINVAL`, so a correct
+kernel succeeds on the first call and never sees a non-zero reserved field.
+When the fallback runs, the server says so in its stats. 6.8.0-134 is the last
+version known to be unaffected.
 
 ---
 
 ## Reading order
 
-1. `docs/STORY.md` — what happened, what went wrong, what it taught. Start here.
-2. `docs/APIGUIDE.md` — how the pieces fit and how to use them.
-3. `src/sched.zig` — the core, and the only file with no I/O in it.
+1. `docs/STORY.md`. What happened and what it taught. Start here.
+2. `examples/echo.zig`. The smallest thing that uses the kernel.
+3. `docs/APIGUIDE.md`. How the pieces fit, and every knob.
+4. `src/sched.zig`. The core, and the only file with no I/O in it.
