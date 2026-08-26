@@ -5,9 +5,9 @@
 A cooperative scheduler for one thread, in Zig 0.16, built by applying seL4's
 resource model to a userspace async runtime.
 
-It is a research artifact, not a library. It runs, it is tested, and it has
-real gaps listed at the bottom. What is worth your time here is the shape of
-it, and `docs/STORY.md`, which records what went wrong on the way.
+This is a research artifact. It runs, it is tested, and the gaps are listed at
+the bottom. The interesting part is the shape of it, and `docs/STORY.md`,
+which records what went wrong on the way.
 
 Two questions drove the design. What should a scheduler be allowed to know
 about the work it schedules? And when a connection misbehaves, who is holding
@@ -17,29 +17,29 @@ the number that proves it?
 
 ## What it borrows from seL4
 
-seL4 gives a thread a scheduling context: a budget, a period, and nothing
-else. The kernel enforces it without knowing what the thread does. Separately,
-memory comes from untyped capabilities that a process carves up itself, and
-the kernel tracks the derivation tree without knowing what the memory is for.
+seL4 gives a thread a scheduling context: a budget and a period. The kernel
+enforces the thread from those two numbers alone. Memory comes from untyped
+capabilities that a process carves up itself, and the kernel tracks the
+derivation tree while the meaning of the memory stays with the process.
 
 Both ideas show up here.
 
-`sched.zig` gives each task one opaque execution budget. It has no fd, no
-syscall, no clock read, and no idea what a buffer, a byte, or a protocol phase
-is. An earlier version had an `Account` enum inside the scheduler listing
-`{accept, parse, work, write}`, which is a web server's phases compiled into a
-CPU scheduler. Those labels now live in `accounts.zig`, where the application
-defines them and the scheduler never sees them.
+`sched.zig` gives each task one opaque execution budget. Its whole vocabulary
+is task ids, priorities, budgets, deadlines, and a cancel bit. An earlier
+version had an `Account` enum inside the scheduler listing `{accept, parse,
+work, write}`, which is a web server's phases compiled into a CPU scheduler.
+Those labels now live in `accounts.zig`, where the application defines them
+and reads them back.
 
 `quota.zig` is the derivation tree. A parent hands budget to children, a draw
 deducts from every ancestor, and it is all or nothing. It is generic over the
-unit, and refill is a policy field. It is deliberately not a scheduler
-concept, because in seL4 it is not one either.
+unit, and refill is a policy field. It sits beside the scheduler, the way seL4
+keeps capability derivation separate from scheduling.
 
-Where it stops borrowing: seL4 is a verified kernel with hardware protection,
-and this is a cooperative loop in one userspace thread. A task that refuses to
-yield is a problem no capability model solves. There is a watchdog for that,
-and it reports rather than enforces.
+Where the borrowing stops: seL4 is a verified kernel with hardware protection,
+and this is a cooperative loop in one userspace thread. A task that holds the
+CPU is a problem capabilities leave open. The watchdog covers it by reporting,
+described below.
 
 ---
 
@@ -50,36 +50,34 @@ bitmask.
 
 Three budget levels that answer different questions. A per-request `cap`, the
 `budget` a task currently holds, and a supervisor tree where `topUp` deducts
-from every ancestor. The third is the one that earns its keep, because it
-makes "all connections together may spend X per period" expressible rather
-than only per-connection limits.
+from every ancestor. The third one earns its keep, because it makes "all
+connections together may spend X per period" expressible.
 
-A cleanup reserve the task body cannot touch, so an unwind is funded even when
-the work that overran was not.
+A cleanup reserve that only the unwind path can spend, so releasing a
+connection stays funded after the work that overran it.
 
-Generational cancel tokens. Cancellation is scheduler state, never a return
-value, so no `catch {}` can swallow it.
+Generational cancel tokens. Cancellation lives in scheduler state, so it
+survives whatever error handling the task does on the way out.
 
-An intrusive timer wheel with O(1) arm, disarm, and rearm, and no stale
-entries.
+An intrusive timer wheel with O(1) arm, disarm, and rearm.
 
-Two currencies that never mix. Work units enforce and are deterministic.
-Nanoseconds are observed and never read by control flow. That separation is
-what lets the simulator run the real scheduler on a virtual clock and get the
-same trace every time.
+Two currencies with separate jobs. Work units enforce, and they are
+deterministic. Nanoseconds are recorded for telemetry. Keeping the clock out
+of control flow is what lets the simulator run the real scheduler on a virtual
+clock and get the same trace every time.
 
-A `yieldCheck()` and a stall watchdog. If the running task has not passed a
-yield point since the last tick, the supervisor gets a fault naming the task.
-That turns "we are careful about yielding" from a convention into something
+A `yieldCheck()` and a stall watchdog. If the running task has passed no yield
+point since the last tick, the supervisor gets a fault naming the task. That
+turns "we are careful about yielding" from a convention into something
 measured.
 
 ---
 
 ## Writing a server against it
 
-`examples/echo.zig` is about 120 lines and names no operating system. Build it
-on Linux and the reactor underneath is epoll. Build it on macOS and it is
-kqueue. Nothing in the file changes.
+`examples/echo.zig` is about 120 lines of code whose only imports are the
+kernel and `std`. Build it on Linux and the reactor underneath is epoll. Build
+it on macOS and it is kqueue. The same file compiles for both.
 
 The loop is the whole contract:
 
@@ -91,8 +89,8 @@ while (true) {
 }
 ```
 
-A task is a state machine the scheduler hands control to. When it cannot make
-progress, it parks itself against an fd and returns:
+A task is a state machine the scheduler hands control to. It runs until it
+would block, parks itself against an fd, and returns:
 
 ```zig
 fn step(t: TaskId) void {
@@ -113,13 +111,12 @@ fn step(t: TaskId) void {
 }
 ```
 
-`r.read` belongs to the reactor rather than the caller, and that is not an
-accident. A readiness reactor that hands out `watch` and lets the application
-do the read never learns how many bytes anyone consumed, so fairness has to
-live somewhere else and coordinate with it. Six attempts at a byte-fairness
-policy failed that way before the read moved inside. The reactor owns the
-read, so it owns the bytes, so it owns both the accounting and the arming, and
-a pause cannot race its own resume.
+Notice that `r.read` is the reactor's call. That placement is the answer to
+the second question at the top. The reactor does the read, so it sees the byte
+count, so it owns the accounting and the arming together, and a pause happens
+in the same code that will resume it. Six attempts at a byte-fairness policy
+came apart before the read moved inside, each of them splitting the count from
+the decision that used it.
 
 Run it with `zig build echo`, then `curl localhost:8080`.
 
@@ -128,21 +125,20 @@ Run it with `zig build echo`, then `curl localhost:8080`.
 ## Reactors
 
 Five backends have been written against the same contract: poll, epoll,
-io_uring readiness, io_uring completion, and kqueue. `sched.zig` was unchanged
-across every one of them.
+io_uring readiness, io_uring completion, and kqueue. `sched.zig` stayed
+byte-identical through all of them.
 
-The kqueue port did not need a fifth copy of the reactor. Of `reactor.zig`'s
-400 lines, about 15 were ever epoll-specific, and those are now
-`backend_epoll.zig` and `backend_kqueue.zig`. The client table, the byte
-accounting, and the round policy stay shared. The semantics line up because
-`EV_ONESHOT` and `EPOLLONESHOT` mean the same thing. An event fires, the
-registration is gone, and the task stays parked until something rearms it.
+The kqueue port reused the reactor whole. Of `reactor.zig`'s 400 lines, about
+15 were epoll-specific, and those 15 are now `backend_epoll.zig` and
+`backend_kqueue.zig`. The client table, the byte accounting, and the round
+policy stay shared. The semantics line up because `EV_ONESHOT` and
+`EPOLLONESHOT` mean the same thing. An event fires, the registration is gone,
+and the task stays parked until something rearms it.
 
-Be careful with the word portable here. The readiness backends really are
-interchangeable, and `examples/echo.zig` is the proof. The io_uring completion
-build is not. It needs a different application shape, which is why
-`app/server_uring2.zig` is a separate file from `app/server.zig` rather than
-the same file with a flag.
+That interchangeability covers the readiness backends, and `examples/echo.zig`
+is the proof. The io_uring completion build asks for a different application
+shape, since the kernel fills buffers and hands back completions, so
+`app/server_uring2.zig` is its own file.
 
 ---
 
@@ -153,8 +149,8 @@ clock. The same seed gives a byte-identical trace hash over a million
 dispatches, and six hours of virtual time takes seconds of real time.
 
 The hash also matches across macOS on arm64 and Linux on x86_64, so the
-scheduler is deterministic across architecture and operating system, not only
-across runs on one machine.
+determinism holds across architecture and operating system as well as across
+runs.
 
 ---
 
@@ -162,7 +158,7 @@ across runs on one machine.
 
 ```
 src/
-  sched.zig            the scheduler. The only file with no I/O in it.
+  sched.zig            the scheduler. Pure logic, I/O free.
   quota.zig            conservation trees over a resource
   accounts.zig         per-phase telemetry, labels defined by the application
   reactor.zig          readiness reactor: client table, byte accounting, rounds
@@ -205,24 +201,24 @@ Use `-Drelease`. Zig 0.16 exposes that flag and rejects `-Doptimize`. It also
 matters more than usual here, because a Debug build of the server is a 498 MB
 file against 4.7 MB for ReleaseFast.
 
-That is disk, not memory. `iobuf.store` is a 135 MB static pool declared
-`undefined`. ReleaseFast leaves it uninitialised so it sits in `.bss` and
-occupies no bytes in the file, while Debug writes `0xAA` over it, which moves
-it into `.data` and into the binary. `.data` accounts for 181 MB of the Debug
-file; most of the rest is padding, since the loadable segments do not start
-until roughly 252 MB in.
+Those are file sizes. `iobuf.store` is a 135 MB static pool declared
+`undefined`. ReleaseFast leaves it uninitialised, so it lands in `.bss` and
+costs zero bytes on disk. Debug writes `0xAA` over it, which moves it into
+`.data` and into the file. `.data` accounts for 181 MB of the Debug binary,
+and the linker adds another 247 MB of padding between segments, which is where
+the rest goes.
 
-Neither number is what the process costs to run. Measured on Linux:
+Memory is a separate question. Measured on Linux:
 
 | | file | virtual | resident |
 |---|---|---|---|
 | Debug | 498.2 MB | 185.2 MB | 3.8 MB |
 | ReleaseFast | 4.7 MB | 137.5 MB | 2.4 MB |
 
-The pool is reserved address space in both. Only the pages actually touched
-are ever faulted in, and at the default of 64 buffers that is about a
-megabyte, so resident memory stays under 4 MB either way. The Debug binary is
-also not sparse, though it gzips to 3.1 MB if you need to move one.
+The pool is reserved address space in both builds, and the kernel faults in
+only the pages actually touched, which at the default of 64 buffers is about a
+megabyte. Resident memory stays under 4 MB either way. The Debug binary
+occupies its full 498 MB on disk and gzips to 3.1 MB.
 
 |  | Linux | macOS |
 |---|---|---|
@@ -251,23 +247,23 @@ surface.
 
 Gaps, in the order I would fix them:
 
-- One carrier, no threads. Multi-core is designed, shard rather than steal,
-  and not built.
-- Tasks are hand-rolled state machines rather than fibers. There is no
-  `perform` or `around`.
-- The io_uring completion build does not scale with queue depth, because a
-  provided buffer ring gives global backpressure rather than per-connection
-  flow control. See APIGUIDE.
-- `iobuf` has no "the kernel owns this" state, which an IOCP port would need
-  first.
-- The benches still speak raw Linux syscalls and have not been ported, so
-  generating load on macOS needs an outside tool.
-- `bench/diskbench.zig` uses a raw `open` syscall and will not compile for
-  arm64 Linux, which is openat only.
+- One carrier, single threaded. Multi-core is designed as sharding, and still
+  on paper.
+- Tasks are hand-rolled state machines. Fibers, `perform` and `around` are
+  still open.
+- The io_uring completion build stays flat as queue depth rises. A provided
+  buffer ring gives global backpressure, so per-connection flow control has to
+  come from somewhere else. See APIGUIDE.
+- `iobuf` needs a "the kernel owns this" state before an IOCP port is
+  possible.
+- The benches speak raw Linux syscalls, so generating load on macOS needs an
+  outside tool such as wrk.
+- `bench/diskbench.zig` uses a raw `open` syscall, so it compiles for x86_64
+  Linux only. arm64 is openat only.
 
 Numbers from the original measurements are in `results/` and discussed in
-`docs/STORY.md`. Treat them as a record of one session on one shared vCPU with
-the load generator running on the same core, not as a claim about this design.
+`docs/STORY.md`. Read them as a record of one session on one shared vCPU with
+the load generator running on the same core.
 
 ### A kernel bug worth knowing about
 
@@ -288,9 +284,9 @@ disassembling the function out of `/proc/kcore` is what confirmed it.
 
 `src/uring_bufring.zig` works around it. It registers the ring correctly
 first and falls back to the inverted form only on `EINVAL`, so a correct
-kernel succeeds on the first call and never sees a non-zero reserved field.
-When the fallback runs, the server says so in its stats. 6.8.0-134 is the last
-version known to be unaffected.
+kernel succeeds on the first call and stays on the spec-correct path. When the
+fallback runs, the server says so in its stats. 6.8.0-134 is the last version
+known to be unaffected.
 
 ---
 
@@ -299,4 +295,4 @@ version known to be unaffected.
 1. `docs/STORY.md`. What happened and what it taught. Start here.
 2. `examples/echo.zig`. The smallest thing that uses the kernel.
 3. `docs/APIGUIDE.md`. How the pieces fit, and every knob.
-4. `src/sched.zig`. The core, and the only file with no I/O in it.
+4. `src/sched.zig`. The core, and the one file that touches no I/O.
