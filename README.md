@@ -333,16 +333,23 @@ Known gaps:
   way in. The Launchpad reporter suspected that commit; the disassembly above
   is what confirms it.
 
-  There is no fix released as of this writing. The remedies are to run
-  6.8.0-134 or a mainline kernel. Working around it in userspace means
-  writing a non-zero value into a reserved field, which is correct only
-  against a kernel carrying this bug and rejected by every correct one, so
-  this project does not do it.
+  No fix is released as of this writing: the bug is still New and unassigned,
+  6.8.0-138 carries only networking CVEs, and while 6.8.0-139 pulls the
+  correct upstream commit in an stable patchset, nobody has confirmed it
+  resolves this. 6.8.0-134 is the last version known to work.
 
-  The completion reactor itself is fine. Patched past the bad check locally
-  -- not committed, since writing junk into a reserved field is only correct
-  against a kernel this broken -- `server_uring2` serves 1,102,349 requests
-  at **91.9k req/s** against epoll's 67-81k on the same two cores, with
+  `src/uring_bufring.zig` works around it so the completion build runs
+  meanwhile. It registers the ring the correct way first and falls back to
+  the inverted one **only** on `EINVAL`, so a correct kernel succeeds on the
+  first call and never sees a non-zero reserved field from this program; any
+  other errno is a real failure and is returned rather than retried. When the
+  fallback is used the server says so in its stats. The file exists for this
+  one bug and is meant to be deleted with a single `git rm` once the kernel
+  is fixed.
+
+  The completion reactor itself is fine. With the workaround in place,
+  `server_uring2` serves 1,102,349 requests at **91.9k req/s** against
+  epoll's 67-81k on the same two cores, with
   multishot recv rearming cleanly, `enobufs=0`, and buffer acquires equal to
   releases. So the io_uring advantage the table below claims does reproduce;
   it is the kernel, not the reactor, that is broken here.

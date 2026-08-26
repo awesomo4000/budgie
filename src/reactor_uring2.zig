@@ -296,7 +296,10 @@ pub const Reactor = struct {
         r.buf_size = buf_size;
         r.n_bufs = n_bufs;
         r.bufs_mem = try std.heap.page_allocator.alloc(u8, @as(usize, buf_size) * n_bufs);
-        r.br = try IoUring.setup_buf_ring(r.ring.fd, n_bufs, buf_group, .{ .inc = false });
+        // Not IoUring.setup_buf_ring: see uring_bufring.zig. It registers the
+        // correct way first and only works around a broken kernel if that is
+        // refused with EINVAL.
+        r.br = try @import("uring_bufring.zig").setup(r.ring.fd, n_bufs, buf_group);
         IoUring.buf_ring_init(r.br);
         r.br_mask = IoUring.buf_ring_mask(n_bufs);
         var bi: u16 = 0;

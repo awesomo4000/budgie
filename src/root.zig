@@ -66,6 +66,13 @@ pub const reactor_uring = if (has_io_uring)
 else
     @compileError("reactor_uring requires Linux io_uring");
 
+/// Buffer ring registration, working around an inverted reserved-field check
+/// in Ubuntu 6.8.0-136 and -137. Delete once that is fixed.
+pub const uring_bufring = if (has_io_uring)
+    @import("uring_bufring.zig")
+else
+    @compileError("uring_bufring requires Linux io_uring");
+
 /// io_uring reactor via multishot recv and a provided buffer ring
 /// (completion). Linux 5.19+, 6.0+ for IORING_RECV_MULTISHOT.
 pub const reactor_uring2 = if (has_io_uring)

@@ -1095,6 +1095,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         a.r.feat & linux.IORING_FEAT_SUBMIT_STABLE != 0,
         a.r.fixed_files, a.r.fixed_bufs, a.r.sends, a.r.file_updates,
     });
+
+    // Say it out loud. A run that silently worked around a kernel bug and one
+    // that did not are different runs, and the difference belongs in the
+    // stats rather than in whoever remembers the kernel version.
+    if (@import("coopkernel").uring_bufring.used_workaround)
+        std.debug.print("NOTE: buffer ring needed the inverted-resv workaround -- this kernel has Launchpad #2162843 (Ubuntu 6.8.0-136/-137). Upgrade past it.\n", .{});
     std.debug.print("uring: enters={d} cqes={d} recv_arms={d} multishot_ended={d} rearmed={d} stale_completions={d} enobufs={d} bytes_in={d}\n", .{
         a.r.enters, a.r.cqes_total, a.r.recv_arms, a.r.multishot_reups, a.r.rearms_after_end, a.r.stale_completions, a.r.enobufs, a.r.bytes_in,
     });
