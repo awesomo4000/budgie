@@ -811,7 +811,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     a.r.watch(listener_task, sock, .read);
 
     // Background task: always runnable, budget refilled on a period.
-    a.bufs.init(@intCast(K.io_bufs));
+    try a.bufs.init(@intCast(K.io_bufs));
     if (K.drr_quantum < 0) {
         // EXPERIMENTAL, NOT THE DEFAULT. Converges to a fair share and costs
         // an order of magnitude of throughput doing it -- see the note on

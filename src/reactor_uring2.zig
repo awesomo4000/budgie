@@ -310,7 +310,7 @@ pub const Reactor = struct {
         IoUring.buf_ring_advance(r.br, n_bufs);
 
         if (r.fixed_bufs) {
-            const region = @import("iobuf.zig").storeRegion(r.pool_slots);
+            const region = try @import("iobuf.zig").storeRegion(r.pool_slots);
             r.reg_base = @intFromPtr(region.ptr);
             r.reg_len = region.len;
             r.reg_iov[0] = .{ .base = region.ptr, .len = region.len };

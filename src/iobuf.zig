@@ -11,8 +11,10 @@
 //! discipline as the cancel token.
 //!
 //! Sizing the pool IS the memory budget: exhaustion is an admission decision
-//! with a real answer (503), not an allocation failure. That is the property
-//! a per-connection array cannot express.
+//! with a real answer (503), rather than an allocation failure. That is the
+//! property a per-connection array cannot express, and it is why the store is
+//! one mapping sized at startup: the number of buffers is a policy decision
+//! the operator makes once, and everything downstream reads it off the pool.
 
 const std = @import("std");
 const http = @import("http.zig");
@@ -51,22 +53,49 @@ pub const Handle = struct {
     }
 };
 
-/// Storage lives in BSS and is never initialised as a whole: pages stay
-/// unmapped until a slot is actually used. Writing `@splat(.{})` over this
-/// array would touch every page and defeat the entire point.
-var store: [max_bufs]IoBuf = undefined;
+/// Backing store for the pool, one anonymous mapping sized to the configured
+/// pool rather than to `max_bufs`.
+///
+/// This was a `[max_bufs]IoBuf = undefined` in BSS, which read as free: the
+/// pages stay unmapped until a slot is touched, so an unused ceiling cost
+/// nothing resident. It is free at runtime and expensive everywhere else.
+/// `max_bufs` slots is 135 MB of reserved address space whatever the pool is
+/// actually set to, and in a Debug build it is far worse, because Zig writes
+/// `0xAA` over `undefined` and that moves all 135 MB out of `.bss` and into
+/// the binary. The linker then pads around it. A Debug server was a 498 MB
+/// file for a pool that defaults to 64 buffers.
+///
+/// One mapping of exactly the slots asked for keeps the property that
+/// mattered, since anonymous pages fault in on first touch the same way BSS
+/// does, and drops the rest.
+var store: []IoBuf = &.{};
 
-/// The whole store as one region, so it can be handed to
-/// IORING_REGISTER_BUFFERS as a single registered buffer. Every `out` buffer
-/// then lives inside registered memory and a send can name an address within
-/// it, skipping get_user_pages per operation.
-/// Only the slots the pool will actually hand out. Registering the whole
-/// `max_bufs` array pins every page of it -- 8192 x 2904B = 23.8 MB of
-/// resident, pinned memory for a pool that may only ever use 32 slots. The
-/// registered region must match the pool's cap, not its ceiling.
-pub fn storeRegion(n_slots: usize) []u8 {
-    const n = @min(n_slots, max_bufs);
-    return std.mem.asBytes(&store)[0 .. @as(usize, n) * @sizeOf(IoBuf)];
+/// Size the store. Idempotent, because the io_uring build registers the region
+/// during reactor init and the pool initialises after it. Both are handed the
+/// same `io_bufs`, so whichever runs first allocates.
+///
+/// Growing later is refused rather than reallocated: by then the region may be
+/// registered with the kernel, and moving it would leave the ring pointing at
+/// freed memory.
+pub fn reserve(n_slots: usize) error{ OutOfMemory, StoreTooSmall }![]IoBuf {
+    const n: usize = @min(n_slots, max_bufs);
+    if (store.len == 0) store = try std.heap.page_allocator.alloc(IoBuf, n);
+    if (n > store.len) return error.StoreTooSmall;
+    return store;
+}
+
+/// The store as one region, so it can be handed to IORING_REGISTER_BUFFERS as
+/// a single registered buffer. Every `out` buffer then lives inside registered
+/// memory and a send can name an address within it, skipping get_user_pages
+/// per operation.
+///
+/// Only the slots the pool will actually hand out. Registering a ceiling pins
+/// every page of it, which is resident, pinned memory for slots that may never
+/// be used.
+pub fn storeRegion(n_slots: usize) ![]u8 {
+    const n: usize = @min(n_slots, max_bufs);
+    const s = try reserve(n);
+    return std.mem.sliceAsBytes(s)[0 .. n * @sizeOf(IoBuf)];
 }
 
 pub const Pool = struct {
@@ -81,8 +110,9 @@ pub const Pool = struct {
     releases: u64 = 0,
     exhausted: u64 = 0,
 
-    pub fn init(p: *Pool, cap: usize) void {
-        p.cap = @min(cap, max_bufs);
+    pub fn init(p: *Pool, cap: usize) !void {
+        p.cap = @min(cap, @as(usize, max_bufs));
+        _ = try reserve(p.cap);
         p.n_free = p.cap;
         var i: usize = 0;
         while (i < p.cap) : (i += 1) p.free[i] = @intCast(p.cap - 1 - i);

@@ -197,28 +197,7 @@ zig build test             # six test programs
 zig build check            # typecheck everything for Linux without running
 ```
 
-Use `-Drelease`. Zig 0.16 exposes that flag and rejects `-Doptimize`. It also
-matters more than usual here, because a Debug build of the server is a 498 MB
-file against 4.7 MB for ReleaseFast.
-
-Those are file sizes. `iobuf.store` is a 135 MB static pool declared
-`undefined`. ReleaseFast leaves it uninitialised, so it lands in `.bss` and
-costs zero bytes on disk. Debug writes `0xAA` over it, which moves it into
-`.data` and into the file. `.data` accounts for 181 MB of the Debug binary,
-and the linker adds another 247 MB of padding between segments, which is where
-the rest goes.
-
-Memory is a separate question. Measured on Linux:
-
-| | file | virtual | resident |
-|---|---|---|---|
-| Debug | 498.2 MB | 185.2 MB | 3.8 MB |
-| ReleaseFast | 4.7 MB | 137.5 MB | 2.4 MB |
-
-The pool is reserved address space in both builds, and the kernel faults in
-only the pages actually touched, which at the default of 64 buffers is about a
-megabyte. Resident memory stays under 4 MB either way. The Debug binary
-occupies its full 498 MB on disk and gzips to 3.1 MB.
+Use `-Drelease`. Zig 0.16 exposes that flag and rejects `-Doptimize`.
 
 |  | Linux | macOS |
 |---|---|---|

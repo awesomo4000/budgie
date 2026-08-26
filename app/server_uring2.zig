@@ -1017,7 +1017,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     a.r.watch(listener_task, sock, .read);
 
     // Background task: always runnable, budget refilled on a period.
-    a.bufs.init(@intCast(K.io_bufs));
+    try a.bufs.init(@intCast(K.io_bufs));
     a.s.grant_size = K.grant;
     a.q.define(sup_root, quota.none, quota.unlimited, .periodic, K.sup_period_ms, "root");
     a.q.define(sup_conn, sup_root, if (K.conn_quota > 0) K.conn_quota else quota.unlimited, .periodic, K.sup_period_ms, "conn");
