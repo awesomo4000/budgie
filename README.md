@@ -343,9 +343,11 @@ Known gaps:
   the inverted one **only** on `EINVAL`, so a correct kernel succeeds on the
   first call and never sees a non-zero reserved field from this program; any
   other errno is a real failure and is returned rather than retried. When the
-  fallback is used the server says so in its stats. The file exists for this
-  one bug and is meant to be deleted with a single `git rm` once the kernel
-  is fixed.
+  fallback is used the server says so in its stats. It is a compatibility
+  shim rather than a temporary patch -- it stays while affected kernels are
+  still in circulation, costs one extra `io_uring_register` at startup on a
+  broken kernel and nothing on a working one, and lives in its own file so
+  retiring it is one `git rm` and one call site.
 
   The completion reactor itself is fine. With the workaround in place,
   `server_uring2` serves 1,102,349 requests at **91.9k req/s** against

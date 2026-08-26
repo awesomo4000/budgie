@@ -1,8 +1,11 @@
 //! Registering a provided buffer ring, around a broken kernel.
 //!
-//! DELETE THIS FILE once Ubuntu ships a fixed 6.8 kernel. It exists for one
-//! bug and nothing else, and it is kept separate so removing it is a single
-//! `git rm` and one call site.
+//! This is a compatibility shim, not a temporary patch: it stays as long as
+//! affected kernels are still in circulation, which is not something the
+//! program can know from here. It costs one extra `io_uring_register` at
+//! startup on a broken kernel and nothing at all on a working one, so
+//! carrying it is close to free. It is kept in its own file so that retiring
+//! it, when that day comes, is a single `git rm` and one call site.
 //!
 //! Ubuntu 6.8.0-136 and -137 return `EINVAL` from `io_register_pbuf_ring`
 //! when the `io_uring_buf_reg` reserved fields are correctly zeroed, and
@@ -20,7 +23,7 @@
 //! `memchr_inv(s, 0, n) == NULL`, so upstream compiles to a `jne` into the
 //! error path; the shipped kernel has a `je`. The negation was lost.
 //!
-//! The shape here is what makes it safe to carry: register the correct way
+//! The shape is what makes it safe to ship anywhere: register the correct way
 //! first, and fall back only on `EINVAL`. A correct kernel succeeds on the
 //! first call and never reaches the second, so no correct system ever sees a
 //! non-zero reserved field from this program. Only a kernel carrying the bug
