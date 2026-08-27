@@ -47,7 +47,7 @@ pub const setReuseAddr = impl.setReuseAddr;
 pub const setLinger = impl.setLinger;
 pub const setNonblock = impl.setNonblock;
 pub const setNoDelay = impl.setNoDelay;
-pub const sleepMs = impl.sleepMs;
+pub const sleepRelNs = impl.sleepRelNs;
 pub const bind = impl.bind;
 pub const listen = impl.listen;
 pub const getsockname = impl.getsockname;
@@ -93,6 +93,28 @@ pub fn sysErr(rc: usize) bool {
 
 /// Loopback, in network byte order, which is the same bit pattern everywhere.
 pub const loopback: u32 = 0x0100007f;
+
+/// Sleep for `ms`, measured against the monotonic clock rather than against
+/// however many times a signal interrupted the attempt.
+///
+/// The obvious spellings both get this wrong in opposite directions. A bare
+/// `nanosleep` returns early when a signal arrives and reports a shorter sleep
+/// than asked for. `std.posix.poll` retries EINTR internally with the *full*
+/// timeout again, so a process taking a signal every 20ms and asking for 375ms
+/// can sleep for seconds: measured at 2311ms for a 375ms request, against a
+/// server whose own tick was the thing doing the interrupting.
+///
+/// Neither is acceptable for a test that is timing a server's deadline, so
+/// this loops against an absolute deadline and lets the clock decide.
+pub fn sleepMs(ms: u64) void {
+    const clock = @import("clock.zig");
+    const deadline = clock.monotonicNs() + @as(i64, @intCast(ms)) * 1_000_000;
+    while (true) {
+        const remaining = deadline - clock.monotonicNs();
+        if (remaining <= 0) return;
+        sleepRelNs(@intCast(remaining));
+    }
+}
 
 pub fn hostToNetPort(p: u16) u16 {
     return std.mem.nativeToBig(u16, p);

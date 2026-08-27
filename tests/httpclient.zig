@@ -189,8 +189,7 @@ pub fn countOf(bytes: []const u8, needle: []const u8) usize {
 /// Sleep, without reaching for `std.Thread.sleep`, which 0.16 moved behind
 /// `std.Io`. `poll` on an empty set is a timeout and nothing else.
 pub fn sleepMs(ms: i32) void {
-    var none: [0]std.posix.pollfd = .{};
-    _ = std.posix.poll(&none, ms) catch {};
+    budgie.sys.sleepMs(@intCast(@max(0, ms)));
 }
 
 /// Wait for a condition, up to a limit. Returns whether it came true.
