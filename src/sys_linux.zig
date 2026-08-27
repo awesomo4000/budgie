@@ -45,6 +45,20 @@ pub fn acceptNonblock(listener: i32) usize {
     return linux.accept4(listener, null, null, linux.SOCK.NONBLOCK);
 }
 
+/// A blocking TCP socket, for a client that wants to wait rather than poll.
+pub fn tcpSocket() usize {
+    return linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+}
+
+pub fn connect(fd: i32, addr: *const SockAddrIn) usize {
+    return linux.connect(fd, @ptrCast(addr), @sizeOf(SockAddrIn));
+}
+
+/// Half-close: stop sending, keep receiving. `how` is 1 for SHUT_WR.
+pub fn shutdown(fd: i32, how: i32) usize {
+    return linux.shutdown(fd, how);
+}
+
 pub fn read(fd: i32, buf: [*]u8, len: usize) usize {
     return linux.read(fd, buf, len);
 }

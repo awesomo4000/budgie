@@ -170,13 +170,13 @@ Requires Zig 0.16.0. Use `-Drelease`, which Zig 0.16 exposes in place of `-Dopti
 ```sh
 zig build -Drelease        # servers and the example into zig-out/bin
 zig build echo             # run the example server
-zig build test             # six test programs
+zig build test             # seven test programs
 zig build check            # typecheck everything for Linux without running
 ```
 
 |  | Linux | macOS |
 |---|---|---|
-| `zig build test` | 6/6 | 6/6 |
+| `zig build test` | 7/7 | 7/7 |
 | `examples/echo.zig` | epoll | kqueue |
 | `app/server.zig` | epoll | kqueue |
 | `app/server_uring2.zig` | io_uring | not available |

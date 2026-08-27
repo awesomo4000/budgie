@@ -43,21 +43,34 @@ var r: Reactor = .{};
 var listener: i32 = -1;
 
 pub fn main() !void {
-    listener = try listen(8080);
-    defer sys.close(listener);
+    const port = try start(8080);
 
+    // The only line in this file that knows a backend exists, and it only
+    // knows in order to say so.
+    const backend = if (@import("builtin").os.tag == .linux) "epoll" else "kqueue";
+    std.debug.print("listening on 127.0.0.1:{d} via {s}\n", .{ port, backend });
+
+    run();
+}
+
+/// Bind, and make the listener the first task. Returns the port actually
+/// bound, so passing 0 lets the operating system choose one. Split out from
+/// `run` so a test can start a server and then talk to it.
+pub fn start(port: u16) !u16 {
+    listener = try listen(port);
     try r.init();
-    defer r.deinit();
 
     s.live[listener_task] = true;
     s.setPrio(listener_task, 1); // accept ahead of serving
     r.watch(listener_task, listener, .read);
 
-    // The only line in this file that knows a backend exists, and it only
-    // knows in order to say so.
-    const backend = if (@import("builtin").os.tag == .linux) "epoll" else "kqueue";
-    std.debug.print("listening on 127.0.0.1:8080 via {s}\n", .{backend});
+    var addr = sys.SockAddrIn{ .port = 0, .addr = 0 };
+    if (sys.sysErr(sys.getsockname(listener, &addr))) return error.GetSockNameFailed;
+    return sys.netToHostPort(addr.port);
+}
 
+/// The loop, which is the whole contract.
+pub fn run() noreturn {
     while (true) {
         // 1. Run everything the scheduler says is runnable.
         while (s.popRunnable()) |t| step(t);

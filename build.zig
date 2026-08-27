@@ -30,6 +30,8 @@ const Test = struct {
     /// sim is a determinism check rather than an assertion check, and it runs
     /// six hours of virtual time; it wants the fast build.
     fast: bool = false,
+    /// echo_test starts the real example server, so it needs it as a module.
+    needs_echo: bool = false,
 };
 const tests = [_]Test{
     .{ .name = "parser_test" },
@@ -38,6 +40,7 @@ const tests = [_]Test{
     .{ .name = "feedcmp" },
     .{ .name = "chunkfuzz" },
     .{ .name = "sim", .args = &.{ "42", "64", "30" }, .fast = true },
+    .{ .name = "echo_test", .needs_echo = true },
 };
 
 pub fn build(b: *std.Build) void {
@@ -121,15 +124,28 @@ pub fn build(b: *std.Build) void {
         bench_step.dependOn(&install.step);
     }
 
+    // The example, as a module, so the end-to-end test can start the real
+    // server rather than a copy of it.
+    const echo_mod = b.createModule(.{
+        .root_source_file = b.path("examples/echo.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "budgie", .module = budgie }},
+    });
+
     const test_step = b.step("test", "Build and run the test programs");
     for (tests) |t| {
+        const imports: []const std.Build.Module.Import = if (t.needs_echo)
+            &.{ .{ .name = "budgie", .module = budgie }, .{ .name = "echo", .module = echo_mod } }
+        else
+            &.{.{ .name = "budgie", .module = budgie }};
         const exe = b.addExecutable(.{
             .name = t.name,
             .root_module = b.createModule(.{
                 .root_source_file = b.path(b.fmt("tests/{s}.zig", .{t.name})),
                 .target = target,
                 .optimize = if (t.fast) optimize else test_optimize,
-                .imports = &.{.{ .name = "budgie", .module = budgie }},
+                .imports = imports,
             }),
         });
 
