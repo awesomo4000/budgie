@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const sys = @import("budgie").sys;
 const Sched = @import("budgie").sched.Sched;
 const TaskId = @import("budgie").sched.TaskId;
 const max_tasks = @import("budgie").sched.max_tasks;
@@ -573,7 +574,16 @@ const App = struct {
     fn stepCtrl(a: *App, t: TaskId, c: *Conn) void {
         var buf: [64]u8 = undefined;
         const rc = linux.read(c.fd, &buf, buf.len);
-        if (sysErr(rc)) return a.r.watch(t, c.fd, .read);
+        if (sysErr(rc)) {
+            if (!sys.wouldBlock(rc)) {
+                a.r.unwatch(t);
+                a.s.release(t);
+                _ = linux.close(c.fd);
+                a.live_conn[t] = false;
+                return;
+            }
+            return a.r.watch(t, c.fd, .read);
+        }
         if (rc == 0) {
             a.r.unwatch(t);
             a.s.release(t);
@@ -906,7 +916,13 @@ const App = struct {
         if (b.out_sent >= b.out_len) return a.finishWrite(t, c, b);
         if (K.async_send == 0) {
             const rc = linux.write(c.fd, b.out[b.out_sent..].ptr, b.out_len - b.out_sent);
-            if (sysErr(rc)) return a.r.watch(t, c.fd, .write);
+            if (sysErr(rc)) {
+                // EAGAIN means wait; EPIPE and ECONNRESET mean the peer is
+                // gone. Parking on a dead descriptor holds a task and a buffer
+                // that nothing reclaims.
+                if (!sys.wouldBlock(rc)) return a.finish(t, c, .peer_gone);
+                return a.r.watch(t, c.fd, .write);
+            }
             b.out_sent += rc;
             if (b.out_sent < b.out_len) return a.r.watch(t, c.fd, .write);
             return a.finishWrite(t, c, b);
@@ -968,6 +984,7 @@ var conn_store_bss: [max_tasks]Conn = undefined;
 /// the operating system choose. Split out from `main` for the same reason as
 /// in server.zig: so a test can start the real thing and talk to it.
 pub fn start(want_port: u16) !u16 {
+    sys.ignoreSigpipe();
     const src = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK, 0);
     if (sysErr(src)) return error.SocketFailed;
     const sock: i32 = @intCast(src);

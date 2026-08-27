@@ -20,6 +20,12 @@ const eintr_retries = 8;
 /// Connect attempts, each on a fresh descriptor.
 const connect_retries = 40;
 
+/// Call before touching a socket. Without it a write to a peer that has gone
+/// away kills the test process, which reads as a hang rather than a failure.
+pub fn ignoreSigpipe() void {
+    budgie.sys.ignoreSigpipe();
+}
+
 pub const Client = struct {
     fd: i32,
 
@@ -128,6 +134,15 @@ pub const Client = struct {
         return !sys.sysErr(rc) and rc == 0;
     }
 
+    /// Make `close` send a RST rather than a FIN, so the peer's next write
+    /// lands on a torn-down connection. This is what a client crashing or a
+    /// load balancer giving up looks like from the server's side, and it is
+    /// the case that used to kill the process outright.
+    pub fn resetOnClose(c: Client) void {
+        const linger = extern struct { onoff: c_int, seconds: c_int }{ .onoff = 1, .seconds = 0 };
+        _ = budgie.sys.setLinger(c.fd, @ptrCast(&linger), @sizeOf(@TypeOf(linger)));
+    }
+
     pub fn halfClose(c: Client) void {
         _ = sys.shutdown(c.fd, 1); // SHUT_WR
     }
@@ -136,6 +151,23 @@ pub const Client = struct {
         sys.close(c.fd);
     }
 };
+
+/// The status line only, which is what a status assertion must look at.
+///
+/// Searching the whole response for "408" passes even when the status line
+/// says 503, because this server's bodies repeat the code: the body for a
+/// deadline is literally "408 deadline missed". A test written that way
+/// reports success for a server answering the wrong thing.
+pub fn statusLine(bytes: []const u8) []const u8 {
+    const eol = std.mem.indexOf(u8, bytes, "\r\n") orelse bytes.len;
+    return bytes[0..eol];
+}
+
+pub fn statusIs(bytes: []const u8, code: []const u8) bool {
+    const line = statusLine(bytes);
+    return std.mem.startsWith(u8, line, "HTTP/1.1 ") and
+        std.mem.indexOf(u8, line, code) != null;
+}
 
 pub fn request(target: []const u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "GET {s} HTTP/1.1\r\nHost: x\r\n\r\n", .{target}) catch unreachable;
@@ -159,6 +191,20 @@ pub fn countOf(bytes: []const u8, needle: []const u8) usize {
 pub fn sleepMs(ms: i32) void {
     var none: [0]std.posix.pollfd = .{};
     _ = std.posix.poll(&none, ms) catch {};
+}
+
+/// Wait for a condition, up to a limit. Returns whether it came true.
+///
+/// A fixed sleep before reading counters races whatever is still finishing,
+/// and the failure it produces is off by one and irreproducible. Polling still
+/// catches a real leak, which never balances however long you wait.
+pub fn waitUntil(comptime pred: fn () bool, timeout_ms: usize) bool {
+    var waited: usize = 0;
+    while (waited < timeout_ms) : (waited += 20) {
+        if (pred()) return true;
+        sleepMs(20);
+    }
+    return pred();
 }
 
 // ------------------------------------------------------------- reporting

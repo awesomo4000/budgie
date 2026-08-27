@@ -1,9 +1,9 @@
 # tests
 
-Nine programs, each with a `main` rather than `test` blocks: the fuzz and simulation drivers take a seed and an iteration count, and being able to re-run one by hand with a different seed is the point of them.
+Ten programs, each with a `main` rather than `test` blocks: the fuzz and simulation drivers take a seed and an iteration count, and being able to re-run one by hand with a different seed is the point of them.
 
 ```sh
-zig build test                  # all nine, in order; a non-zero exit fails
+zig build test                  # all ten, in order; a non-zero exit fails
 zig build sim        -- 42 64 600
 zig build chunkfuzz  -- 200000 0xBADF00D
 ```
@@ -21,6 +21,7 @@ They import the kernel as `@import("budgie")`. There is nothing to link or copy 
 | `echo_test.zig`   | drives `examples/echo.zig` over real sockets: keep-alive, pipelined bursts, byte-at-a-time delivery, every split boundary, malformed and oversized input, hangups, half-close, 32 concurrent connections, and slot reuse |
 | `server_test.zig` | drives `app/server.zig` the same way, for what the example leaves out: work units charged exactly, over-budget requests refused with 503, a storm of twenty of them, the control surface on the next port up and under load, and the counters agreeing afterwards |
 | `starve_test.zig` | runs `app/server.zig` with a pool of 2 against 24 simultaneous connections, and holds it to answering every one of them with a 503 rather than closing in silence |
+| `deadline_test.zig` | the idle deadline: a silent connection and a half-sent request are answered 408, an active one is never cut off, and the counters agree |
 | `httpclient.zig`  | the blocking client the socket tests share, not a test itself |
 
 Tests build at `ReleaseSafe`, not at `-Doptimize`: the suite states its invariants with `std.debug.assert`, which `ReleaseFast` compiles out. A green run in `ReleaseFast` would be checking almost nothing. `-Dtest-optimize=` overrides it; `sim` is the exception and builds at `-Doptimize`, because it checks a trace hash rather than assertions and runs six hours of virtual time.

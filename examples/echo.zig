@@ -57,6 +57,7 @@ pub fn main() !void {
 /// bound, so passing 0 lets the operating system choose one. Split out from
 /// `run` so a test can start a server and then talk to it.
 pub fn start(port: u16) !u16 {
+    sys.ignoreSigpipe();
     listener = try listen(port);
     try r.init();
 
@@ -93,7 +94,12 @@ fn step(t: TaskId) void {
     if (drain(t, c)) return; // a pipelined request may already be buffered
 
     const n = r.read(t, c.fd, c.in[c.in_len..]);
-    if (n < 0) return r.watch(t, c.fd, .read); // would block; park again
+    if (n < 0) {
+        // EAGAIN means park and wait. EPIPE or ECONNRESET means the peer is
+        // gone, and parking on a dead descriptor holds the task forever.
+        if (!sys.wouldBlock(@bitCast(n))) return finish(t, c);
+        return r.watch(t, c.fd, .read);
+    }
     if (n == 0) return finish(t, c); // peer hung up
     c.in_len += @intCast(n);
 
@@ -145,7 +151,10 @@ fn respond(t: TaskId, c: *Conn, req: http.Request) void {
 
 fn write(t: TaskId, c: *Conn) void {
     const rc = sys.write(c.fd, c.out[c.out_sent..].ptr, c.out_len - c.out_sent);
-    if (sys.sysErr(rc)) return r.watch(t, c.fd, .write);
+    if (sys.sysErr(rc)) {
+        if (!sys.wouldBlock(rc)) return finish(t, c);
+        return r.watch(t, c.fd, .write);
+    }
     c.out_sent += rc;
     if (c.out_sent < c.out_len) return r.watch(t, c.fd, .write);
     c.writing = false;

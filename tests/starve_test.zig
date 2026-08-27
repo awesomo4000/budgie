@@ -41,6 +41,11 @@ var start_failed: std.atomic.Value(bool) = .init(false);
 /// waits for a response fails, and only the checks that pass by receiving
 /// nothing still pass. The epoll build does not care, which is exactly why
 /// this is worth stating.
+fn buffersBalanced() bool {
+    const st = server.stats();
+    return st.buf_acquires == st.buf_releases;
+}
+
 fn serverThread() void {
     const p = server.start(0) catch {
         start_failed.store(true, .release);
@@ -64,6 +69,7 @@ fn startServer() !u16 {
 }
 
 pub fn main() !void {
+    hc.ignoreSigpipe();
     // Set before the thread starts, so the pool is sized when `start` runs.
     server.knobs().io_bufs = pool_size;
     const port = try startServer();
@@ -116,6 +122,7 @@ pub fn main() !void {
     check(refused > 0, "exhaustion actually happened", .{ .refused = refused, .served = served });
     check(mislabelled == 0, "exhaustion answered 503, never 408", .{ .mislabelled = mislabelled });
 
+    _ = hc.waitUntil(buffersBalanced, 3000);
     const st = server.stats();
     check(st.ended_no_buffer > 0, "no_buffer recorded as its own ending", .{ .no_buffer = st.ended_no_buffer });
     check(st.buf_acquires == st.buf_releases, "buffers balanced under exhaustion", .{

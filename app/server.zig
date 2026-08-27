@@ -547,7 +547,16 @@ const App = struct {
     fn stepCtrl(a: *App, t: TaskId, c: *Conn) void {
         var buf: [64]u8 = undefined;
         const rc = sys.read(c.fd, &buf, buf.len);
-        if (sysErr(rc)) return a.r.watch(t, c.fd, .read);
+        if (sysErr(rc)) {
+            if (!sys.wouldBlock(rc)) {
+                a.r.unwatch(t);
+                a.s.release(t);
+                sys.close(c.fd);
+                a.live_conn[t] = false;
+                return;
+            }
+            return a.r.watch(t, c.fd, .read);
+        }
         if (rc == 0) {
             a.r.unwatch(t);
             a.s.release(t);
@@ -616,6 +625,7 @@ const App = struct {
         if (b.in_len == b.in.len) return a.enterCleanup(t, c, .bad_request);
         const rc: usize = @bitCast(a.r.read(t, c.fd, b.in[b.in_len..]));
         if (sysErr(rc)) {
+            if (!sys.wouldBlock(rc)) return a.finish(t, c, .peer_gone);
             a.releaseIfIdle(c);
             return a.park(t, c, .read);
         }
@@ -762,7 +772,14 @@ const App = struct {
         defer a.book.observe(.write, nowNs() - t0);
         const b = a.bufs.get(c.buf) orelse return a.finish(t, c, .peer_gone);
         const rc = sys.write(c.fd, b.out[b.out_sent..].ptr, b.out_len - b.out_sent);
-        if (sysErr(rc)) return a.park(t, c, .write);
+        if (sysErr(rc)) {
+            // EAGAIN means wait. EPIPE and ECONNRESET mean the peer is gone,
+            // and parking on a dead descriptor holds a task and a buffer that
+            // nothing will ever reclaim: it keeps waking on I/O rather than on
+            // its deadline, so the deadline check never fires either.
+            if (!sys.wouldBlock(rc)) return a.finish(t, c, .peer_gone);
+            return a.park(t, c, .write);
+        }
         b.out_sent += rc;
         if (b.out_sent < b.out_len) return a.park(t, c, .write);
 
@@ -821,6 +838,7 @@ var conn_store_bss: [max_tasks]Conn = undefined;
 /// Split out from `main` so a test can start a real server and then talk to
 /// it. `main` is argv parsing, this, `runUntil`, and the stats dump.
 pub fn start(want_port: u16) !u16 {
+    sys.ignoreSigpipe();
     const src = sys.tcpSocketNonblock();
     if (sysErr(src)) return error.SocketFailed;
     const sock: i32 = @intCast(src);

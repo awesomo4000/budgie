@@ -13,6 +13,14 @@
 //! `acquires == releases` proves nothing leaked while answering it, and that
 //! is the assertion most likely to catch the next real bug.
 //!
+//! One limit worth stating. Signal disposition is per process, and the server
+//! shares this one, so `hc.ignoreSigpipe()` here also covers the server. That
+//! means this file cannot verify the server's own SIGPIPE handling: removing
+//! `sys.ignoreSigpipe()` from `start` leaves all these checks passing. It was
+//! verified out of process instead, by running the real binary and sending 400
+//! request-then-reset cycles at it. Before the fix that killed it after about
+//! three, exit status 141. After, it serves all 400 and keeps going.
+//!
 //! The server runs on its own thread for the same reason as in `echo_test`:
 //! so the test can block on a socket without deadlocking against a loop that
 //! is single threaded by design.
@@ -288,6 +296,49 @@ fn tHangupsAndVanish(port: u16) !void {
     check(true, "hangups mid-request and immediate closes accepted", .{});
 }
 
+/// A client that sends a request and then resets the connection.
+///
+/// Two separate faults lived here, and both were remote: the server's write
+/// landed on a torn-down socket and took SIGPIPE, whose default disposition
+/// is to terminate, so any peer could kill the process with one reset. Fixing
+/// that exposed the second, because with the signal ignored the write returned
+/// EPIPE and the code treated every write error as would-block. The task
+/// parked on a dead descriptor, kept waking on I/O rather than on its
+/// deadline, and was never reclaimed: 397 buffers and 401 tasks held after 400
+/// resets.
+fn tResetFlood(port: u16) !void {
+    const before = server.stats();
+    const rounds = 200;
+    var sent: usize = 0;
+    var rq: [128]u8 = undefined;
+    const req = workReq(200, &rq);
+
+    for (0..rounds) |_| {
+        const c = Client.connect(port) catch continue;
+        c.resetOnClose();
+        c.send(req) catch {
+            c.close();
+            continue;
+        };
+        c.close(); // RST, while the answer is being written
+        sent += 1;
+    }
+
+    // Surviving at all is the first assertion. Before the fix the process was
+    // gone by roughly the third round.
+    check(sent > rounds / 2, "server survived a flood of resets", .{ .sent = sent, .of = rounds });
+
+    hc.sleepMs(500);
+    const after = server.stats();
+    const accepted = after.accepted - before.accepted;
+    const ended = after.endings_total - before.endings_total;
+    check(ended >= accepted -| 4, "reset connections were reclaimed, not left parked", .{
+        .accepted = accepted,
+        .ended = ended,
+    });
+    check(after.buf_live <= 2, "no buffers left held by reset connections", .{ .live = after.buf_live });
+}
+
 fn tConcurrent(port: u16, n_conns: usize) !void {
     var clients: [48]Client = undefined;
     var opened: usize = 0;
@@ -332,10 +383,15 @@ fn tSlotReuse(port: u16, rounds: usize) !void {
     check(ok, "task and buffer slots reused across rounds", .{ .rounds = rounds });
 }
 
+fn buffersBalanced() bool {
+    const st = server.stats();
+    return st.buf_acquires == st.buf_releases;
+}
+
 fn tBuffersBalance() !void {
     // The assertion most likely to catch the next real bug. Every buffer
     // handed out across every case above came back.
-    hc.sleepMs(300); // let teardown settle
+    _ = hc.waitUntil(buffersBalanced, 3000);
     const st = server.stats();
     check(st.buf_acquires == st.buf_releases and st.buf_live == 0, "every buffer acquired was released", .{
         .acquires = st.buf_acquires,
@@ -401,6 +457,7 @@ fn startServer() !u16 {
 }
 
 pub fn main() !void {
+    hc.ignoreSigpipe();
     const port = try startServer();
     std.debug.print("server_test: server on 127.0.0.1:{d}, control on {d}\n", .{ port, port + 1 });
 
@@ -416,6 +473,7 @@ pub fn main() !void {
     try tControlSurface(port);
     try tControlSurfaceUnderLoad(port);
     try tHangupsAndVanish(port);
+    try tResetFlood(port);
     try tConcurrent(port, 32);
     try tSlotReuse(port, 4);
     try tStillHealthy(port);

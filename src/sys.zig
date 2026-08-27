@@ -44,6 +44,7 @@ pub const impl = switch (builtin.os.tag) {
 pub const SockAddrIn = impl.SockAddrIn;
 pub const tcpSocketNonblock = impl.tcpSocketNonblock;
 pub const setReuseAddr = impl.setReuseAddr;
+pub const setLinger = impl.setLinger;
 pub const setNonblock = impl.setNonblock;
 pub const setNoDelay = impl.setNoDelay;
 pub const sleepMs = impl.sleepMs;
@@ -54,12 +55,35 @@ pub const acceptNonblock = impl.acceptNonblock;
 pub const tcpSocket = impl.tcpSocket;
 pub const connect = impl.connect;
 pub const shutdown = impl.shutdown;
+pub const wouldBlock = impl.wouldBlock;
 pub const read = impl.read;
 pub const write = impl.write;
 pub const close = impl.close;
 pub const armIntervalTimer = impl.armIntervalTimer;
 pub const rssKb = impl.rssKb;
 pub const cpuMs = impl.cpuMs;
+
+
+/// Ignore SIGPIPE, so that writing to a peer that has hung up returns EPIPE
+/// instead of killing the process.
+///
+/// The default disposition for SIGPIPE is to terminate, which for a server is
+/// a remote denial of service and not a diagnostic. A client only has to send
+/// a request and reset the connection while the answer is being written.
+/// Measured before this existed: 400 request-then-RST cycles against
+/// `app/server.zig` killed it after roughly three, exit status 141, which is
+/// 128 plus signal 13.
+///
+/// Every write in this project already checks its return value, so EPIPE lands
+/// on a path that closes the connection and reclaims the task.
+pub fn ignoreSigpipe() void {
+    var act: std.posix.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = std.posix.sigemptyset(),
+        .flags = 0,
+    };
+    std.posix.sigaction(.PIPE, &act, null);
+}
 
 // --- platform-independent, so they stay here rather than being written twice
 

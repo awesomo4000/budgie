@@ -52,6 +52,11 @@ pub fn sleepMs(ms: u64) void {
     _ = c.nanosleep(&ts, null);
 }
 
+/// SO_LINGER, so a test can close with a RST instead of a FIN.
+pub fn setLinger(fd: i32, opt: *const anyopaque, len: u32) usize {
+    return wrap(c.setsockopt(fd, c.SOL.SOCKET, c.SO.LINGER, @ptrCast(opt), len));
+}
+
 pub fn setReuseAddr(fd: i32) void {
     const one: c_int = 1;
     _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int));
@@ -92,6 +97,24 @@ pub fn connect(fd: i32, addr: *const SockAddrIn) usize {
 /// Half-close: stop sending, keep receiving. `how` is 1 for SHUT_WR.
 pub fn shutdown(fd: i32, how: i32) usize {
     return wrap(c.shutdown(fd, how));
+}
+
+/// Whether a failed call merely means "not right now".
+///
+/// Every I/O call here reports failure as a negative return, which lumps
+/// EAGAIN in with EPIPE and ECONNRESET. Those mean opposite things. EAGAIN
+/// says park and wait; the others say the peer is gone and the connection
+/// should be reclaimed. Treating a terminal error as would-block parks a task
+/// on a dead descriptor, and since it keeps waking on I/O rather than on its
+/// deadline, nothing ever reclaims it: measured at 397 buffers and 401 tasks
+/// held after 400 reset connections.
+///
+/// Darwin reports -1 and puts the code in a thread-local, so this reads what
+/// the immediately preceding call left behind. Call it right after the check.
+pub fn wouldBlock(rc: usize) bool {
+    _ = rc;
+    const e = c._errno().*;
+    return e == @intFromEnum(c.E.AGAIN) or e == @intFromEnum(c.E.INTR);
 }
 
 pub fn read(fd: i32, buf: [*]u8, len: usize) usize {

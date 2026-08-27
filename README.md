@@ -170,13 +170,13 @@ Requires Zig 0.16.0. Use `-Drelease`, which Zig 0.16 exposes in place of `-Dopti
 ```sh
 zig build -Drelease        # servers and the example into zig-out/bin
 zig build echo             # run the example server
-zig build test             # nine test programs, eleven runs on Linux
+zig build test             # ten test programs, twelve runs on Linux
 zig build check            # typecheck everything for Linux without running
 ```
 
 |  | Linux | macOS |
 |---|---|---|
-| `zig build test` | 11/11 | 9/9 |
+| `zig build test` | 12/12 | 10/10 |
 | `examples/echo.zig` | epoll | kqueue |
 | `app/server.zig` | epoll | kqueue |
 | `app/server_uring2.zig` | io_uring, socket-tested | not available |
@@ -194,6 +194,11 @@ Open, roughly in the order I would take them:
 
 - One carrier, single threaded. Multi-core is designed as sharding, and still on paper.
 - Tasks are hand-rolled state machines. Fibers, `perform` and `around` are still open, and are the part most likely to change how this feels to use.
+- The io_uring completion build does not notice a keep-alive request that
+  arrives after a pause. The connection sits unread until the idle deadline
+  ends it with a 408, where the epoll build answers normally. Found by
+  `tests/deadline_test.zig`, which runs against that build as
+  `zig build uring_deadline_test` and currently fails there on purpose.
 - The io_uring completion build stays flat as queue depth rises. A provided buffer ring gives global backpressure, so per-connection flow control has to come from somewhere else. See APIGUIDE.
 - `iobuf` needs a "the kernel owns this" state before an IOCP port is possible.
 - `gen`, `diskbench`, `iobench` and `sysc` stay Linux-only. The first three are io_uring, and `sysc` measures raw syscall entry cost, which on macOS would be measuring libc.

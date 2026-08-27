@@ -326,6 +326,7 @@ fn serverThread() void {
 }
 
 pub fn main() !void {
+    hc.ignoreSigpipe();
     const port = try echo.start(0); // 0: let the OS pick, avoids collisions
     var thread = try std.Thread.spawn(.{}, serverThread, .{});
     thread.detach();
