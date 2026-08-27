@@ -146,13 +146,28 @@ pub fn build(b: *std.Build) void {
     });
 
     // app/server.zig as a module, so the socket test drives the real server.
-    // Linux only, in step with the reactor it is built against.
     const server_mod = b.createModule(.{
         .root_source_file = b.path("app/server.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "budgie", .module = budgie }},
     });
+
+    // The io_uring completion server, same idea. The socket tests are written
+    // against a module named `server`, so pointing that name at this instead
+    // runs the identical tests over the other reactor. Linux only.
+    const uring_mod = if (is_linux) b.createModule(.{
+        .root_source_file = b.path("app/server_uring2.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "budgie", .module = budgie }},
+    }) else null;
+
+    // The same two socket tests, pointed at the io_uring server.
+    const uring_variants = [_]struct { name: []const u8, src: []const u8 }{
+        .{ .name = "uring_test", .src = "tests/server_test.zig" },
+        .{ .name = "uring_starve_test", .src = "tests/starve_test.zig" },
+    };
 
     const test_step = b.step("test", "Build and run the test programs");
     for (tests) |t| {
@@ -199,6 +214,30 @@ pub fn build(b: *std.Build) void {
         solo.stdio = .inherit;
         if (b.args) |args| solo.addArgs(args) else solo.addArgs(t.args);
         b.step(t.name, b.fmt("Run {s}", .{t.name})).dependOn(&solo.step);
+    }
+
+    if (uring_mod) |um| {
+        for (uring_variants) |v| {
+            const exe = b.addExecutable(.{
+                .name = v.name,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(v.src),
+                    .target = target,
+                    .optimize = test_optimize,
+                    .imports = &.{
+                        .{ .name = "budgie", .module = budgie },
+                        .{ .name = "server", .module = um },
+                        .{ .name = "httpclient", .module = httpclient_mod },
+                    },
+                }),
+            });
+            const run = b.addRunArtifact(exe);
+            run.stdio = .inherit;
+            test_step.dependOn(&run.step);
+            const solo = b.addRunArtifact(exe);
+            solo.stdio = .inherit;
+            b.step(v.name, b.fmt("Run {s}", .{v.name})).dependOn(&solo.step);
+        }
     }
 
     // Cross-compile everything without running it. The kernel is Linux-only,

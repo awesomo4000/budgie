@@ -961,40 +961,17 @@ var app_storage: App = undefined;
 
 var conn_store_bss: [max_tasks]Conn = undefined;
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    var argv: [24][]const u8 = undefined;
-    var argc: usize = 0;
-    for (init.args.vector) |x| {
-        if (argc == 24) break;
-        argv[argc] = std.mem.span(x);
-        argc += 1;
-    }
-    const arg_port: u16 = if (argc > 1) (std.fmt.parseInt(u16, argv[1], 10) catch 0) else 0;
-    const arg_secs: i64 = if (argc > 2) (std.fmt.parseInt(i64, argv[2], 10) catch 12) else 12;
-    var csv = false;
-    for (argv[0..argc]) |arg| {
-        if (std.mem.eql(u8, arg, "csv")) { csv = true; continue; }
-        const eq = std.mem.indexOfScalar(u8, arg, '=') orelse continue;
-        const key = arg[0..eq];
-        const val = std.fmt.parseInt(i64, arg[eq + 1 ..], 10) catch continue;
-        inline for (@typeInfo(Knobs).@"struct".fields) |f| {
-            if (std.mem.eql(u8, key, f.name)) {
-                @field(K, f.name) = switch (f.type) {
-                    i64 => val,
-                    u64 => @intCast(val),
-                    usize => @intCast(val),
-                    else => @field(K, f.name),
-                };
-            }
-        }
-    }
 
+/// Bind and wire everything up. Returns the port actually bound, so 0 lets
+/// the operating system choose. Split out from `main` for the same reason as
+/// in server.zig: so a test can start the real thing and talk to it.
+pub fn start(want_port: u16) !u16 {
     const src = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK, 0);
     if (sysErr(src)) return error.SocketFailed;
     const sock: i32 = @intCast(src);
     const one: c_int = 1;
     _ = linux.setsockopt(sock, linux.SOL.SOCKET, linux.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int));
-    var addr = sockaddr_in{ .port = std.mem.nativeToBig(u16, arg_port), .addr = 0x0100007f };
+    var addr = sockaddr_in{ .port = std.mem.nativeToBig(u16, want_port), .addr = 0x0100007f };
     if (sysErr(linux.bind(sock, @ptrCast(&addr), @sizeOf(sockaddr_in)))) return error.BindFailed;
     if (sysErr(linux.listen(sock, 4096))) return error.ListenFailed;
     var len: linux.socklen_t = @sizeOf(sockaddr_in);
@@ -1059,11 +1036,108 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.mem.bigToNative(u16, addr.port), K.work_budget, K.cleanup_reserve, K.quantum_units,
     });
 
+
+    var bound: sockaddr_in = .{ .port = 0, .addr = 0 };
+    var blen: linux.socklen_t = @sizeOf(sockaddr_in);
+    _ = linux.getsockname(app_storage.listener, @ptrCast(&bound), &blen);
+    return std.mem.bigToNative(u16, bound.port);
+}
+
+pub fn runUntil(stop_ms: i64) void {
+    const a = &app_storage;
+    while (nowMs() < stop_ms) a.step();
+}
+
+/// Same shape as server.zig's, by name rather than by index. This build has an
+/// `overloaded` ending the other does not, so positions do not line up.
+pub const Stats = struct {
+    accepted: u64,
+    served: u64,
+    steps: u64,
+
+    ended_ok: u64,
+    ended_budget: u64,
+    ended_deadline: u64,
+    ended_cancelled: u64,
+    ended_bad_request: u64,
+    ended_no_buffer: u64,
+    ended_peer_gone: u64,
+    endings_total: u64,
+
+    buf_acquires: u64,
+    buf_releases: u64,
+    buf_live: usize,
+    buf_exhausted: u64,
+    top_ups: u64,
+    top_up_denials: u64,
+};
+
+pub fn stats() Stats {
+    const a = &app_storage;
+    var total: u64 = 0;
+    for (a.endings) |e| total += e;
+    return .{
+        .accepted = a.accepted,
+        .served = a.served,
+        .steps = a.steps,
+        .ended_ok = a.endings[@intFromEnum(Ending.ok)],
+        .ended_budget = a.endings[@intFromEnum(Ending.budget_exhausted)],
+        .ended_deadline = a.endings[@intFromEnum(Ending.deadline_missed)],
+        .ended_cancelled = a.endings[@intFromEnum(Ending.cancelled)],
+        .ended_bad_request = a.endings[@intFromEnum(Ending.bad_request)],
+        .ended_no_buffer = a.endings[@intFromEnum(Ending.no_buffer)],
+        .ended_peer_gone = a.endings[@intFromEnum(Ending.peer_gone)],
+        .endings_total = total,
+        .buf_acquires = a.bufs.acquires,
+        .buf_releases = a.bufs.releases,
+        .buf_live = a.bufs.live,
+        .buf_exhausted = a.bufs.exhausted,
+        .top_ups = a.s.top_ups,
+        .top_up_denials = a.s.top_up_denials,
+    };
+}
+
+pub const Tunables = Knobs;
+pub fn knobs() *Knobs {
+    return &K;
+}
+
+pub fn main(init: std.process.Init.Minimal) !void {
+    var argv: [24][]const u8 = undefined;
+    var argc: usize = 0;
+    for (init.args.vector) |x| {
+        if (argc == 24) break;
+        argv[argc] = std.mem.span(x);
+        argc += 1;
+    }
+    const arg_port: u16 = if (argc > 1) (std.fmt.parseInt(u16, argv[1], 10) catch 0) else 0;
+    const arg_secs: i64 = if (argc > 2) (std.fmt.parseInt(i64, argv[2], 10) catch 12) else 12;
+    var csv = false;
+    for (argv[0..argc]) |arg| {
+        if (std.mem.eql(u8, arg, "csv")) { csv = true; continue; }
+        const eq = std.mem.indexOfScalar(u8, arg, '=') orelse continue;
+        const key = arg[0..eq];
+        const val = std.fmt.parseInt(i64, arg[eq + 1 ..], 10) catch continue;
+        inline for (@typeInfo(Knobs).@"struct".fields) |f| {
+            if (std.mem.eql(u8, key, f.name)) {
+                @field(K, f.name) = switch (f.type) {
+                    i64 => val,
+                    u64 => @intCast(val),
+                    usize => @intCast(val),
+                    else => @field(K, f.name),
+                };
+            }
+        }
+    }
+
+    const port = try start(arg_port);
+    _ = port;
+
+    const a = &app_storage;
     const t_start = nowNs();
     const rss_start = rssKb();
     const cpu_start = cpuMs();
-    const stop = nowMs() + arg_secs * 1000;
-    while (nowMs() < stop) a.step();
+    runUntil(nowMs() + arg_secs * 1000);
 
     const wall_ns = nowNs() - t_start;
     var observed: i64 = 0;

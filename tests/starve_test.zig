@@ -28,15 +28,45 @@ const check = hc.check;
 const pool_size = 2;
 const n_conns = 24;
 
+
+/// The port the server bound, published once it is listening.
+var bound_port: std.atomic.Value(u16) = .init(0);
+var start_failed: std.atomic.Value(bool) = .init(false);
+
+/// `start` runs here rather than on the main thread, and that placement is
+/// load-bearing for the io_uring build. It sets IORING_SETUP_SINGLE_ISSUER,
+/// which requires every submission to come from the task that created the
+/// ring. Creating it on one thread and submitting from another leaves the
+/// server accepting connections and answering none of them: every check that
+/// waits for a response fails, and only the checks that pass by receiving
+/// nothing still pass. The epoll build does not care, which is exactly why
+/// this is worth stating.
 fn serverThread() void {
+    const p = server.start(0) catch {
+        start_failed.store(true, .release);
+        return;
+    };
+    bound_port.store(p, .release);
     server.runUntil(std.math.maxInt(i64));
 }
 
-pub fn main() !void {
-    server.knobs().io_bufs = pool_size;
-    const port = try server.start(0);
+fn startServer() !u16 {
     var thread = try std.Thread.spawn(.{}, serverThread, .{});
     thread.detach();
+    var waited: usize = 0;
+    while (bound_port.load(.acquire) == 0) {
+        if (start_failed.load(.acquire)) return error.ServerStartFailed;
+        hc.sleepMs(10);
+        waited += 1;
+        if (waited > 500) return error.ServerNeverStarted;
+    }
+    return bound_port.load(.acquire);
+}
+
+pub fn main() !void {
+    // Set before the thread starts, so the pool is sized when `start` runs.
+    server.knobs().io_bufs = pool_size;
+    const port = try startServer();
 
     std.debug.print("starve_test: server on 127.0.0.1:{d}, io_bufs={d}\n", .{ port, pool_size });
 
@@ -87,7 +117,7 @@ pub fn main() !void {
     check(mislabelled == 0, "exhaustion answered 503, never 408", .{ .mislabelled = mislabelled });
 
     const st = server.stats();
-    check(st.endings[5] > 0, "no_buffer recorded as its own ending", .{ .no_buffer = st.endings[5] });
+    check(st.ended_no_buffer > 0, "no_buffer recorded as its own ending", .{ .no_buffer = st.ended_no_buffer });
     check(st.buf_acquires == st.buf_releases, "buffers balanced under exhaustion", .{
         .acquires = st.buf_acquires,
         .releases = st.buf_releases,

@@ -895,7 +895,20 @@ pub const Stats = struct {
     accepted: u64,
     served: u64,
     steps: u64,
-    endings: [7]u64,
+
+    // Named rather than an array, because the two servers do not agree on the
+    // `Ending` enum: the io_uring build has an `overloaded` variant the epoll
+    // build has no use for. A test that indexes by position would silently
+    // read the wrong counter when pointed at the other one.
+    ended_ok: u64,
+    ended_budget: u64,
+    ended_deadline: u64,
+    ended_cancelled: u64,
+    ended_bad_request: u64,
+    ended_no_buffer: u64,
+    ended_peer_gone: u64,
+    endings_total: u64,
+
     buf_acquires: u64,
     buf_releases: u64,
     buf_live: usize,
@@ -906,11 +919,20 @@ pub const Stats = struct {
 
 pub fn stats() Stats {
     const a = &app_storage;
+    var total: u64 = 0;
+    for (a.endings) |e| total += e;
     return .{
         .accepted = a.accepted,
         .served = a.served,
         .steps = a.steps,
-        .endings = a.endings,
+        .ended_ok = a.endings[@intFromEnum(Ending.ok)],
+        .ended_budget = a.endings[@intFromEnum(Ending.budget_exhausted)],
+        .ended_deadline = a.endings[@intFromEnum(Ending.deadline_missed)],
+        .ended_cancelled = a.endings[@intFromEnum(Ending.cancelled)],
+        .ended_bad_request = a.endings[@intFromEnum(Ending.bad_request)],
+        .ended_no_buffer = a.endings[@intFromEnum(Ending.no_buffer)],
+        .ended_peer_gone = a.endings[@intFromEnum(Ending.peer_gone)],
+        .endings_total = total,
         .buf_acquires = a.bufs.acquires,
         .buf_releases = a.bufs.releases,
         .buf_live = a.bufs.live,

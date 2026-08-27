@@ -25,4 +25,8 @@ They import the kernel as `@import("budgie")`. There is nothing to link or copy 
 
 Tests build at `ReleaseSafe`, not at `-Doptimize`: the suite states its invariants with `std.debug.assert`, which `ReleaseFast` compiles out. A green run in `ReleaseFast` would be checking almost nothing. `-Dtest-optimize=` overrides it; `sim` is the exception and builds at `-Doptimize`, because it checks a trace hash rather than assertions and runs six hours of virtual time.
 
+On Linux the two socket tests run twice, once against `app/server.zig` over epoll and once against `app/server_uring2.zig` over io_uring, by pointing the module named `server` at the other file. The test sources are identical; only the binding changes.
+
+`start` runs on the server's own thread rather than the caller's, and that placement is load-bearing. The io_uring build sets `IORING_SETUP_SINGLE_ISSUER`, which requires every submission to come from the task that created the ring. Creating it on one thread and submitting from another leaves the server accepting connections and answering none: 14 of 18 checks failed that way, and the four that passed were the ones that pass by receiving nothing.
+
 `echo_test` starts the real example server on a thread, binds port 0 so runs cannot collide, and talks to it over the loopback interface. It exists because the rest of the suite never touched a socket, and two bugs lived in exactly that gap: a pipelined request the example kept in its buffer and never looked at again, and a clock call that passed a constant where it meant the time. Reintroducing either one now fails the build.

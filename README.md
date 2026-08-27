@@ -170,16 +170,16 @@ Requires Zig 0.16.0. Use `-Drelease`, which Zig 0.16 exposes in place of `-Dopti
 ```sh
 zig build -Drelease        # servers and the example into zig-out/bin
 zig build echo             # run the example server
-zig build test             # nine test programs
+zig build test             # nine test programs, eleven runs on Linux
 zig build check            # typecheck everything for Linux without running
 ```
 
 |  | Linux | macOS |
 |---|---|---|
-| `zig build test` | 9/9 | 9/9 |
+| `zig build test` | 11/11 | 9/9 |
 | `examples/echo.zig` | epoll | kqueue |
 | `app/server.zig` | epoll | kqueue |
-| `app/server_uring2.zig` | io_uring | not available |
+| `app/server_uring2.zig` | io_uring, socket-tested | not available |
 | `zig build bench` | yes | not ported |
 
 The Linux build links no libc. Nothing calls `linkLibC`, the ELF is static, and it carries no libc symbols, so a binary cross-compiled on a Mac runs on a Linux box with nothing installed. macOS is the opposite and always will be, because there is no stable syscall ABI there.

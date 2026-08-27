@@ -102,10 +102,10 @@ fn tBudgetRefusalIsClean(port: u16) !void {
     // Let the server finish the teardown before reading its counters.
     hc.sleepMs(200);
     const after = server.stats();
-    const budget_endings = after.endings[1] - before.endings[1];
+    const budget_endings = after.ended_budget - before.ended_budget;
     check(budget_endings >= 1, "budget refusal recorded as its own ending", .{
-        .before = before.endings[1],
-        .after = after.endings[1],
+        .before = before.ended_budget,
+        .after = after.ended_budget,
     });
 }
 
@@ -348,12 +348,9 @@ fn tEndingsAccountForConnections() !void {
     // Every connection that was accepted ended somewhere, and the reasons are
     // recorded rather than lost.
     const st = server.stats();
-    var total: u64 = 0;
-    for (st.endings) |e| total += e;
-    check(total > 0 and total <= st.accepted, "every ending accounted for", .{
+    check(st.endings_total > 0 and st.endings_total <= st.accepted, "every ending accounted for", .{
         .accepted = st.accepted,
-        .endings_total = total,
-        .endings = st.endings,
+        .endings_total = st.endings_total,
     });
 }
 
@@ -369,16 +366,42 @@ fn tStillHealthy(port: u16) !void {
 
 // ---------------------------------------------------------------- driver
 
+/// The port the server bound, published once it is listening.
+var bound_port: std.atomic.Value(u16) = .init(0);
+var start_failed: std.atomic.Value(bool) = .init(false);
+
+/// `start` runs here rather than on the main thread, and that placement is
+/// load-bearing for the io_uring build. It sets IORING_SETUP_SINGLE_ISSUER,
+/// which requires every submission to come from the task that created the
+/// ring. Creating it on one thread and submitting from another leaves the
+/// server accepting connections and answering none of them: every check that
+/// waits for a response fails, and only the checks that pass by receiving
+/// nothing still pass. The epoll build does not care, which is exactly why
+/// this is worth stating.
 fn serverThread() void {
-    // Far beyond the length of the run; the process exits when main returns.
+    const p = server.start(0) catch {
+        start_failed.store(true, .release);
+        return;
+    };
+    bound_port.store(p, .release);
     server.runUntil(std.math.maxInt(i64));
 }
 
-pub fn main() !void {
-    const port = try server.start(0); // 0: let the OS pick
+fn startServer() !u16 {
     var thread = try std.Thread.spawn(.{}, serverThread, .{});
     thread.detach();
+    var waited: usize = 0;
+    while (bound_port.load(.acquire) == 0) {
+        if (start_failed.load(.acquire)) return error.ServerStartFailed;
+        hc.sleepMs(10);
+        waited += 1;
+        if (waited > 500) return error.ServerNeverStarted;
+    }
+    return bound_port.load(.acquire);
+}
 
+pub fn main() !void {
+    const port = try startServer();
     std.debug.print("server_test: server on 127.0.0.1:{d}, control on {d}\n", .{ port, port + 1 });
 
     try tWorkUnitsCharged(port);
