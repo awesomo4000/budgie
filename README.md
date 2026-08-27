@@ -157,7 +157,7 @@ src/
 app/         the two servers, epoll/kqueue and io_uring completion
 examples/    echo.zig, the small backend-independent server
 tests/       parser, cancellation, pipelining, chunk fuzzing, the simulator
-bench/       load generators and microbenchmarks (Linux only)
+bench/       load generators and microbenchmarks
 docs/        APIGUIDE.md, LESSONS.md, architecture diagram
 results/     CSVs and plots from the original measurements
 stages/      srv..srv14, every checkpoint, kept as history
@@ -180,7 +180,7 @@ zig build check            # typecheck everything for Linux without running
 | `examples/echo.zig` | epoll | kqueue |
 | `app/server.zig` | epoll | kqueue |
 | `app/server_uring2.zig` | io_uring, socket-tested | not available |
-| `zig build bench` | yes | not ported |
+| `zig build bench` | all eight | the four network ones |
 
 The Linux build links no libc. Nothing calls `linkLibC`, the ELF is static, and it carries no libc symbols, so a binary cross-compiled on a Mac runs on a Linux box with nothing installed. macOS is the opposite and always will be, because there is no stable syscall ABI there.
 
@@ -196,7 +196,7 @@ Open, roughly in the order I would take them:
 - Tasks are hand-rolled state machines. Fibers, `perform` and `around` are still open, and are the part most likely to change how this feels to use.
 - The io_uring completion build stays flat as queue depth rises. A provided buffer ring gives global backpressure, so per-connection flow control has to come from somewhere else. See APIGUIDE.
 - `iobuf` needs a "the kernel owns this" state before an IOCP port is possible.
-- The benches speak raw Linux syscalls, so generating load on macOS needs an outside tool such as wrk.
+- `gen`, `diskbench`, `iobench` and `sysc` stay Linux-only. The first three are io_uring, and `sysc` measures raw syscall entry cost, which on macOS would be measuring libc.
 
 Numbers from the original measurements live in `results/` and are discussed in `docs/LESSONS.md`. Read them as a diary of one session on one shared vCPU with the load generator running on the same core.
 

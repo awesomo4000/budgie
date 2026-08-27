@@ -21,6 +21,24 @@ pub fn tcpSocketNonblock() usize {
     return linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK, 0);
 }
 
+/// Non-blocking mode on an existing descriptor. `tcpSocketNonblock` folds
+/// this into the socket call; a client that connects first needs it after.
+pub fn setNonblock(fd: i32) void {
+    _ = linux.fcntl(fd, 4, 0o4000); // F_SETFL, O_NONBLOCK
+}
+
+/// Nagle off. Load generators want each request on the wire immediately, or
+/// they measure Nagle rather than the server.
+pub fn setNoDelay(fd: i32) void {
+    const one: c_int = 1;
+    _ = linux.setsockopt(fd, 6, 1, @ptrCast(&one), @sizeOf(c_int)); // IPPROTO_TCP, TCP_NODELAY
+}
+
+pub fn sleepMs(ms: u64) void {
+    var ts: linux.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+    _ = linux.nanosleep(&ts, null);
+}
+
 pub fn setReuseAddr(fd: i32) void {
     const one: c_int = 1;
     _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int));

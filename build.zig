@@ -9,16 +9,14 @@ const std = @import("std");
 const apps = [_][]const u8{ "server", "server_uring2" };
 const linux_only_apps = [_][]const u8{"server_uring2"};
 
-/// Load generators and microbenchmarks. Every one is standalone -- they import
-/// only `std`, so a bench can be built and shipped to a load box on its own.
+/// Load generators and microbenchmarks.
 ///
-/// All of them still speak raw Linux syscalls directly and have not been
-/// ported; `gen` and `diskbench` are io_uring and never will be. The bench
-/// step is gated on Linux for that reason.
-const benches = [_][]const u8{
-    "gen",       "bench",  "bench2",  "ctrl",
-    "diskbench", "hold",   "iobench", "sysc",
-};
+/// The four network ones go through `sys.zig` and build anywhere the servers
+/// do. The rest are Linux-only for reasons that are not going away: `gen` and
+/// `iobench` are io_uring, `diskbench` is io_uring and O_DIRECT, and `sysc`
+/// measures raw syscall entry cost, which on macOS would be measuring libc.
+const portable_benches = [_][]const u8{ "bench", "bench2", "ctrl", "hold" };
+const linux_benches = [_][]const u8{ "gen", "diskbench", "iobench", "sysc" };
 
 /// Test programs, with the arguments `zig build test` runs them under.
 /// These are ordinary executables with a `main`, not `test` blocks: the fuzz
@@ -106,16 +104,19 @@ pub fn build(b: *std.Build) void {
     }
 
     const bench_step = b.step("bench", "Build the load generators and microbenchmarks");
-    if (!is_linux) {
-        // Say so rather than failing with a page of errors from inside the
-        // standard library, which is what a raw-syscall bench does when it is
-        // pointed at the wrong OS.
-        const note = b.addSystemCommand(&.{
-            "sh", "-c",
-            "echo 'bench: skipped -- the benches are Linux-only (raw syscalls; gen and diskbench are io_uring).' >&2",
+    for (portable_benches) |name| {
+        const exe = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("bench/{s}.zig", .{name})),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "budgie", .module = budgie }},
+            }),
         });
-        bench_step.dependOn(&note.step);
-    } else for (benches) |name| {
+        bench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+    if (is_linux) for (linux_benches) |name| {
         const exe = b.addExecutable(.{
             .name = name,
             .root_module = b.createModule(.{
@@ -124,9 +125,8 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
-        const install = b.addInstallArtifact(exe, .{});
-        bench_step.dependOn(&install.step);
-    }
+        bench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    };
 
     // The example, as a module, so the end-to-end test can start the real
     // server rather than a copy of it.
@@ -280,7 +280,19 @@ pub fn build(b: *std.Build) void {
             check_step.dependOn(&exe.step);
         }
     }
-    for (benches) |name| {
+    for (portable_benches) |name| {
+        const exe = b.addExecutable(.{
+            .name = b.fmt("check-{s}", .{name}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(b.fmt("bench/{s}.zig", .{name})),
+                .target = check_target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "budgie", .module = check_mod }},
+            }),
+        });
+        check_step.dependOn(&exe.step);
+    }
+    for (linux_benches) |name| {
         const exe = b.addExecutable(.{
             .name = b.fmt("check-{s}", .{name}),
             .root_module = b.createModule(.{

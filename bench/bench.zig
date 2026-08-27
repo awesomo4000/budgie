@@ -5,24 +5,17 @@
 
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
+const budgie = @import("budgie");
+const sys = budgie.sys;
 
-const sockaddr_in = extern struct {
-    family: u16 = linux.AF.INET,
-    port: u16,
-    addr: u32,
-    zero: [8]u8 = @splat(0),
-};
+// The shim's, because the BSDs put a length byte in front of the family.
+const sockaddr_in = sys.SockAddrIn;
 
 fn sysErr(rc: usize) bool {
     return @as(isize, @bitCast(rc)) < 0;
 }
 
-fn nowNs() i64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
-}
+fn nowNs() i64 { return budgie.clock.monotonicNs(); }
 
 const C = struct {
     fd: i32,
@@ -60,11 +53,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const addr = sockaddr_in{ .port = std.mem.nativeToBig(u16, port), .addr = 0x0100007f };
     for (conns, 0..) |*c, i| {
-        const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+        const rc = sys.tcpSocket();
         if (sysErr(rc)) return error.SocketFailed;
         const fd: i32 = @intCast(rc);
-        if (sysErr(linux.connect(fd, @ptrCast(&addr), @sizeOf(sockaddr_in)))) return error.ConnectFailed;
-        _ = linux.fcntl(fd, 4, 0o4000); // F_SETFL O_NONBLOCK
+        if (sysErr(sys.connect(fd, &addr))) return error.ConnectFailed;
+        sys.setNonblock(fd);
         c.* = .{ .fd = fd, .slow = i < nslow };
         const units = if (c.slow) slow_u else fast_u;
         c.req_len = (try std.fmt.bufPrint(&c.req, "GET /work/{d} HTTP/1.1\r\nHost: x\r\n\r\n", .{units})).len;
@@ -85,7 +78,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         for (conns, 0..) |*c, i| {
             if (fds[i].revents == 0) continue;
             if (c.sending) {
-                const rc = linux.write(c.fd, c.req[c.sent..].ptr, c.req_len - c.sent);
+                const rc = sys.write(c.fd, c.req[c.sent..].ptr, c.req_len - c.sent);
                 if (sysErr(rc)) continue;
                 c.sent += rc;
                 if (c.sent == c.req_len) {
@@ -93,7 +86,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     c.got = 0;
                 }
             } else {
-                const rc = linux.read(c.fd, c.buf[c.got..].ptr, c.buf.len - c.got);
+                const rc = sys.read(c.fd, c.buf[c.got..].ptr, c.buf.len - c.got);
                 if (sysErr(rc)) continue;
                 if (rc == 0) continue;
                 c.got += rc;

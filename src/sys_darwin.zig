@@ -34,10 +34,22 @@ pub fn tcpSocketNonblock() usize {
     return wrap(fd);
 }
 
-fn setNonblock(fd: c_int) void {
+pub fn setNonblock(fd: c_int) void {
     const flags = c.fcntl(fd, c.F.GETFL, @as(c_int, 0));
     if (flags < 0) return;
     _ = c.fcntl(fd, c.F.SETFL, flags | @as(c_int, @bitCast(c.O{ .NONBLOCK = true })));
+}
+
+/// Nagle off. Load generators want each request on the wire immediately, or
+/// they measure Nagle rather than the server.
+pub fn setNoDelay(fd: i32) void {
+    const one: c_int = 1;
+    _ = c.setsockopt(fd, c.IPPROTO.TCP, c.TCP.NODELAY, @ptrCast(&one), @sizeOf(c_int));
+}
+
+pub fn sleepMs(ms: u64) void {
+    var ts: c.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+    _ = c.nanosleep(&ts, null);
 }
 
 pub fn setReuseAddr(fd: i32) void {

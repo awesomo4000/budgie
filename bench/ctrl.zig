@@ -6,22 +6,15 @@
 //! usage: ctrl <port> <seconds> <interval_ms>
 
 const std = @import("std");
-const linux = std.os.linux;
+const budgie = @import("budgie");
+const sys = budgie.sys;
 
-const sockaddr_in = extern struct {
-    family: u16 = linux.AF.INET,
-    port: u16,
-    addr: u32,
-    zero: [8]u8 = @splat(0),
-};
+// The shim's, because the BSDs put a length byte in front of the family.
+const sockaddr_in = sys.SockAddrIn;
 fn sysErr(rc: usize) bool {
     return @as(isize, @bitCast(rc)) < 0;
 }
-fn nowNs() i64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
-}
+fn nowNs() i64 { return budgie.clock.monotonicNs(); }
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var argv: [6][]const u8 = undefined;
@@ -35,14 +28,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const secs = try std.fmt.parseInt(i64, argv[2], 10);
     const iv_ms = if (argc > 3) try std.fmt.parseInt(i64, argv[3], 10) else 10;
 
-    const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+    const rc = sys.tcpSocket();
     if (sysErr(rc)) return error.Socket;
     const fd: i32 = @intCast(rc);
     const addr = sockaddr_in{ .port = std.mem.nativeToBig(u16, port), .addr = 0x0100007f };
-    if (sysErr(linux.connect(fd, @ptrCast(&addr), @sizeOf(sockaddr_in)))) return error.Connect;
+    if (sysErr(sys.connect(fd, &addr))) return error.Connect;
     // TCP_NODELAY: Nagle would add its own latency and hide the scheduler's.
-    const one: c_int = 1;
-    _ = linux.setsockopt(fd, 6, 1, @ptrCast(&one), @sizeOf(c_int));
+    sys.setNoDelay(fd);
 
     var lat = std.ArrayList(i64).empty;
     const gpa = std.heap.page_allocator;
@@ -51,15 +43,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var buf: [8]u8 = undefined;
     while (nowNs() < stop) {
         const t0 = nowNs();
-        if (sysErr(linux.write(fd, @ptrCast(&key), 1))) break;
-        const r = linux.read(fd, &buf, buf.len);
+        if (sysErr(sys.write(fd, @ptrCast(&key), 1))) break;
+        const r = sys.read(fd, &buf, buf.len);
         if (sysErr(r) or r == 0) break;
         try lat.append(gpa, nowNs() - t0);
-        var req = linux.timespec{ .sec = 0, .nsec = @intCast(iv_ms * 1_000_000) };
-        _ = linux.nanosleep(&req, null);
-        _ = &req;
+        sys.sleepMs(@intCast(iv_ms));
     }
-    _ = linux.close(fd);
+    _ = sys.close(fd);
 
     const v = lat.items;
     if (v.len == 0) {

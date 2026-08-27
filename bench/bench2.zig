@@ -4,11 +4,12 @@
 //! usage: bench2 <port> <conns> <secs> <depth> <units>
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
-const sockaddr_in = extern struct { family: u16 = linux.AF.INET, port: u16, addr: u32, zero: [8]u8 = @splat(0) };
+const budgie = @import("budgie");
+const sys = budgie.sys;
+// The shim's, because the BSDs put a length byte in front of the family.
+const sockaddr_in = sys.SockAddrIn;
 fn sysErr(rc: usize) bool { return @as(isize, @bitCast(rc)) < 0; }
-fn nowNs() i64 { var ts: linux.timespec = undefined; _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64,@intCast(ts.sec))*1_000_000_000 + @as(i64,@intCast(ts.nsec)); }
+fn nowNs() i64 { return budgie.clock.monotonicNs(); }
 
 const C = struct {
     fd: i32,
@@ -43,13 +44,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const fds = try gpa.alloc(posix.pollfd, nconn);
     const addr = sockaddr_in{ .port = std.mem.nativeToBig(u16, port), .addr = 0x0100007f };
     for (conns) |*c| {
-        const rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+        const rc = sys.tcpSocket();
         if (sysErr(rc)) return error.Socket;
         c.* = .{ .fd = @intCast(rc) };
-        if (sysErr(linux.connect(c.fd, @ptrCast(&addr), @sizeOf(sockaddr_in)))) return error.Connect;
-        _ = linux.fcntl(c.fd, 4, 0o4000);
-        const one: c_int = 1;
-        _ = linux.setsockopt(c.fd, 6, 1, @ptrCast(&one), @sizeOf(c_int));
+        if (sysErr(sys.connect(c.fd, &addr))) return error.Connect;
+        sys.setNonblock(c.fd);
+        sys.setNoDelay(c.fd);
     }
 
     var lat = std.ArrayList(i64).empty;
@@ -59,7 +59,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // top up each connection to `depth` outstanding requests
         for (conns) |*c| {
             if (c.outstanding > 0) continue;
-            const w = linux.write(c.fd, burst.ptr, burst.len);
+            const w = sys.write(c.fd, burst.ptr, burst.len);
             if (sysErr(w) or w < burst.len) continue;
             const now0 = nowNs();
             for (0..depth) |_| {
@@ -72,7 +72,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         _ = posix.poll(fds, 50) catch 0;
         for (conns, 0..) |*c, i| {
             if (fds[i].revents == 0) continue;
-            const r = linux.read(c.fd, c.rbuf[c.rlen..].ptr, c.rbuf.len - c.rlen);
+            const r = sys.read(c.fd, c.rbuf[c.rlen..].ptr, c.rbuf.len - c.rlen);
             if (sysErr(r) or r == 0) continue;
             c.rlen += r;
             // count complete responses by their status lines
