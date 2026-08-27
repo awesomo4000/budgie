@@ -704,14 +704,26 @@ const App = struct {
             .budget_exhausted => "503 budget exhausted\n",
             .cancelled => "503 cancelled        \n",
             .no_buffer => "503 no buffer        \n",
-            else => "408 deadline missed\n",
+            .deadline_missed => "408 deadline missed\n",
+            .ok, .peer_gone => "500 internal error  \n",
         };
         const status = switch (why) {
+            // Exhaustive on purpose, with no `else`. An `else` arm is how
+            // `.no_buffer` came to answer "408 Request Timeout": the variant
+            // was added to `Ending`, nobody gave it a status, and the fallback
+            // quietly claimed the request had timed out. Adding an `Ending`
+            // now fails to compile until it has been given an answer.
+            //
+            // `.ok` and `.peer_gone` do not reach here. `ok` finishes
+            // normally and `peer_gone` goes straight to `finish`, which writes
+            // nothing because there is nobody to write to. They carry a status
+            // anyway rather than `unreachable`, so that being wrong about that
+            // shows up as an odd 500 in a log rather than as a panic in a
+            // server or as undefined behaviour in a release build.
             .bad_request => "400 Bad Request",
-            .budget_exhausted => "503 Service Unavailable",
-            .cancelled => "503 Service Unavailable",
-            .no_buffer => "503 Service Unavailable",
-            else => "408 Request Timeout",
+            .budget_exhausted, .cancelled, .no_buffer => "503 Service Unavailable",
+            .deadline_missed => "408 Request Timeout",
+            .ok, .peer_gone => "500 Internal Server Error",
         };
         // The unwind needs a buffer even if the body could not get one: that
         // is what a cleanup reserve means for memory. The pool holds one back
