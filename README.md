@@ -197,7 +197,6 @@ Open, roughly in the order I would take them:
 - The io_uring completion build stays flat as queue depth rises. A provided buffer ring gives global backpressure, so per-connection flow control has to come from somewhere else. See APIGUIDE.
 - `iobuf` needs a "the kernel owns this" state before an IOCP port is possible.
 - The benches speak raw Linux syscalls, so generating load on macOS needs an outside tool such as wrk.
-- `bench/diskbench.zig` uses a raw `open` syscall, so it compiles for x86_64 Linux only. arm64 is openat only.
 
 Numbers from the original measurements live in `results/` and are discussed in `docs/LESSONS.md`. Read them as a diary of one session on one shared vCPU with the load generator running on the same core.
 

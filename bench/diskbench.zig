@@ -21,21 +21,32 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const n_ops: usize = if (argc > 1) try std.fmt.parseInt(usize, argv[1], 10) else 20000;
     const file_mb: usize = 512;
     const gpa = std.heap.page_allocator;
-    const path = "/home/claude/direct.dat";
+
+    // Scratch file, second argument, defaulting to the working directory.
+    // This was hardcoded to a home directory that existed on one machine, so
+    // everywhere else the create failed, its result went unchecked, and the
+    // O_DIRECT open reported OpenDirect for a file that was never there.
+    const path: [*:0]const u8 = if (argc > 2) @ptrCast(argv[2].ptr) else "./direct.dat";
 
     {
         const fd = linux.open(path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+        if (sysErr(fd)) return error.CreateScratchFile;
         const buf = try gpa.alignedAlloc(u8, .fromByteUnits(4096), 1 << 20);
         @memset(buf, 0xcd);
-        for (0..file_mb) |_| _ = linux.write(@intCast(fd), buf.ptr, buf.len);
+        for (0..file_mb) |_| {
+            if (sysErr(linux.write(@intCast(fd), buf.ptr, buf.len))) return error.WriteScratchFile;
+        }
         _ = linux.fsync(@intCast(fd));
         _ = linux.close(@intCast(fd));
         gpa.free(buf);
     }
     // Drop what we can from cache, then open O_DIRECT so reads hit the device.
-    const O_DIRECT: u32 = 0o40000;
-    const rc = linux.syscall3(.open, @intFromPtr(path), @as(usize, 0) | O_DIRECT, 0);
-    if (sysErr(rc)) return error.OpenDirect;
+    //
+    // `openat` rather than `open`. arm64 Linux has no `open` syscall at all,
+    // only `openat`, so the raw `syscall3(.open, ...)` this used to make would
+    // not compile for aarch64 and took the whole tree with it.
+    const rc = linux.openat(linux.AT.FDCWD, path, .{ .ACCMODE = .RDONLY, .DIRECT = true }, 0);
+    if (sysErr(rc)) return error.OpenDirect; // O_DIRECT is refused on tmpfs and overlayfs
     const fd: i32 = @intCast(rc);
 
     var prng = std.Random.DefaultPrng.init(7);
