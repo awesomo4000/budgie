@@ -104,6 +104,12 @@ pub const Pool = struct {
     n_free: usize = 0,
     cap: usize = 0,
 
+    /// Slots withheld from `acquire`, reachable only by `acquireForCleanup`.
+    /// One is enough: an unwind formats a short fixed response and releases
+    /// immediately. A pool too small to spare one keeps none, since a pool of
+    /// one that reserves its only slot can serve nobody.
+    cleanup_slots: usize = 1,
+
     live: usize = 0,
     high_water: usize = 0,
     acquires: u64 = 0,
@@ -112,17 +118,45 @@ pub const Pool = struct {
 
     pub fn init(p: *Pool, cap: usize) !void {
         p.cap = @min(cap, @as(usize, max_bufs));
+        p.cleanup_slots = if (p.cap >= 2) 1 else 0;
         _ = try reserve(p.cap);
         p.n_free = p.cap;
         var i: usize = 0;
         while (i < p.cap) : (i += 1) p.free[i] = @intCast(p.cap - 1 - i);
     }
 
+    /// Take a buffer for a request body. Stops one short of empty, so the
+    /// last slot stays available to an unwind.
+    ///
+    /// Refusing here is the admission decision the pool exists to make: the
+    /// caller answers 503 rather than failing to allocate. That answer has to
+    /// be written somewhere, which is what `cleanup_slots` is for.
     pub fn acquire(p: *Pool) ?Handle {
+        if (p.n_free <= p.cleanup_slots) {
+            p.exhausted += 1;
+            return null;
+        }
+        return p.take();
+    }
+
+    /// Take a buffer for an unwind, including the reserved one.
+    ///
+    /// The execution budget keeps a cleanup reserve the body cannot spend, so
+    /// an unwind is funded even when the work that overran it was not. This is
+    /// the same idea for memory. Without it, a pool that runs dry takes the
+    /// error response with it: the body fails to acquire, the unwind retries
+    /// the identical call, fails identically, and the connection closes with
+    /// nothing written. Measured before this existed: 48 connections against a
+    /// pool of 2 produced 42 `no_buffer` endings and zero delivered 503s.
+    pub fn acquireForCleanup(p: *Pool) ?Handle {
         if (p.n_free == 0) {
             p.exhausted += 1;
             return null;
         }
+        return p.take();
+    }
+
+    fn take(p: *Pool) ?Handle {
         p.n_free -= 1;
         const idx = p.free[p.n_free];
         p.live += 1;

@@ -44,6 +44,7 @@ const tests = [_]Test{
     .{ .name = "sim", .args = &.{ "42", "64", "30" }, .fast = true },
     .{ .name = "echo_test", .needs_echo = true },
     .{ .name = "server_test", .needs_server = true },
+    .{ .name = "starve_test", .needs_server = true },
 };
 
 pub fn build(b: *std.Build) void {

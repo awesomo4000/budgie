@@ -875,6 +875,7 @@ const App = struct {
             .overloaded => "503 pipeline too deep\n",
             .budget_exhausted => "503 budget exhausted\n",
             .cancelled => "503 cancelled        \n",
+            .no_buffer => "503 no buffer        \n",
             else => "408 deadline missed\n",
         };
         const status = switch (why) {
@@ -882,11 +883,12 @@ const App = struct {
             .overloaded => "503 Service Unavailable",
             .budget_exhausted => "503 Service Unavailable",
             .cancelled => "503 Service Unavailable",
+            .no_buffer => "503 Service Unavailable",
             else => "408 Request Timeout",
         };
         // The unwind needs a buffer even if the body could not get one: that
         // is what a cleanup reserve means for memory.
-        if (c.buf.isNull()) c.buf = a.bufs.acquire() orelse return a.finish(t, c, why);
+        if (c.buf.isNull()) c.buf = a.bufs.acquireForCleanup() orelse return a.finish(t, c, why);
         const b = a.bufs.get(c.buf) orelse return a.finish(t, c, why);
         b.out_sent = 0;
         b.out_len = (std.fmt.bufPrint(&b.out, "HTTP/1.1 {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ status, body.len, body }) catch

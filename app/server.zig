@@ -687,21 +687,49 @@ const App = struct {
         // That unwatch is itself a cleanup-reserve action.
         a.r.unwatch(t);
         a.s.arm(t, nowMs() + 500);
+        // `.no_buffer` was falling through to the deadline arm, so a pool
+        // that ran dry answered "408 Request Timeout" to a client whose
+        // request had not timed out. The pool is an admission control, and
+        // the honest answer for admission refused is 503.
         const body = switch (why) {
             .bad_request => "400 bad request      \n",
             .budget_exhausted => "503 budget exhausted\n",
             .cancelled => "503 cancelled        \n",
+            .no_buffer => "503 no buffer        \n",
             else => "408 deadline missed\n",
         };
         const status = switch (why) {
             .bad_request => "400 Bad Request",
             .budget_exhausted => "503 Service Unavailable",
             .cancelled => "503 Service Unavailable",
+            .no_buffer => "503 Service Unavailable",
             else => "408 Request Timeout",
         };
         // The unwind needs a buffer even if the body could not get one: that
-        // is what a cleanup reserve means for memory.
-        if (c.buf.isNull()) c.buf = a.bufs.acquire() orelse return a.finish(t, c, why);
+        // is what a cleanup reserve means for memory. The pool holds one back
+        // for exactly this.
+        //
+        // One slot is not always enough. Under a burst every connection fails
+        // to acquire in the same reactor pass, so the number of unwinds
+        // wanting a buffer at once is the number of connections, and the
+        // reserve serves one of them. Measured: 48 connections against a pool
+        // of 2 gave 43 `no_buffer` endings and zero delivered 503s, with the
+        // reserve in place.
+        //
+        // So when even the reserve is gone, write the answer straight out. It
+        // is short, fixed, and goes to a socket whose send buffer is empty,
+        // which is the case where a single write takes all of it. A partial
+        // write here loses the tail of an error response on a connection that
+        // is closing anyway, and that is a better failure than closing with
+        // nothing said.
+        if (c.buf.isNull()) {
+            c.buf = a.bufs.acquireForCleanup() orelse {
+                var scratch: [128]u8 = undefined;
+                const msg = std.fmt.bufPrint(&scratch, "HTTP/1.1 {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ status, body.len, body }) catch return a.finish(t, c, why);
+                _ = sys.write(c.fd, msg.ptr, msg.len);
+                return a.finish(t, c, why);
+            };
+        }
         const b = a.bufs.get(c.buf) orelse return a.finish(t, c, why);
         b.out_sent = 0;
         b.out_len = (std.fmt.bufPrint(&b.out, "HTTP/1.1 {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ status, body.len, body }) catch
