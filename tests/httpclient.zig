@@ -1,0 +1,182 @@
+//! A blocking HTTP client, for tests that drive a real server over loopback.
+//!
+//! Shared by `echo_test.zig` and `server_test.zig`. It uses `budgie.sys` for
+//! the socket calls, which is the same shim the servers use, so a platform
+//! break shows up in the test rather than only in production.
+//!
+//! Everything here retries on `EINTR`. `app/server.zig` raises `SIGALRM` on a
+//! timer, and a signal landing between `poll` and `read` would otherwise look
+//! like a closed connection and fail a test that had nothing wrong with it.
+
+const std = @import("std");
+const budgie = @import("budgie");
+const sys = budgie.sys;
+
+pub const ok_head = "HTTP/1.1 200 OK";
+
+/// How many times to retry a syscall that failed without meaning it.
+const eintr_retries = 8;
+
+/// Connect attempts, each on a fresh descriptor.
+const connect_retries = 40;
+
+pub const Client = struct {
+    fd: i32,
+
+    /// Connect, retrying on a fresh descriptor each time.
+    ///
+    /// A socket whose connect failed cannot be reused; a second connect on it
+    /// returns EALREADY or EISCONN forever. Retrying on the same descriptor
+    /// turns one transient refusal under a burst into a permanent failure,
+    /// which is what made this flaky before.
+    pub fn connect(port: u16) !Client {
+        var attempt: usize = 0;
+        while (attempt < connect_retries) : (attempt += 1) {
+            const rc = sys.tcpSocket();
+            if (sys.sysErr(rc)) {
+                sleepMs(5);
+                continue;
+            }
+            const fd: i32 = @intCast(rc);
+            var addr = sys.SockAddrIn{ .port = sys.hostToNetPort(port), .addr = sys.loopback };
+            if (!sys.sysErr(sys.connect(fd, &addr))) return .{ .fd = fd };
+            sys.close(fd);
+            sleepMs(5); // a full accept queue drains; give it a moment
+        }
+        return error.ConnectFailed;
+    }
+
+    pub fn send(c: Client, bytes: []const u8) !void {
+        var off: usize = 0;
+        var stalls: usize = 0;
+        while (off < bytes.len) {
+            const rc = sys.write(c.fd, bytes[off..].ptr, bytes.len - off);
+            if (sys.sysErr(rc)) {
+                stalls += 1;
+                if (stalls > eintr_retries) return error.WriteFailed;
+                continue;
+            }
+            if (rc == 0) return error.WriteZero;
+            off += rc;
+            stalls = 0;
+        }
+    }
+
+    /// Read until `want` bytes arrive, the peer closes, or the timeout expires.
+    /// Returns what actually came, so a caller can tell a short answer from no
+    /// answer. Never hangs, so a stalled server fails one check rather than the
+    /// whole run.
+    pub fn recv(c: Client, buf: []u8, want: usize, timeout_ms: i32) usize {
+        var got: usize = 0;
+        var stalls: usize = 0;
+        while (got < want and got < buf.len) {
+            var p = [_]std.posix.pollfd{.{ .fd = c.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&p, timeout_ms) catch return got;
+            if (ready == 0) return got; // timed out
+
+            const rc = sys.read(c.fd, buf[got..].ptr, buf.len - got);
+            if (sys.sysErr(rc)) {
+                stalls += 1;
+                if (stalls > eintr_retries) return got;
+                continue;
+            }
+            if (rc == 0) return got; // peer closed
+            got += rc;
+            stalls = 0;
+        }
+        return got;
+    }
+
+    /// Read until `needle` has appeared `count` times, the peer closes, or the
+    /// timeout expires. Returns how many bytes arrived.
+    ///
+    /// Waiting on a marker rather than a byte count matters more than it
+    /// looks. A response here is 63 bytes; asking `recv` for 64 blocks for the
+    /// whole timeout on every single request, which turns a fast test into a
+    /// slow one and hides real stalls behind expected ones.
+    pub fn recvUntil(c: Client, buf: []u8, needle: []const u8, count: usize, timeout_ms: i32) usize {
+        var got: usize = 0;
+        var stalls: usize = 0;
+        while (got < buf.len) {
+            if (countOf(buf[0..got], needle) >= count) return got;
+
+            var p = [_]std.posix.pollfd{.{ .fd = c.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            const ready = std.posix.poll(&p, timeout_ms) catch return got;
+            if (ready == 0) return got;
+
+            const rc = sys.read(c.fd, buf[got..].ptr, buf.len - got);
+            if (sys.sysErr(rc)) {
+                stalls += 1;
+                if (stalls > eintr_retries) return got;
+                continue;
+            }
+            if (rc == 0) return got;
+            got += rc;
+            stalls = 0;
+        }
+        return got;
+    }
+
+    /// Whether the peer closed within the timeout. Tells "closed" apart from
+    /// "idle", which matters when the expected behaviour is a refusal.
+    pub fn closedByPeer(c: Client, timeout_ms: i32) bool {
+        var p = [_]std.posix.pollfd{.{ .fd = c.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = std.posix.poll(&p, timeout_ms) catch return false;
+        if (ready == 0) return false;
+        var b: [1]u8 = undefined;
+        const rc = sys.read(c.fd, &b, 1);
+        return !sys.sysErr(rc) and rc == 0;
+    }
+
+    pub fn halfClose(c: Client) void {
+        _ = sys.shutdown(c.fd, 1); // SHUT_WR
+    }
+
+    pub fn close(c: Client) void {
+        sys.close(c.fd);
+    }
+};
+
+pub fn request(target: []const u8, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "GET {s} HTTP/1.1\r\nHost: x\r\n\r\n", .{target}) catch unreachable;
+}
+
+/// How many 200 responses are in a buffer. Counting rather than parsing,
+/// because a pipelined burst arrives as one run of bytes.
+pub fn countOk(bytes: []const u8) usize {
+    return countOf(bytes, ok_head);
+}
+
+pub fn countOf(bytes: []const u8, needle: []const u8) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, bytes, i, needle)) |at| : (i = at + needle.len) n += 1;
+    return n;
+}
+
+/// Sleep, without reaching for `std.Thread.sleep`, which 0.16 moved behind
+/// `std.Io`. `poll` on an empty set is a timeout and nothing else.
+pub fn sleepMs(ms: i32) void {
+    var none: [0]std.posix.pollfd = .{};
+    _ = std.posix.poll(&none, ms) catch {};
+}
+
+// ------------------------------------------------------------- reporting
+
+pub var failures: usize = 0;
+pub var checks: usize = 0;
+
+pub fn check(ok: bool, comptime name: []const u8, detail: anytype) void {
+    checks += 1;
+    if (ok) {
+        std.debug.print("  ok    {s}\n", .{name});
+    } else {
+        failures += 1;
+        std.debug.print("  FAIL  {s}  {any}\n", .{ name, detail });
+    }
+}
+
+pub fn report() void {
+    std.debug.print("\n{d} checks, {d} failures\n", .{ checks, failures });
+    if (failures != 0) std.process.exit(1);
+}

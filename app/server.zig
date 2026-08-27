@@ -765,39 +765,19 @@ var app_storage: App = undefined;
 
 var conn_store_bss: [max_tasks]Conn = undefined;
 
-pub fn main(init: std.process.Init.Minimal) !void {
-    var argv: [24][]const u8 = undefined;
-    var argc: usize = 0;
-    for (init.args.vector) |x| {
-        if (argc == 24) break;
-        argv[argc] = std.mem.span(x);
-        argc += 1;
-    }
-    const arg_port: u16 = if (argc > 1) (std.fmt.parseInt(u16, argv[1], 10) catch 0) else 0;
-    const arg_secs: i64 = if (argc > 2) (std.fmt.parseInt(i64, argv[2], 10) catch 12) else 12;
-    var csv = false;
-    for (argv[0..argc]) |arg| {
-        if (std.mem.eql(u8, arg, "csv")) { csv = true; continue; }
-        const eq = std.mem.indexOfScalar(u8, arg, '=') orelse continue;
-        const key = arg[0..eq];
-        const val = std.fmt.parseInt(i64, arg[eq + 1 ..], 10) catch continue;
-        inline for (@typeInfo(Knobs).@"struct".fields) |f| {
-            if (std.mem.eql(u8, key, f.name)) {
-                @field(K, f.name) = switch (f.type) {
-                    i64 => val,
-                    u64 => @intCast(val),
-                    usize => @intCast(val),
-                    else => @field(K, f.name),
-                };
-            }
-        }
-    }
 
+/// Bind, wire up the scheduler, reactor, buffer pool and supervisor tree, and
+/// arm the tick. Returns the port actually bound, so passing 0 lets the
+/// operating system choose one.
+///
+/// Split out from `main` so a test can start a real server and then talk to
+/// it. `main` is argv parsing, this, `runUntil`, and the stats dump.
+pub fn start(want_port: u16) !u16 {
     const src = sys.tcpSocketNonblock();
     if (sysErr(src)) return error.SocketFailed;
     const sock: i32 = @intCast(src);
     sys.setReuseAddr(sock);
-    var addr = sockaddr_in{ .port = sys.hostToNetPort(arg_port), .addr = sys.loopback };
+    var addr = sockaddr_in{ .port = sys.hostToNetPort(want_port), .addr = sys.loopback };
     if (sysErr(sys.bind(sock, &addr))) return error.BindFailed;
     if (sysErr(sys.listen(sock, 4096))) return error.ListenFailed;
     _ = sys.getsockname(sock, &addr);
@@ -863,11 +843,97 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.mem.bigToNative(u16, addr.port), K.work_budget, K.cleanup_reserve, K.quantum_units,
     });
 
+
+    var bound = sockaddr_in{ .port = 0, .addr = 0 };
+    if (sysErr(sys.getsockname(app_storage.listener, &bound))) return error.GetSockNameFailed;
+    return sys.netToHostPort(bound.port);
+}
+
+/// Step until the deadline. The control surface listens on the bound port
+/// plus one.
+pub fn runUntil(stop_ms: i64) void {
+    const a = &app_storage;
+    while (nowMs() < stop_ms) a.step();
+}
+
+/// One iteration, for a test that wants to interleave rather than block.
+pub fn stepOnce() void {
+    app_storage.step();
+}
+
+/// Live counters, so a test can assert internal consistency rather than only
+/// what came back over the socket.
+pub const Stats = struct {
+    accepted: u64,
+    served: u64,
+    steps: u64,
+    endings: [7]u64,
+    buf_acquires: u64,
+    buf_releases: u64,
+    buf_live: usize,
+    buf_exhausted: u64,
+    top_ups: u64,
+    top_up_denials: u64,
+};
+
+pub fn stats() Stats {
+    const a = &app_storage;
+    return .{
+        .accepted = a.accepted,
+        .served = a.served,
+        .steps = a.steps,
+        .endings = a.endings,
+        .buf_acquires = a.bufs.acquires,
+        .buf_releases = a.bufs.releases,
+        .buf_live = a.bufs.live,
+        .buf_exhausted = a.bufs.exhausted,
+        .top_ups = a.s.top_ups,
+        .top_up_denials = a.s.top_up_denials,
+    };
+}
+
+/// Knobs, so a test can shrink a budget or a pool before starting.
+pub const Tunables = Knobs;
+pub fn knobs() *Knobs {
+    return &K;
+}
+
+pub fn main(init: std.process.Init.Minimal) !void {
+    var argv: [24][]const u8 = undefined;
+    var argc: usize = 0;
+    for (init.args.vector) |x| {
+        if (argc == 24) break;
+        argv[argc] = std.mem.span(x);
+        argc += 1;
+    }
+    const arg_port: u16 = if (argc > 1) (std.fmt.parseInt(u16, argv[1], 10) catch 0) else 0;
+    const arg_secs: i64 = if (argc > 2) (std.fmt.parseInt(i64, argv[2], 10) catch 12) else 12;
+    var csv = false;
+    for (argv[0..argc]) |arg| {
+        if (std.mem.eql(u8, arg, "csv")) { csv = true; continue; }
+        const eq = std.mem.indexOfScalar(u8, arg, '=') orelse continue;
+        const key = arg[0..eq];
+        const val = std.fmt.parseInt(i64, arg[eq + 1 ..], 10) catch continue;
+        inline for (@typeInfo(Knobs).@"struct".fields) |f| {
+            if (std.mem.eql(u8, key, f.name)) {
+                @field(K, f.name) = switch (f.type) {
+                    i64 => val,
+                    u64 => @intCast(val),
+                    usize => @intCast(val),
+                    else => @field(K, f.name),
+                };
+            }
+        }
+    }
+
+    const port = try start(arg_port);
+    _ = port;
+
+    const a = &app_storage;
     const t_start = nowNs();
     const rss_start = rssKb();
     const cpu_start = cpuMs();
-    const stop = nowMs() + arg_secs * 1000;
-    while (nowMs() < stop) a.step();
+    runUntil(nowMs() + arg_secs * 1000);
 
     const wall_ns = nowNs() - t_start;
     var observed: i64 = 0;

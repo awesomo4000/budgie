@@ -32,6 +32,8 @@ const Test = struct {
     fast: bool = false,
     /// echo_test starts the real example server, so it needs it as a module.
     needs_echo: bool = false,
+    /// server_test does the same with app/server.zig.
+    needs_server: bool = false,
 };
 const tests = [_]Test{
     .{ .name = "parser_test" },
@@ -41,6 +43,7 @@ const tests = [_]Test{
     .{ .name = "chunkfuzz" },
     .{ .name = "sim", .args = &.{ "42", "64", "30" }, .fast = true },
     .{ .name = "echo_test", .needs_echo = true },
+    .{ .name = "server_test", .needs_server = true },
 };
 
 pub fn build(b: *std.Build) void {
@@ -133,10 +136,37 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "budgie", .module = budgie }},
     });
 
+    // The blocking HTTP client the socket tests share.
+    const httpclient_mod = b.createModule(.{
+        .root_source_file = b.path("tests/httpclient.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "budgie", .module = budgie }},
+    });
+
+    // app/server.zig as a module, so the socket test drives the real server.
+    // Linux only, in step with the reactor it is built against.
+    const server_mod = b.createModule(.{
+        .root_source_file = b.path("app/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "budgie", .module = budgie }},
+    });
+
     const test_step = b.step("test", "Build and run the test programs");
     for (tests) |t| {
         const imports: []const std.Build.Module.Import = if (t.needs_echo)
-            &.{ .{ .name = "budgie", .module = budgie }, .{ .name = "echo", .module = echo_mod } }
+            &.{
+                .{ .name = "budgie", .module = budgie },
+                .{ .name = "echo", .module = echo_mod },
+                .{ .name = "httpclient", .module = httpclient_mod },
+            }
+        else if (t.needs_server)
+            &.{
+                .{ .name = "budgie", .module = budgie },
+                .{ .name = "server", .module = server_mod },
+                .{ .name = "httpclient", .module = httpclient_mod },
+            }
         else
             &.{.{ .name = "budgie", .module = budgie }};
         const exe = b.addExecutable(.{

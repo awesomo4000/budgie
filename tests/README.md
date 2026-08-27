@@ -1,9 +1,9 @@
 # tests
 
-Seven programs, each with a `main` rather than `test` blocks: the fuzz and simulation drivers take a seed and an iteration count, and being able to re-run one by hand with a different seed is the point of them.
+Eight programs, each with a `main` rather than `test` blocks: the fuzz and simulation drivers take a seed and an iteration count, and being able to re-run one by hand with a different seed is the point of them.
 
 ```sh
-zig build test                  # all seven, in order; a non-zero exit fails
+zig build test                  # all eight, in order; a non-zero exit fails
 zig build sim        -- 42 64 600
 zig build chunkfuzz  -- 200000 0xBADF00D
 ```
@@ -19,6 +19,8 @@ They import the kernel as `@import("budgie")`. There is nothing to link or copy 
 | `feedcmp.zig`     | old vs new parser `feed()`, for the record |
 | `sim.zig`         | deterministic simulation of the real scheduler on a virtual clock |
 | `echo_test.zig`   | drives `examples/echo.zig` over real sockets: keep-alive, pipelined bursts, byte-at-a-time delivery, every split boundary, malformed and oversized input, hangups, half-close, 32 concurrent connections, and slot reuse |
+| `server_test.zig` | drives `app/server.zig` the same way, for what the example leaves out: work units charged exactly, over-budget requests refused with 503, a storm of twenty of them, the control surface on the next port up and under load, and the counters agreeing afterwards |
+| `httpclient.zig`  | the blocking client the two socket tests share, not a test itself |
 
 Tests build at `ReleaseSafe`, not at `-Doptimize`: the suite states its invariants with `std.debug.assert`, which `ReleaseFast` compiles out. A green run in `ReleaseFast` would be checking almost nothing. `-Dtest-optimize=` overrides it; `sim` is the exception and builds at `-Doptimize`, because it checks a trace hash rather than assertions and runs six hours of virtual time.
 
