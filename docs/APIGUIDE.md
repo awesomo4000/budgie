@@ -403,14 +403,21 @@ Because nothing here performs I/O, byte-at-a-time input must produce results ide
 
 ```zig
 p.init(cap);
-p.acquire() ?Handle;    // null = pool exhausted
+p.acquire() ?Handle;             // null = pool at the cleanup floor
+p.acquireForCleanup() ?Handle;   // may take the last slot; unwinds only
 p.release(h);
-p.get(h) ?*IoBuf;       // null if the handle is stale
+p.get(h) ?*IoBuf;                // null if the handle is stale
 ```
 
 Generational handles: a handle for a released buffer fails a check rather than aliasing whoever got the slot next.
 
-Sizing the pool **is** the memory budget, and exhaustion is an admission decision with a real answer (503), not an allocation failure. With `io_bufs=64` and 256 connections attacking, 192 got a clean 503 and the server kept serving.
+Sizing the pool **is** the memory budget, and exhaustion is an admission decision with a real answer (503) rather than an allocation failure.
+
+That took two fixes to actually be true, and it is worth knowing which, because the original measurements were taken before either. `acquire` now stops one slot short of empty and only `acquireForCleanup` may cross that floor, which is the memory version of the cleanup reserve the execution budget already has. One slot is not enough on its own: under a burst every connection fails to acquire in the same reactor pass, so the number of unwinds wanting a buffer at once is the number of connections. When even the reserve is gone the unwind writes its answer straight to the socket from a stack buffer, needing no slot at all.
+
+Before that, a pool of 2 against 48 connections produced 43 `no_buffer` endings and zero delivered 503s. After, 24 connections against a pool of 2 give 3 served and 21 refused with a 503 that arrives. Figures elsewhere in this document that count `no_buffer` are counting refusals the server decided on, not responses a client received.
+
+The CSVs in `results/` corroborate that reading rather than contradicting it. `bufs.csv` and `bufs_e.csv` both report `non2xx=0` on every row, including the rows where the server recorded tens of thousands of refusals. `wrk` counts a reset connection as a socket error and not as a non-2xx response, so a column of zeros beside a large refusal count is the signature of refusals that never reached a client.
 
 Also, unexpectedly, it is a latency knob: fewer buffers means fewer connections with I/O in flight, a shorter queue, and a working set that fits cache (32 x 2904 B = 93 KB vs 3 MB at 1024). p50 1.40 ms -> 168 us with throughput flat and nothing shed.
 

@@ -106,8 +106,16 @@ const Knobs = struct {
     /// The READINESS build needs roughly one buffer PER CONNECTION, because
     /// `stepReading` acquires before reading, so every readable connection
     /// holds one at the same instant. Measured at 256 connections: io_bufs=64
-    /// produced 95,522 `no_buffer` 503s and 16k req/s; io_bufs=256 produced
-    /// zero and 87k.
+    /// recorded 95,522 `no_buffer` endings at 16k req/s; io_bufs=256 recorded
+    /// zero at 87k.
+    ///
+    /// Those were counted endings, and at the time an ending was not the same
+    /// thing as an answer. `.no_buffer` was missing from the switch that picks
+    /// the status line, so it fell through to the deadline arm, and the unwind
+    /// had no buffer to format into anyway, so most of those connections were
+    /// closed in silence. Both are fixed and a socket test holds them fixed,
+    /// but the 95,522 figure is a count of refusals the server decided on, not
+    /// of 503s a client received.
     ///
     /// The COMPLETION build is the opposite -- it acquires in `onData`, only
     /// once bytes have actually arrived, and processes completions serially,
