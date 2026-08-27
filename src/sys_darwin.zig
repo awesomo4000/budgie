@@ -47,8 +47,10 @@ pub fn setNoDelay(fd: i32) void {
     _ = c.setsockopt(fd, c.IPPROTO.TCP, c.TCP.NODELAY, @ptrCast(&one), @sizeOf(c_int));
 }
 
-pub fn sleepMs(ms: u64) void {
-    var ts: c.timespec = .{ .sec = @intCast(ms / 1000), .nsec = @intCast((ms % 1000) * 1_000_000) };
+/// Sleep for up to `ns`. May return early if a signal arrives; the caller is
+/// responsible for deciding whether that matters.
+pub fn sleepRelNs(ns: u64) void {
+    var ts: c.timespec = .{ .sec = @intCast(ns / 1_000_000_000), .nsec = @intCast(ns % 1_000_000_000) };
     _ = c.nanosleep(&ts, null);
 }
 

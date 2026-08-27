@@ -104,6 +104,22 @@ pub fn build(b: *std.Build) void {
         b.step("echo", "Run the example server from examples/echo.zig").dependOn(&run.step);
     }
 
+    // Scratch probe for the keep-alive stall investigation. Linux only.
+    if (is_linux) {
+        const exe = b.addExecutable(.{
+            .name = "mshot",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("probe/mshot.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "budgie", .module = budgie }},
+            }),
+        });
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        b.step("mshot", "Run the multishot recv probe").dependOn(&run.step);
+    }
+
     const bench_step = b.step("bench", "Build the load generators and microbenchmarks");
     for (portable_benches) |name| {
         const exe = b.addExecutable(.{
@@ -164,17 +180,12 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "budgie", .module = budgie }},
     }) else null;
 
-    // The same socket tests, pointed at the io_uring server.
-    //
-    // `uring_deadline_test` is deliberately absent, and is built as its own
-    // step below rather than joining `test`. It fails, and it fails for a real
-    // reason: a keep-alive connection with think-time between requests is not
-    // noticed by the completion build until the idle deadline kills it with a
-    // 408. The epoll build handles the same case. Run it with
-    // `zig build uring_deadline_test` while working on that.
+    // The same socket tests, pointed at the io_uring server. The test sources
+    // are identical; only the module named `server` changes.
     const uring_variants = [_]struct { name: []const u8, src: []const u8 }{
         .{ .name = "uring_test", .src = "tests/server_test.zig" },
         .{ .name = "uring_starve_test", .src = "tests/starve_test.zig" },
+        .{ .name = "uring_deadline_test", .src = "tests/deadline_test.zig" },
 
     };
 
@@ -247,28 +258,6 @@ pub fn build(b: *std.Build) void {
             solo.stdio = .inherit;
             b.step(v.name, b.fmt("Run {s}", .{v.name})).dependOn(&solo.step);
         }
-    }
-
-    // The known-failing variant, on its own step so it is runnable without
-    // making `zig build test` report a failure that nobody is going to fix in
-    // passing.
-    if (uring_mod) |um| {
-        const exe = b.addExecutable(.{
-            .name = "uring_deadline_test",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("tests/deadline_test.zig"),
-                .target = target,
-                .optimize = test_optimize,
-                .imports = &.{
-                    .{ .name = "budgie", .module = budgie },
-                    .{ .name = "server", .module = um },
-                    .{ .name = "httpclient", .module = httpclient_mod },
-                },
-            }),
-        });
-        const run = b.addRunArtifact(exe);
-        run.stdio = .inherit;
-        b.step("uring_deadline_test", "Run the deadline test against the io_uring server (known failing)").dependOn(&run.step);
     }
 
     // Cross-compile everything without running it. The kernel is Linux-only,

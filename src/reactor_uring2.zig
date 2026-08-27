@@ -51,6 +51,11 @@ pub var coop_taskrun: bool = false;
 const tag_recv: u64 = 0;
 const tag_poll: u64 = 1 << 40;
 const tag_timeout: u64 = 1 << 41;
+/// Cancellations need a user_data of their own. They used to borrow
+/// `tag_timeout`, and the completion loop treats anything wearing that value
+/// as the periodic tick expiring, so every cancellation cleared `tick_armed`
+/// for a tick that had not fired.
+const tag_cancel: u64 = 1 << 42;
 const tag_send: u64 = 1 << 42;
 const tag_mask: u64 = 0xffff_ffff;
 
@@ -191,6 +196,8 @@ pub const Reactor = struct {
     /// still in flight for the old incarnation is recognisably stale.
     arm_gen: [sched.max_tasks]u32 = @splat(0),
     stale_completions: u64 = 0,
+    dbg_last: i64 = 0,
+    dbg_watch: sched.TaskId = 0,
     gen_keys: bool = true,
     /// Buffers the app is holding because it could not take their bytes.
     /// While these are held they are NOT in the ring, so the kernel runs short
@@ -378,7 +385,7 @@ pub const Reactor = struct {
     /// instead, because multishot simply uses a different buffer.
     pub fn pauseRecv(r: *Reactor, task: sched.TaskId) void {
         if (!r.armed_recv[task]) return;
-        _ = r.ring.poll_remove(tag_timeout, key(tag_recv, task, r.arm_gen[task])) catch {};
+        _ = r.ring.poll_remove(tag_cancel, key(tag_recv, task, r.arm_gen[task])) catch {};
         r.armed_recv[task] = false;
         if (r.armed > 0) r.armed -= 1;
         r.arm_gen[task] +%= 1; // any completion still in flight is now stale
@@ -387,7 +394,7 @@ pub const Reactor = struct {
 
     pub fn unwatch(r: *Reactor, task: sched.TaskId) void {
         if (r.armed_recv[task]) {
-            _ = r.ring.poll_remove(tag_timeout, key(tag_recv, task, r.arm_gen[task])) catch {};
+            _ = r.ring.poll_remove(tag_cancel, key(tag_recv, task, r.arm_gen[task])) catch {};
             r.armed_recv[task] = false;
             if (r.armed > 0) r.armed -= 1;
         }
@@ -486,10 +493,16 @@ pub const Reactor = struct {
         // non-blocking for a bounded window to let stragglers accumulate.
         if (timeout_ms > 0 and !r.tick_armed) {
             r.tick_ts = .{ .sec = 0, .nsec = r.tick_ns };
-            _ = r.ring.timeout(tag_timeout, &r.tick_ts, 0, 0) catch {};
-            r.sqes_total += 1;
-            r.timeout_arms += 1;
-            r.tick_armed = true;
+            // Only claim it is armed if it armed. This used to set the flag
+            // whatever happened, so a full submission queue left the reactor
+            // believing a timer was pending that was not, and every later wait
+            // skipped arming one. `submit_and_wait(1)` then blocks with no
+            // timeout at all.
+            if (r.ring.timeout(tag_timeout, &r.tick_ts, 0, 0)) |_| {
+                r.sqes_total += 1;
+                r.timeout_arms += 1;
+                r.tick_armed = true;
+            } else |_| {}
         }
         const wait_nr: u32 = if (timeout_ms == 0) 0 else 1;
 
@@ -539,11 +552,22 @@ pub const Reactor = struct {
             }
         }
         r.cqes_total += n;
+        {
+            const now_ms = @divTrunc(nowNsLocal(), 1_000_000);
+            if (now_ms - r.dbg_last >= 200) {
+                if (r.dbg_watch != 0) {
+                    const t5 = r.dbg_watch;
+                    std.debug.print("DBG {d}ms t{d}: armed_recv={} needs_rearm={} armed={d} enters={d} cqes={d} tick_armed={}\n", .{ now_ms, t5, r.armed_recv[t5], r.needs_rearm[t5], r.armed, r.enters, r.cqes_total, r.tick_armed });
+                }
+                r.dbg_last = now_ms;
+            }
+        }
         for (cqes[0..n]) |cqe| {
             if (cqe.user_data == tag_timeout) {
                 r.tick_armed = false;
                 continue;
             }
+            if (cqe.user_data == tag_cancel) continue; // a cancellation landing, nothing to do
             const task = keyTask(cqe.user_data);
             if (use_gen and keyGen(cqe.user_data) != r.arm_gen[task]) {
                 // Late completion for a released incarnation. Recycle its

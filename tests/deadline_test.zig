@@ -10,27 +10,14 @@
 //! deadline is what turns that into an answer, which makes it exactly the kind
 //! of path that can rot without anyone noticing.
 //!
-//! Against `app/server_uring2.zig` this test fails, and the failure is real.
-//! A keep-alive connection that pauses between requests is not read again: the
-//! request sits in the kernel and the connection is ended by this deadline
-//! with a 408 for a request that had already arrived. What is known:
-//!
-//!   - The deadline itself is correct. It is armed to now+1500 by `finishWrite`
-//!     and fires at exactly that time, so the connection really was idle from
-//!     the server's point of view.
-//!   - The recv is armed the whole time. `armed_recv` stays true, no multishot
-//!     end is recorded, and no ENOBUFS appears.
-//!   - The data really did arrive on time. Its completion is delivered only
-//!     after the deadline tears the connection down, roughly 1.7s late.
-//!   - The loop is not stuck. It wakes on a 4ms internal tick throughout, and
-//!     never blocks more than 100ms.
-//!   - It is not the `submit_and_wait(0)` DEFER_TASKRUN defect fixed in
-//!     `reactor_uring2.wait`. That path is barely taken here, and fixing it
-//!     moved the failure rate from 8-in-8 to 6-in-8 rather than clearing it.
-//!
-//! So a multishot recv, armed, on a ring being entered with GETEVENTS every
-//! 4ms, is not delivering data that has arrived. That is further into the recv
-//! lifecycle than the above accounts for.
+//! A note on the sleep between requests, because it cost a long investigation.
+//! It has to be measured against the clock, not against however many times a
+//! signal interrupted the attempt. `std.posix.poll` retries EINTR with the
+//! full timeout again, and this server raises SIGALRM on a 20ms tick, so a
+//! 375ms sleep built on it measured 2311ms. The client then sent its next
+//! request after the deadline had passed, the server answered 408 exactly as
+//! it should, and the test called that a server bug. `sys.sleepMs` loops
+//! against an absolute deadline for that reason.
 //!
 //! Worth being precise about what a 408 means here. It is not the request
 //! timing out on the server's side. It is the server declining to hold a task,
