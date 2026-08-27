@@ -492,11 +492,33 @@ pub const Reactor = struct {
             r.tick_armed = true;
         }
         const wait_nr: u32 = if (timeout_ms == 0) 0 else 1;
-        _ = r.ring.submit_and_wait(wait_nr) catch {
-            _ = r.ring.submit() catch {};
-            r.enters += 1;
-            return 0;
-        };
+
+        // DEFER_TASKRUN defers completion work until the owning task enters
+        // the kernel with IORING_ENTER_GETEVENTS. `submit_and_wait(0)` sets
+        // neither that flag nor, when the submission queue is empty, any enter
+        // at all, so with the flag on a non-blocking poll of this ring does
+        // not actually poll it: deferred completions stay invisible.
+        //
+        // Entering explicitly with GETEVENTS and min_complete 0 runs the
+        // deferred work without blocking, which is what asking for "anything
+        // ready right now" has to mean on a DEFER_TASKRUN ring.
+        //
+        // This is a real defect and it is fixed here, but it is not the cause
+        // of the keep-alive stall in tests/deadline_test.zig: that path uses
+        // wait_nr 1, which already sets GETEVENTS. See the note in that file.
+        if (wait_nr == 0 and defer_taskrun) {
+            const submitted = r.ring.flush_sq();
+            _ = r.ring.enter(submitted, 0, linux.IORING_ENTER_GETEVENTS) catch {
+                r.enters += 1;
+                return 0;
+            };
+        } else {
+            _ = r.ring.submit_and_wait(wait_nr) catch {
+                _ = r.ring.submit() catch {};
+                r.enters += 1;
+                return 0;
+            };
+        }
         r.enters += 1;
 
         var cqes: [max_cqes]linux.io_uring_cqe = undefined;
