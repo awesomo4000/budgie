@@ -32,6 +32,10 @@ const Test = struct {
     needs_echo: bool = false,
     /// server_test does the same with app/server.zig.
     needs_server: bool = false,
+    /// Build step name, when it should differ from the file name. The
+    /// catalogues of failure modes are named `wrong-*` so they group together
+    /// in `zig build --help` and read as what they are.
+    step: ?[]const u8 = null,
 };
 const tests = [_]Test{
     .{ .name = "parser_test" },
@@ -46,6 +50,7 @@ const tests = [_]Test{
     .{ .name = "starve_test", .needs_server = true },
     .{ .name = "deadline_test", .needs_server = true },
     .{ .name = "writepath_test", .needs_server = true },
+    .{ .name = "wrong_cancel", .step = "wrong-cancel" },
 };
 
 pub fn build(b: *std.Build) void {
@@ -274,7 +279,8 @@ pub fn build(b: *std.Build) void {
         const solo = b.addRunArtifact(exe);
         solo.stdio = .inherit;
         if (b.args) |args| solo.addArgs(args) else solo.addArgs(t.args);
-        b.step(t.name, b.fmt("Run {s}", .{t.name})).dependOn(&solo.step);
+        const step_name = t.step orelse t.name;
+        b.step(step_name, b.fmt("Run {s}", .{t.name})).dependOn(&solo.step);
     }
 
     if (uring_mod) |um| {
