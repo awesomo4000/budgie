@@ -65,6 +65,16 @@ const Knobs = struct {
     /// for the run, instead of one write per answer. See the note on the same
     /// knob in app/server.zig.
     out_batch: i64 = 1,
+    /// Kernel send buffer for an accepted connection, in bytes. 0 leaves the
+    /// system default, which on both platforms auto-tunes into the megabytes.
+    ///
+    /// It is here because backpressure is otherwise unreachable. A test that
+    /// wants the server to meet EAGAIN has to leave several megabytes of
+    /// response unread, and the buffer keeps growing while it tries. Setting
+    /// this bounds the per-connection kernel memory, which is the same kind of
+    /// decision `io_bufs` is, and makes the parked-write path something a test
+    /// can provoke in one round trip.
+    send_buf_bytes: i64 = 0,
     uring_batch: i64 = 1,
     uring_window_us: i64 = 200,
     fixed_files: i64 = 1,
@@ -333,6 +343,14 @@ const App = struct {
     defer_max_ns: i64 = 0,
     served: u64 = 0,
     batched_answers: u64 = 0,
+    /// Backpressure, in its two shapes, counted so a test can assert the path
+    /// ran rather than assuming a small buffer was enough to provoke it. A
+    /// write that moved some bytes and stopped leaves `out_sent` partway
+    /// through and has to resume; a write that moved none found the peer's
+    /// window shut. They are separate counters because they are separate
+    /// paths, and a test that only reaches one of them has only covered one.
+    partial_writes: u64 = 0,
+    write_stalls: u64 = 0,
 
     // ----------------------------------------------------------- the kernel
 
@@ -509,6 +527,7 @@ const App = struct {
             const rc = linux.accept4(a.listener, null, null, linux.SOCK.NONBLOCK);
             if (sysErr(rc)) break;
             const fd: i32 = @intCast(rc);
+            if (K.send_buf_bytes > 0) sys.setSendBuf(fd, @intCast(K.send_buf_bytes));
             const t = a.freeTask() orelse {
                 _ = linux.close(fd);
                 break;
@@ -706,6 +725,7 @@ const App = struct {
         b.out_sent += @intCast(res);
         c.send_inflight = false;
         if (b.out_sent < b.out_len) {
+            a.partial_writes += 1;
             _ = a.r.submitSend(t, c.fd, b.out[b.out_sent..b.out_len]);
             c.send_inflight = true;
             return;
@@ -950,10 +970,14 @@ const App = struct {
                 // gone. Parking on a dead descriptor holds a task and a buffer
                 // that nothing reclaims.
                 if (!sys.wouldBlock(rc)) return a.finish(t, c, .peer_gone);
+                a.write_stalls += 1;
                 return a.r.watch(t, c.fd, .write);
             }
             b.out_sent += rc;
-            if (b.out_sent < b.out_len) return a.r.watch(t, c.fd, .write);
+            if (b.out_sent < b.out_len) {
+                a.partial_writes += 1;
+                return a.r.watch(t, c.fd, .write);
+            }
             return a.finishWrite(t, c, b);
         }
         if (!a.r.submitSend(t, c.fd, b.out[b.out_sent..b.out_len])) {
@@ -1121,6 +1145,8 @@ pub const Stats = struct {
     buf_exhausted: u64,
     top_ups: u64,
     top_up_denials: u64,
+    partial_writes: u64,
+    write_stalls: u64,
 };
 
 pub fn stats() Stats {
@@ -1145,6 +1171,8 @@ pub fn stats() Stats {
         .buf_exhausted = a.bufs.exhausted,
         .top_ups = a.s.top_ups,
         .top_up_denials = a.s.top_up_denials,
+        .partial_writes = a.partial_writes,
+        .write_stalls = a.write_stalls,
     };
 }
 
