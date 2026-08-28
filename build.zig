@@ -106,6 +106,44 @@ pub fn build(b: *std.Build) void {
         b.step("echo", "Run the example server from examples/echo.zig").dependOn(&run.step);
     }
 
+    // Cancellation on its own, no I/O. A scratchpad for the interface rather
+    // than a demonstration of a settled one.
+    {
+        const exe = b.addExecutable(.{
+            .name = "cancel",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/cancel.zig"),
+                .target = target,
+                .optimize = test_optimize,
+                .imports = &.{.{ .name = "budgie", .module = budgie }},
+            }),
+        });
+        b.installArtifact(exe);
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        if (b.args) |args| run.addArgs(args);
+        b.step("cancel", "Run the cancellation example from examples/cancel.zig").dependOn(&run.step);
+    }
+
+    // The same race with the cancellation check hoisted into a dispatcher.
+    // Read next to examples/cancel.zig; the comparison is the point.
+    {
+        const exe = b.addExecutable(.{
+            .name = "cancel-supervised",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/cancel_supervised.zig"),
+                .target = target,
+                .optimize = test_optimize,
+                .imports = &.{.{ .name = "budgie", .module = budgie }},
+            }),
+        });
+        b.installArtifact(exe);
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        if (b.args) |args| run.addArgs(args);
+        b.step("cancel-supervised", "Run examples/cancel_supervised.zig").dependOn(&run.step);
+    }
+
     // Scratch probe for the keep-alive stall investigation. Linux only.
     if (is_linux) {
         const exe = b.addExecutable(.{
