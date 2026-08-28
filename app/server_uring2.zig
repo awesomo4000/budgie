@@ -61,6 +61,10 @@ const Knobs = struct {
     /// far below the connection count (64 vs 256 measured). The readiness
     /// build is the opposite and needs one per connection.
     io_bufs: i64 = 64,
+    /// 1 = append pipelined answers into one buffer and issue a single write
+    /// for the run, instead of one write per answer. See the note on the same
+    /// knob in app/server.zig.
+    out_batch: i64 = 1,
     uring_batch: i64 = 1,
     uring_window_us: i64 = 200,
     fixed_files: i64 = 1,
@@ -328,6 +332,7 @@ const App = struct {
     tick_coalesced: u64 = 0,
     defer_max_ns: i64 = 0,
     served: u64 = 0,
+    batched_answers: u64 = 0,
 
     // ----------------------------------------------------------- the kernel
 
@@ -865,13 +870,34 @@ const App = struct {
         if (c.work_left > 0) return a.s.makeRunnable(t, .spawn);
 
         const b = a.bufs.get(c.buf) orelse return a.finish(t, c, .peer_gone);
-        b.out_len = (std.fmt.bufPrint(&b.out,
+
+        // Append rather than overwrite: anything already in `out` answers an
+        // earlier request on this connection that has not been written yet.
+        const answer = std.fmt.bufPrint(b.out[b.out_len..],
             "HTTP/1.1 200 OK\r\nContent-Length: 24\r\n\r\ndone, spent {d:>5} units\n", .{c.spent}) catch
-            return a.finish(t, c, .peer_gone)).len;
+            return a.finish(t, c, .peer_gone);
+        b.out_len += answer.len;
+        a.served += 1;
+
+        if (K.out_batch != 0 and b.in_len > 0 and b.out.len - b.out_len >= max_answer_bytes) {
+            b.parser.reset();
+            c.spent = 0;
+            c.work_left = 0;
+            c.phase = .reading;
+            a.s.setReserve(t, K.cleanup_reserve);
+            a.s.renewCap(t, K.work_budget);
+            a.s.arm(t, nowMs() + K.idle_deadline_ms);
+            a.batched_answers += 1;
+            return a.s.makeRunnable(t, .spawn);
+        }
+
         b.out_sent = 0;
         c.phase = .writing;
         a.s.makeRunnable(t, .spawn);
     }
+
+    /// Worst case for one answer, so the batching loop knows when to stop.
+    const max_answer_bytes = 96;
 
     fn enterCleanup(a: *App, t: TaskId, c: *Conn, why: Ending) void {
         c.ending = why;
@@ -940,7 +966,6 @@ const App = struct {
     /// The response is fully out. Either close (cleanup path) or recycle.
     fn finishWrite(a: *App, t: TaskId, c: *Conn, b: *iobuf.IoBuf) void {
         if (c.phase == .cleanup) return a.finish(t, c, c.ending);
-        a.served += 1;
         // Reset the parser and the OUTPUT only. `b.in` holds pipelined bytes
         // that belong to the next request and must survive untouched.
         b.out_len = 0;
@@ -979,7 +1004,6 @@ const App = struct {
         a.r.unregisterFile(t);
         _ = linux.close(c.fd);
         a.live_conn[t] = false;
-        a.served += 1;
     }
 };
 
@@ -1220,7 +1244,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (sp.quota == 0) continue;
         std.debug.print("  {s:<6} quota={d:<12} granted={d:<14} denials={d}\n", .{ sp.tag, sp.quota, sp.granted, sp.denials });
     }
-    std.debug.print("drain_breaks={d}\n", .{a.drain_breaks});
+    std.debug.print("drain_breaks={d}  batched_answers={d} (answers that shared a write)\n", .{ a.drain_breaks, a.batched_answers });
     std.debug.print("rss: start={d}KB end={d}KB   cpu={d}ms of {d}ms wall ({d:.2}%)   asleep={d}ms\n", .{
         rss_start, rssKb(), cpuMs() - cpu_start, @divTrunc(wall_ns, 1_000_000),
         100.0 * @as(f64, @floatFromInt(cpuMs() - cpu_start)) / (@as(f64, @floatFromInt(wall_ns)) / 1e6),
