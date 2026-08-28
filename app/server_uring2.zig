@@ -531,9 +531,12 @@ const App = struct {
             };
             a.conn_store[t] = .{ .fd = fd };
             a.live_conn[t] = true;
-            a.s.setPrio(t, prio_conn);
-            a.s.assignQuota(t, sup_conn);
-            a.s.admit(t, K.work_budget, K.cleanup_reserve); // cap; grant arrives via topUp
+            _ = a.s.admit(t, .{
+                .prio = prio_conn,
+                .quota = sup_conn,
+                .cap = K.work_budget,   // grant arrives via topUp
+                .reserve = K.cleanup_reserve,
+            });
             if (K.drr_quantum > 0) a.drr.admit(t);
             a.s.arm(t, nowMs() + K.idle_deadline_ms);
             a.r.registerFile(t, fd);
@@ -586,9 +589,7 @@ const App = struct {
             };
             a.conn_store[t] = .{ .fd = fd, .is_ctrl = true };
             a.live_conn[t] = true;
-            a.s.setPrio(t, prio_ctrl);
-            a.s.assignQuota(t, sup_ctrl);
-            a.s.admit(t, 1 << 20, 1 << 20);  // control surface: effectively uncapped
+            _ = a.s.admit(t, .{ .prio = prio_ctrl, .quota = sup_ctrl, .cap = 1 << 20, .reserve = 1 << 20 });
             a.r.watch(t, fd, .read);
         }
         a.r.watch(ctrl_listener_task, a.ctrl_listener, .read);
@@ -1089,9 +1090,12 @@ pub fn start(want_port: u16) !u16 {
     a.r.watch(ctrl_listener_task, csock, .read);
 
 
-    a.s.setPrio(background_task, prio_idle);  // only when there is slack
-    a.s.assignQuota(background_task, sup_bg);
-    a.s.admit(background_task, quota.unlimited, 0);
+    _ = a.s.admit(background_task, .{
+        .prio = prio_idle,
+        .quota = sup_bg,
+        .cap = quota.unlimited,
+        .reserve = 0,
+    });
     a.s.arm(background_task, nowMs() + K.bg_period_ms);
 
     var act: posix.Sigaction = .{

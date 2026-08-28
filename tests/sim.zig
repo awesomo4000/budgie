@@ -103,9 +103,12 @@ const Sim = struct {
         // Every task starts parked with a request arriving at a random time.
         for (1..sm.n_tasks + 1) |i| {
             const t: TaskId = @intCast(i);
-            sm.s.setPrio(t, 2);
-            sm.s.assignQuota(t, sup_conn);
-            sm.s.admit(t, cfg.cap, cfg.reserve);
+            _ = sm.s.admit(t, .{
+                .prio = 2,
+                .quota = sup_conn,
+                .cap = cfg.cap,
+                .reserve = cfg.reserve,
+            });
             _ = sm.s.popRunnable(); // consume the spawn wake; arrival drives it
             sm.s.queued[t] = false;
             sm.pushEvent(sm.clock.v_ns + r.intRangeAtMost(i64, 0, 50_000_000), t);

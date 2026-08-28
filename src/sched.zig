@@ -40,6 +40,27 @@ pub const max_tasks = 8192;
 /// for its own timeout condition.
 pub const Wake = enum { spawn, io, deadline, cancelled };
 
+/// What has been withdrawn from a task, if anything. See `Sched.faultOf`.
+///
+/// One variant, and that is the honest count rather than a placeholder. Two
+/// other conditions look like they belong here and do not.
+///
+/// A fired deadline is not a fault. The same wheel means "you are late" for a
+/// connection and "refill my budget" for a periodic task, and only the
+/// application knows which of those it armed. `app/server.zig` uses it both
+/// ways in the same file.
+///
+/// A refused `charge` is not a fault either. It fails for two unrelated
+/// reasons, this request spending its per-request ceiling or the whole class
+/// running out of allowance for the period, and those want different answers:
+/// refuse the request, or park until the refill.
+///
+/// Cancellation is the one where the fact carries no policy. Somebody holding
+/// the right to stop this task has stopped it. What to do about that is the
+/// supervisor's business. That it happened is the scheduler's, and it is the
+/// only thing here the scheduler can state without guessing at intent.
+pub const Fault = enum { cancelled };
+
 /// A minted right to cancel one specific task instance. Generational: a token
 /// for a task whose slot has since been recycled is a no-op, not a kill of
 /// whoever inherited the slot. Same discipline as a pool handle.
@@ -118,17 +139,59 @@ pub const Sched = struct {
 
     // ------------------------------------------------------------ lifecycle
 
-    /// `cap` is the PER-REQUEST ceiling, not a pre-funded grant: `budget`
-    /// starts at zero and units only ever arrive through `topUp`, so the
-    /// supervisor tree stays conservative.
-    pub fn admit(s: *Sched, id: TaskId, cap: i64, reserve: i64) void {
+    /// Everything a task needs decided before it can be dispatched. No field
+    /// has a default, so the compiler makes the caller choose all four.
+    ///
+    /// It is one struct because the three settings used to be three separate
+    /// calls that all had to happen BEFORE `admit`, and getting any of them
+    /// out of order failed silently:
+    ///
+    ///   - `setPrio` after admission left the task queued in the old class
+    ///     for its first dispatch, because `makeRunnable` reads `prio` when it
+    ///     enqueues.
+    ///   - `assignQuota` after admission, or not at all, charged whichever
+    ///     supervisor node the slot's previous occupant used. Admission does
+    ///     not reset `quota_of`, so a recycled slot inherits it.
+    ///   - `cancelTok` before admission produced a token for the generation
+    ///     that admission was about to bump, so the cancel silently no-opped.
+    ///
+    /// None of those was reachable through the type system. All three are now
+    /// unreachable through it.
+    pub const Admission = struct {
+        prio: u8,
+        quota: quota.Id,
+        /// The PER-REQUEST ceiling, not a pre-funded grant: `budget` starts at
+        /// zero and units only ever arrive through `topUp`, so the supervisor
+        /// tree stays conservative.
+        cap: i64,
+        /// Funds the unwind. `charge` has no path into it and `chargeReserve`
+        /// cannot fail, which is what makes cleanup possible after a cancel
+        /// has taken the body budget away.
+        reserve: i64,
+    };
+
+    /// Admit a task and return the sole right to cancel it.
+    ///
+    /// The token comes back from here because this is the only place it can
+    /// honestly be minted. There was a `cancelTok(id)` that would hand anybody
+    /// holding a task id the authority to cancel that task, which is ambient
+    /// authority with a generation check bolted on rather than a capability.
+    /// In seL4 you cannot look up a capability by object id; you receive one
+    /// when the object is created, and dropping your last copy loses the
+    /// authority. This is that rule, as far as a plain copyable struct can
+    /// carry it: nothing here stops a holder copying the token, so it is a
+    /// bearer token rather than a slot in a CNode.
+    pub fn admit(s: *Sched, id: TaskId, a: Admission) CancelTok {
         s.live[id] = true;
-        s.cap[id] = cap;
+        s.prio[id] = @min(a.prio, prio_idle);
+        s.quota_of[id] = a.quota;
+        s.cap[id] = a.cap;
         s.cancelled[id] = false;
         s.gen[id] +%= 1;
         s.budget[id] = 0;
-        s.reserve[id] = reserve;
+        s.reserve[id] = a.reserve;
         s.makeRunnable(id, .spawn);
+        return .{ .task = id, .gen = s.gen[id] };
     }
 
     pub fn release(s: *Sched, id: TaskId) void {
@@ -140,9 +203,6 @@ pub const Sched = struct {
 
     // ---------------------------------------------------------- cancellation
 
-    pub fn cancelTok(s: *const Sched, id: TaskId) CancelTok {
-        return .{ .task = id, .gen = s.gen[id] };
-    }
 
     /// Cancel is two independent guarantees:
     ///   safety   - budget = 0, so the task structurally cannot do more body
@@ -168,6 +228,12 @@ pub const Sched = struct {
 
     pub fn isCancelled(s: *const Sched, id: TaskId) bool {
         return s.cancelled[id];
+    }
+
+    /// See `Fault`. Returns null when this task still has the authority to run.
+    pub fn faultOf(s: *const Sched, id: TaskId) ?Fault {
+        if (s.cancelled[id]) return .cancelled;
+        return null;
     }
 
     /// Refresh the body budget without touching the reserve.

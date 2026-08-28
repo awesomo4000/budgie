@@ -56,7 +56,7 @@ pub fn main() !void {
     var s: S.Sched = .{};
     s.cur = 1000;
 
-    s.admit(1, 1000, 50);
+    _ = s.admit(1, .{ .prio = 1, .quota = 0, .cap = 1000, .reserve = 50 });
     while (s.popRunnable()) |_| {}
 
     s.arm(1, s.cur + far);
@@ -99,8 +99,8 @@ pub fn main() !void {
     check(s.armed == 0, "disarming an overflow entry decrements the armed total", .{ .armed = s.armed });
 
     // Two tasks in overflow at once, and the one in the middle re-armed.
-    s.admit(2, 1000, 50);
-    s.admit(3, 1000, 50);
+    _ = s.admit(2, .{ .prio = 1, .quota = 0, .cap = 1000, .reserve = 50 });
+    _ = s.admit(3, .{ .prio = 1, .quota = 0, .cap = 1000, .reserve = 50 });
     while (s.popRunnable()) |_| {}
     s.arm(1, s.cur + far);
     s.arm(2, s.cur + far + 1);
