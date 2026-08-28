@@ -109,6 +109,10 @@ pub const Sched = struct {
     // stats
     fires: u64 = 0,
     rearms: u64 = 0,
+    /// Arms that landed past one revolution of the wheel and went on the
+    /// overflow list. Counted because for a long time the answer was zero on
+    /// every workload anyone ran, which is how a bug there stayed hidden.
+    overflows: u64 = 0,
     cancels: u64 = 0,
     cancels_stale: u64 = 0,
 
@@ -255,7 +259,18 @@ pub const Sched = struct {
     /// O(1). Rearming an already-armed task unlinks and relinks; there is no
     /// stale entry left behind, which is why no slack window is needed.
     pub fn arm(s: *Sched, id: TaskId, at_ms: i64) void {
-        if (s.timer[id].slot != nil) {
+        // `slot != nil` is not the test for "already armed". A task parked on
+        // the overflow list has no slot, so re-arming one skipped the unlink
+        // and pushed it onto the list a second time. The push sets
+        // `t.next = s.overflow` while `s.overflow` is already this task, so
+        // the list became a ring pointing at itself, and every later walk of
+        // it -- the sweep in `expire`, the scan in `timeoutMs` -- ran forever.
+        //
+        // Nothing reached overflow at the default deadline of 3000ms, which
+        // fits inside the wheel's 4096ms revolution, so the path sat unvisited
+        // until a test asked for a longer one and the server spun at 100% CPU
+        // with a connection half-answered.
+        if (s.isLinked(id)) {
             s.rearms += 1;
             s.unlink(id);
         }
@@ -272,6 +287,7 @@ pub const Sched = struct {
             if (s.overflow != nil) s.timer[s.overflow].prev = id;
             s.overflow = id;
             s.armed += 1;
+            s.overflows += 1;
             return;
         }
         const slot: u32 = @intCast(@as(usize, @intCast(@max(0, at_ms))) % wheel_slots);
@@ -280,9 +296,15 @@ pub const Sched = struct {
     }
 
     pub fn disarm(s: *Sched, id: TaskId) void {
-        const t = &s.timer[id];
-        if (t.slot == nil and t.prev == nil and t.next == nil and s.overflow != id) return;
+        if (!s.isLinked(id)) return;
         s.unlink(id);
+    }
+
+    /// Whether this task is on the wheel or on the overflow list. Both count:
+    /// an overflow entry has no slot but is very much armed.
+    fn isLinked(s: *const Sched, id: TaskId) bool {
+        const t = &s.timer[id];
+        return t.slot != nil or t.prev != nil or t.next != nil or s.overflow == id;
     }
 
     fn link(s: *Sched, id: TaskId, slot: u32) void {

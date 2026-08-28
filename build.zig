@@ -37,6 +37,7 @@ const tests = [_]Test{
     .{ .name = "parser_test" },
     .{ .name = "pipetest" },
     .{ .name = "cancel_test" },
+    .{ .name = "wheel_test" },
     .{ .name = "feedcmp" },
     .{ .name = "chunkfuzz" },
     .{ .name = "sim", .args = &.{ "42", "64", "30" }, .fast = true },
