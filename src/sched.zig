@@ -64,7 +64,22 @@ pub const Fault = enum { cancelled };
 /// A minted right to cancel one specific task instance. Generational: a token
 /// for a task whose slot has since been recycled is a no-op, not a kill of
 /// whoever inherited the slot. Same discipline as a pool handle.
-pub const CancelTok = struct { task: TaskId, gen: u32 };
+pub const CancelTok = struct {
+    task: TaskId = 0,
+    /// Zero is never a live generation. `admit` pre-increments and skips zero
+    /// on wrap, and `cancel` refuses a token carrying it.
+    ///
+    /// That invariant is load bearing rather than tidy. Without it a
+    /// default-constructed `.{}` is a token for task 0 at generation 0, and
+    /// both servers set `live[listener_task] = true` by hand without going
+    /// through admission, so the listener sits at generation 0 forever. An
+    /// uninitialised token would cancel the thing that accepts connections.
+    gen: u32 = 0,
+
+    /// A token that names nothing. Use it for a field that has to exist
+    /// before the task it will refer to does.
+    pub const none: CancelTok = .{};
+};
 
 pub const wheel_slots: usize = 4096; // 1ms per slot => 4.096s of range
 const nil: u32 = std.math.maxInt(u32);
@@ -188,6 +203,7 @@ pub const Sched = struct {
         s.cap[id] = a.cap;
         s.cancelled[id] = false;
         s.gen[id] +%= 1;
+        if (s.gen[id] == 0) s.gen[id] = 1; // zero means "names nothing"
         s.budget[id] = 0;
         s.reserve[id] = a.reserve;
         s.makeRunnable(id, .spawn);
@@ -212,7 +228,7 @@ pub const Sched = struct {
     ///              rather than at its deadline.
     /// Sticky, idempotent, and not a value anything can swallow.
     pub fn cancel(s: *Sched, tok: CancelTok) bool {
-        if (!s.live[tok.task] or s.gen[tok.task] != tok.gen) {
+        if (tok.gen == 0 or !s.live[tok.task] or s.gen[tok.task] != tok.gen) {
             s.cancels_stale += 1;
             return false;
         }

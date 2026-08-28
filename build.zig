@@ -51,6 +51,7 @@ const tests = [_]Test{
     .{ .name = "deadline_test", .needs_server = true },
     .{ .name = "writepath_test", .needs_server = true },
     .{ .name = "wrong_cancel", .step = "wrong-cancel" },
+    .{ .name = "cancel_socket_test", .needs_server = true },
 };
 
 pub fn build(b: *std.Build) void {
@@ -232,6 +233,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "uring_starve_test", .src = "tests/starve_test.zig" },
         .{ .name = "uring_deadline_test", .src = "tests/deadline_test.zig" },
         .{ .name = "uring_writepath_test", .src = "tests/writepath_test.zig" },
+        .{ .name = "uring_cancel_socket_test", .src = "tests/cancel_socket_test.zig" },
 
     };
 

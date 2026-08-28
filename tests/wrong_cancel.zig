@@ -269,6 +269,14 @@ fn notMistakes() void {
     claim(!s.cancel(tok), "the old token does not cancel whoever inherited the slot", .{});
     claim(s.cancels_stale == stale_before + 1, "it is counted as stale", .{});
     claim(!s.isCancelled(t), "and the new occupant is untouched", .{});
+
+    // A token nobody filled in. Both servers set `live` by hand for their
+    // listener without admitting it, so it sits at generation 0, and a
+    // default-constructed token would otherwise name exactly that and cancel
+    // the thing that accepts connections.
+    const stale2 = s.cancels_stale;
+    claim(!s.cancel(.none), "a token that names nothing cancels nothing", .{});
+    claim(s.cancels_stale == stale2 + 1, "and is counted rather than ignored", .{});
 }
 
 pub fn main() !void {

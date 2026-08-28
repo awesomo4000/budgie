@@ -325,6 +325,11 @@ const Conn = struct {
     /// Null while parked with nothing in flight. Acquired on the first read
     /// of a request, released when the connection goes idle again.
     buf: iobuf.Handle = .{},
+    /// The right to cancel this connection, handed back by admission. The
+    /// server holds it because the server admitted the task; nothing else in
+    /// the program can mint one. `.none` until accept fills it in, and a
+    /// `.none` token cancels nothing.
+    tok: sched.CancelTok = .none,
 };
 
 
@@ -507,7 +512,7 @@ const App = struct {
             };
             a.conn_store[t] = .{ .fd = fd };
             a.live_conn[t] = true;
-            _ = a.s.admit(t, .{
+            a.conn_store[t].tok = a.s.admit(t, .{
                 .prio = prio_conn,
                 .quota = sup_conn,
                 .cap = K.work_budget,
@@ -574,6 +579,32 @@ const App = struct {
         a.r.watch(ctrl_listener_task, a.ctrl_listener, .read);
     }
 
+    /// Shed load: withdraw the authority to run from up to `want` connections.
+    ///
+    /// This is the case a deadline cannot cover. Every connection here is
+    /// healthy, responsive and inside its budget; somebody outside has simply
+    /// decided there should be fewer of them. The scheduler zeroes their
+    /// budgets, so they cannot serve another byte whether or not they notice,
+    /// and each one unwinds on its reserve and answers 503 before closing.
+    ///
+    /// It cancels with tokens the server was handed at admission. There is no
+    /// way to cancel a task this server did not admit, which is the point of
+    /// admission returning the token rather than a `cancelTok(id)` anyone
+    /// could call.
+    fn shed(a: *App, want: usize) usize {
+        var done: usize = 0;
+        var t: TaskId = 0;
+        while (t < max_tasks and done < want) : (t += 1) {
+            if (!a.live_conn[t]) continue;
+            const c = &a.conn_store[t];
+            // Not the control connection giving the order, and not one that
+            // is already on its way out.
+            if (c.is_ctrl or c.phase == .cleanup) continue;
+            if (a.s.cancel(c.tok)) done += 1;
+        }
+        return done;
+    }
+
     fn stepCtrl(a: *App, t: TaskId, c: *Conn) void {
         var buf: [64]u8 = undefined;
         const rc = sys.read(c.fd, &buf, buf.len);
@@ -594,7 +625,20 @@ const App = struct {
             a.live_conn[t] = false;
             return;
         }
-        _ = sys.write(c.fd, &buf, rc);
+        // One command, and everything else still echoes, which is what the
+        // existing control-surface test checks.
+        const line = buf[0..rc];
+        if (std.mem.startsWith(u8, line, "shed ")) {
+            var end: usize = 5;
+            while (end < line.len and line[end] >= '0' and line[end] <= '9') end += 1;
+            const want = std.fmt.parseInt(usize, line[5..end], 10) catch 0;
+            var out: [64]u8 = undefined;
+            const n = a.shed(want);
+            const reply = std.fmt.bufPrint(&out, "shed {d}\n", .{n}) catch "shed 0\n";
+            _ = sys.write(c.fd, reply.ptr, reply.len);
+        } else {
+            _ = sys.write(c.fd, &buf, rc);
+        }
         a.r.watch(t, c.fd, .read);
     }
 
@@ -858,9 +902,15 @@ const App = struct {
         b.out_sent = 0;
         b.parser = .{};
         b.in_len = keep_len;
+        // Reset the request state, keeping the three things that belong to the
+        // CONNECTION rather than to the request. This resets by listing what
+        // survives, so a new field that has to survive is one nobody has to
+        // remember: `tok` did not survive when it was added, every cancel came
+        // back stale, and shedding silently did nothing. It cost an afternoon.
         const fd = c.fd;
         const held = c.buf;
-        c.* = .{ .fd = fd, .buf = held };
+        const tok = c.tok;
+        c.* = .{ .fd = fd, .buf = held, .tok = tok };
 
         a.s.setReserve(t, K.cleanup_reserve);
         a.s.renewCap(t, K.work_budget);   // new request, new per-request ceiling
@@ -1016,6 +1066,11 @@ pub const Stats = struct {
     buf_exhausted: u64,
     top_ups: u64,
     top_up_denials: u64,
+    /// Cancels taken, and cancels refused because the token named a task
+    /// instance that no longer exists. The second is not an error, but a test
+    /// wants to know it stayed at zero when it expected every token to be live.
+    cancels: u64,
+    cancels_stale: u64,
     partial_writes: u64,
     write_stalls: u64,
 };
@@ -1042,6 +1097,8 @@ pub fn stats() Stats {
         .buf_exhausted = a.bufs.exhausted,
         .top_ups = a.s.top_ups,
         .top_up_denials = a.s.top_up_denials,
+        .cancels = a.s.cancels,
+        .cancels_stale = a.s.cancels_stale,
         .partial_writes = a.partial_writes,
         .write_stalls = a.write_stalls,
     };
