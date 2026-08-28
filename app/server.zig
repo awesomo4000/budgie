@@ -123,6 +123,15 @@ const Knobs = struct {
     /// SMALL pool (see APIGUIDE: fewer buffers is also a latency win there).
     /// Same knob, opposite optimum, for a structural reason.
     io_bufs: i64 = 1024,
+    /// 1 = append pipelined answers into one buffer and issue a single
+    /// `write` for the run, instead of one `write` per answer.
+    ///
+    /// The phase accounting says the write syscall is essentially the whole
+    /// CPU cost of this server: 5.39s of a 12s run at ~3.5us per call, with
+    /// parse at 0.32s and everything else rounding to nothing. A pipelined
+    /// client hands over a queue of requests whose answers all go to the same
+    /// descriptor, so they can share one call.
+    out_batch: i64 = 1,
     /// 1 = break the drain loop when the tick fires, so the reactor is
     /// re-entered and a waiting control task is seen within one tick.
     /// 0 = drain to completion, control latency then bounded only by how much
@@ -346,6 +355,7 @@ const App = struct {
     tick_coalesced: u64 = 0,
     defer_max_ns: i64 = 0,
     served: u64 = 0,
+    batched_answers: u64 = 0,
 
     // ----------------------------------------------------------- the kernel
 
@@ -687,13 +697,38 @@ const App = struct {
         if (c.work_left > 0) return a.s.makeRunnable(t, .spawn);
 
         const b = a.bufs.get(c.buf) orelse return a.finish(t, c, .peer_gone);
-        b.out_len = (std.fmt.bufPrint(&b.out,
+
+        // Append, rather than overwrite at zero. Everything already in `out`
+        // is an answer to an earlier request on this same connection that has
+        // not been written yet.
+        const answer = std.fmt.bufPrint(b.out[b.out_len..],
             "HTTP/1.1 200 OK\r\nContent-Length: 24\r\n\r\ndone, spent {d:>5} units\n", .{c.spent}) catch
-            return a.finish(t, c, .peer_gone)).len;
+            return a.finish(t, c, .peer_gone);
+        b.out_len += answer.len;
+        a.served += 1;
+
+        // Another request is already buffered and there is room for its
+        // answer, so take it now and let both go out together. The per-request
+        // state resets here exactly as it does after a write.
+        if (K.out_batch != 0 and b.in_len > 0 and b.out.len - b.out_len >= max_answer_bytes) {
+            b.parser.reset();
+            c.spent = 0;
+            c.work_left = 0;
+            c.phase = .reading;
+            a.s.setReserve(t, K.cleanup_reserve);
+            a.s.renewCap(t, K.work_budget);
+            a.s.arm(t, nowMs() + K.idle_deadline_ms);
+            a.batched_answers += 1;
+            return a.s.makeRunnable(t, .spawn);
+        }
+
         b.out_sent = 0;
         c.phase = .writing;
         a.s.makeRunnable(t, .spawn);
     }
+
+    /// Worst case for one answer, so the batching loop knows when to stop.
+    const max_answer_bytes = 96;
 
     fn enterCleanup(a: *App, t: TaskId, c: *Conn, why: Ending) void {
         c.ending = why;
@@ -786,7 +821,8 @@ const App = struct {
         if (c.phase == .cleanup) return a.finish(t, c, c.ending);
 
         // keep-alive: reset the request state, KEEP any pipelined bytes.
-        a.served += 1;
+        // `served` is counted in `stepWorking` now, because one write can
+        // carry several answers.
         const keep_len = b.in_len;
         if (keep_len > 0) {
             var tmp: [512]u8 = undefined;
@@ -822,7 +858,6 @@ const App = struct {
         c.buf = .{};
         sys.close(c.fd);
         a.live_conn[t] = false;
-        a.served += 1;
     }
 };
 
@@ -1057,7 +1092,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (sp.quota == 0) continue;
         std.debug.print("  {s:<6} quota={d:<12} granted={d:<14} denials={d}\n", .{ sp.tag, sp.quota, sp.granted, sp.denials });
     }
-    std.debug.print("drain_breaks={d}\n", .{a.drain_breaks});
+    std.debug.print("drain_breaks={d}  batched_answers={d} (answers that shared a write)\n", .{ a.drain_breaks, a.batched_answers });
     std.debug.print("rss: start={d}KB end={d}KB   cpu={d}ms of {d}ms wall ({d:.2}%)   asleep={d}ms\n", .{
         rss_start, rssKb(), cpuMs() - cpu_start, @divTrunc(wall_ns, 1_000_000),
         100.0 * @as(f64, @floatFromInt(cpuMs() - cpu_start)) / (@as(f64, @floatFromInt(wall_ns)) / 1e6),

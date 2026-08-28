@@ -38,7 +38,10 @@ pub const IoBuf = struct {
     /// which is a resource limit (503) and not a protocol error (400).
     in: [16384]u8 = undefined,
     in_len: usize = 0,
-    out: [256]u8 = undefined,
+    /// Outbound. Large enough to hold a run of pipelined answers, so a
+    /// client that sends N requests at once can be answered in one `write`
+    /// instead of N. At ~63 bytes per answer this holds about 130 of them.
+    out: [8192]u8 = undefined,
     out_len: usize = 0,
     out_sent: usize = 0,
     parser: http.Parser = .{},
