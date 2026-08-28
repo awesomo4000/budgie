@@ -63,16 +63,21 @@ fn startServer() !u16 {
 /// whole burst to finish before the order arrived, which made the mid-flight
 /// scene below assert nothing. It is also how an operator would actually hold
 /// a control channel.
-fn shed(c: Client, n: usize) !usize {
+const Shed = struct { cancelled: usize, busy: usize };
+
+fn shed(c: Client, n: usize) !Shed {
     var cmd: [32]u8 = undefined;
     try c.send(std.fmt.bufPrint(&cmd, "shed {d}\n", .{n}) catch unreachable);
     var buf: [64]u8 = undefined;
     const got = c.recvUntil(&buf, "\n", 1, wait_ms);
     const line = buf[0..got];
     if (!std.mem.startsWith(u8, line, "shed ")) return error.BadReply;
-    var end: usize = 5;
-    while (end < line.len and line[end] >= '0' and line[end] <= '9') end += 1;
-    return std.fmt.parseInt(usize, line[5..end], 10) catch error.BadReply;
+    var it = std.mem.tokenizeAny(u8, line, " \r\n");
+    _ = it.next(); // "shed"
+    const cancelled = std.fmt.parseInt(usize, it.next() orelse return error.BadReply, 10) catch return error.BadReply;
+    _ = it.next(); // "busy"
+    const busy = std.fmt.parseInt(usize, it.next() orelse return error.BadReply, 10) catch return error.BadReply;
+    return .{ .cancelled = cancelled, .busy = busy };
 }
 
 /// Open `n` keep-alive connections and get one answer on each, so every one of
@@ -98,8 +103,9 @@ fn tShedTellsTheClient(port: u16, ctrl: Client) !void {
     check(opened == clients.len, "opened and served every connection first", .{ .opened = opened });
 
     const before = server.stats();
-    const n = try shed(ctrl, opened);
-    check(n == opened, "the control surface shed every one of them", .{ .shed = n, .of = opened });
+    const r = try shed(ctrl, opened);
+    check(r.cancelled == opened, "the control surface shed every one of them", .{ .shed = r.cancelled, .of = opened });
+    check(r.busy == 0, "and reports them as idle, which is what they were", .{ .busy = r.busy });
 
     var answered: usize = 0;
     var silent: usize = 0;
@@ -135,81 +141,95 @@ fn tShedTellsTheClient(port: u16, ctrl: Client) !void {
     });
 }
 
-/// A connection with work in flight, not an idle one. The cancel arrives while
-/// the task is queued and mid-request, which is the case where reading the wake
-/// reason instead of the state would silently miss it.
+/// Connections with work actually in flight.
 ///
-/// One request is not enough to catch: `/work/900` is four dispatches and the
-/// control round trip is slower than that, so the connection is idle again
-/// before the shed lands. A deep pipeline keeps it genuinely busy, and the
-/// server's own `served` counter is what proves it rather than the client's
-/// transcript, for a reason worth writing down. See below.
-fn tShedMidRequest(port: u16, ctrl: Client) !void {
+/// The first version of this scene sent one deep pipeline and hoped the shed
+/// would arrive before it finished. On the readiness backend it did; on the
+/// completion backend the connection served all four hundred requests first,
+/// so the scene cancelled an idle connection while claiming to have cancelled
+/// a busy one. A check whose name does not match what it verified is worse
+/// than no check, and calling that a latency finding was dressing it up.
+///
+/// So the server decides. `shed` reports how many of the connections it
+/// cancelled were holding a buffer at the moment it cancelled them, judged in
+/// the same pass as the cancel rather than sampled from outside, and that
+/// number is what this asserts. Enough load is offered that the answer cannot
+/// be zero for want of anything to do: eight connections, four hundred deep,
+/// nine hundred units each.
+fn tShedBusyConnections(port: u16, ctrl: Client) !void {
+    const conns = 8;
     const depth = 400;
-    const c = try Client.connect(port);
-    defer c.close();
 
-    // Warm up first, and wait for the answer. `connect` returning only means
-    // the kernel completed the handshake; the server has not necessarily run
-    // `accept` yet, so the task does not exist and there is nothing to shed.
-    // On a fast machine the whole scene raced past this: shed found no live
-    // connection, returned zero, and the server then served all 400.
-    var rq: [128]u8 = undefined;
-    try c.send(hc.request("/work/1", &rq));
-    var warm: [256]u8 = undefined;
-    const warmed = c.recvUntil(&warm, "units", 1, wait_ms);
-    check(std.mem.indexOf(u8, warm[0..warmed], "spent") != null, "connection is accepted and serving before we shed it", .{});
+    var clients: [conns]Client = undefined;
+    var opened: usize = 0;
+    defer for (clients[0..opened]) |c| c.close();
 
     const burst = try std.heap.page_allocator.alloc(u8, depth * hc.work_request_bytes);
     defer std.heap.page_allocator.free(burst);
     for (0..depth) |i| _ = hc.workRequest(900, burst[i * hc.work_request_bytes ..][0..hc.work_request_bytes]);
 
+    // Warm each one up and read the answer, so the task exists server-side.
+    // `connect` returning only means the handshake completed; the server has
+    // not necessarily run `accept`, and shedding then finds nothing at all.
+    while (opened < conns) : (opened += 1) {
+        clients[opened] = Client.connect(port) catch break;
+        var rq: [128]u8 = undefined;
+        clients[opened].send(hc.request("/work/1", &rq)) catch break;
+        var warm: [256]u8 = undefined;
+        const w = clients[opened].recvUntil(&warm, "units", 1, wait_ms);
+        if (std.mem.indexOf(u8, warm[0..w], "spent") == null) break;
+    }
+    check(opened == conns, "opened and warmed every connection", .{ .opened = opened });
+
     const before = server.stats();
-    try c.send(burst);
+    for (clients[0..opened]) |c| c.send(burst) catch {};
 
-    // And wait until it has actually started on the burst, so "mid-flight"
-    // is a fact rather than a hope about timing.
+    // Wait until the server has started on it, so there is work in progress
+    // rather than work merely queued in a socket.
     var spun: usize = 0;
-    while (server.stats().served == before.served and spun < 2000) : (spun += 1) hc.sleepMs(1);
-    check(server.stats().served > before.served, "and has started on the pipeline", .{ .spun = spun });
+    while (server.stats().served == before.served and spun < 3000) : (spun += 1) hc.sleepMs(1);
+    check(server.stats().served > before.served, "the server has started on the pipelines", .{ .spun = spun });
 
-    const n = try shed(ctrl, 1);
-    check(n >= 1, "shed a connection that was in the middle of working", .{ .shed = n });
+    const r = try shed(ctrl, opened);
+    check(r.cancelled == opened, "shed all of them", .{ .shed = r.cancelled, .of = opened });
+    check(r.busy > 0, "and at least one had I/O in flight when it was cancelled", .{
+        .busy = r.busy,
+        .of = r.cancelled,
+    });
 
-    const reply = try std.heap.page_allocator.alloc(u8, depth * 96 + 4096);
+    var told: usize = 0;
+    const reply = try std.heap.page_allocator.alloc(u8, depth * 96 + 8192);
     defer std.heap.page_allocator.free(reply);
-    const got = c.recvUntil(reply, "503", 1, wait_ms);
-    const seen = reply[0..got];
+    for (clients[0..opened]) |c| {
+        const got = c.recvUntil(reply, "503", 1, wait_ms);
+        if (std.mem.indexOf(u8, reply[0..got], "503 Service Unavailable") != null) told += 1;
+    }
+    check(told == opened, "every one of them was told, mid-work, rather than left waiting", .{
+        .told = told,
+        .of = opened,
+    });
+
+    // Poll rather than sample. `recvUntil` returns as soon as the bytes "503"
+    // appear, which can be the first few bytes of a partial write, and the
+    // ending is not counted until that write completes. Sampling immediately
+    // read 7 of 8 on a fast machine.
+    var settled: usize = 0;
+    while (settled < 200) : (settled += 1) {
+        if (server.stats().ended_cancelled - before.ended_cancelled == opened) break;
+        hc.sleepMs(10);
+    }
     const after = server.stats();
-
-    const computed = after.served - before.served;
-    const delivered = hc.countOf(seen, hc.ok_head);
-
-    check(n >= 1, "the busy connection was shed", .{ .shed = n });
-    check(std.mem.indexOf(u8, seen, "503 Service Unavailable") != null, "and the client is told, not left waiting", .{
-        .bytes = got,
+    check(after.ended_cancelled - before.ended_cancelled == opened, "counted as cancelled", .{
+        .cancelled = after.ended_cancelled - before.ended_cancelled,
+        .of = opened,
     });
-    check(after.ended_cancelled > before.ended_cancelled, "counted as cancelled", .{});
 
-    // Whether the cancel lands part-way through the pipeline is not asserted,
-    // because it is not a property of cancellation. It is a property of how
-    // promptly each backend services a priority-zero control task while a
-    // connection is grinding, and the two disagree. Measured here: the
-    // readiness server catches it mid-pipeline, and the completion server
-    // serves all 400 requests, roughly 72 million multiply-adds, before it
-    // reads a single byte from an already-open control connection. That is
-    // worth chasing somewhere it can be measured properly rather than being
-    // smuggled into a test about something else.
-    //
-    // When it does land mid-pipeline, the discard below is visible: batching
-    // appends answers into one buffer, and a cancel arriving before that write
-    // formats the 503 from index zero and takes them with it. Work charged
-    // for, done, and thrown away. Defensible for a load shed, and the first
-    // thing to revisit if that stops being true.
-    std.debug.print("    computed {d} of {d}, delivered {d}{s}\n", .{
-        computed, depth, delivered,
-        if (delivered < computed) " (answers discarded with the unwind)" else " (finished before the order arrived)",
-    });
+    // Batching appends answers into one buffer and writes the run in a single
+    // call, so a cancel arriving before that write formats the 503 from index
+    // zero and takes the finished answers with it. Work charged for, done, and
+    // thrown away. Defensible for a load shed, and the first thing to revisit
+    // if that stops being true.
+    std.debug.print("    {d} of {d} cancelled connections were mid-flight\n", .{ r.busy, r.cancelled });
 }
 
 /// The control connection issuing the order must not shed itself, or the reply
@@ -223,8 +243,8 @@ fn tCtrlDoesNotShedItself(port: u16, ctrl: Client) !void {
     _ = c.recvUntil(&buf, "units", 1, wait_ms);
 
     // Ask for far more than exist. Only the one worker connection qualifies.
-    const n = try shed(ctrl, 1000);
-    check(n == 1, "shedding everything sheds the workers and not the control connection", .{ .shed = n });
+    const r = try shed(ctrl, 1000);
+    check(r.cancelled == 1, "shedding everything sheds the workers and not the control connection", .{ .shed = r.cancelled });
 }
 
 fn buffersBalanced() bool {
@@ -265,7 +285,7 @@ pub fn main() !void {
     defer ctrl.close();
 
     try tShedTellsTheClient(port, ctrl);
-    try tShedMidRequest(port, ctrl);
+    try tShedBusyConnections(port, ctrl);
     try tCtrlDoesNotShedItself(port, ctrl);
     try tStillHealthy(port);
     try tAccounting();

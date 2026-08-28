@@ -601,6 +601,14 @@ const App = struct {
 
     }
 
+    /// The outcome of a shed. `busy` is how many of the cancelled connections
+    /// had I/O in flight at the moment they were cancelled, which is decided
+    /// in the same pass as the cancel rather than sampled by the caller
+    /// before or after. A test that wants to prove it cancelled work in
+    /// progress cannot do that from outside without racing the server; this
+    /// makes it a fact the server reports.
+    const Shed = struct { cancelled: usize = 0, busy: usize = 0 };
+
     /// Shed load: withdraw the authority to run from up to `want` connections.
     ///
     /// This is the case a deadline cannot cover. Every connection here is
@@ -610,17 +618,28 @@ const App = struct {
     /// and each one unwinds on its reserve and answers 503 before closing.
     ///
     /// It cancels with tokens the server was handed at admission. There is no
-    /// way to cancel a task this server did not admit.
-    fn shed(a: *App, want: usize) usize {
-        var done: usize = 0;
+    /// way to cancel a task this server did not admit, which is the point of
+    /// admission returning the token rather than a `cancelTok(id)` anyone
+    /// could call.
+    fn shed(a: *App, want: usize) Shed {
+        var out: Shed = .{};
         var t: TaskId = 0;
-        while (t < max_tasks and done < want) : (t += 1) {
+        while (t < max_tasks and out.cancelled < want) : (t += 1) {
             if (!a.live_conn[t]) continue;
             const c = &a.conn_store[t];
+            // Not the control connection giving the order, and not one that
+            // is already on its way out.
             if (c.is_ctrl or c.phase == .cleanup) continue;
-            if (a.s.cancel(c.tok)) done += 1;
+            // Holding a buffer means bytes are in flight: the pool hands one
+            // out on the first read of a request and takes it back when the
+            // connection goes idle again.
+            const was_busy = !c.buf.isNull();
+            if (a.s.cancel(c.tok)) {
+                out.cancelled += 1;
+                if (was_busy) out.busy += 1;
+            }
         }
-        return done;
+        return out;
     }
 
     fn stepCtrl(a: *App, t: TaskId, c: *Conn) void {
@@ -651,8 +670,9 @@ const App = struct {
             while (end < line.len and line[end] >= '0' and line[end] <= '9') end += 1;
             const want = std.fmt.parseInt(usize, line[5..end], 10) catch 0;
             var out: [64]u8 = undefined;
-            const n = a.shed(want);
-            const reply = std.fmt.bufPrint(&out, "shed {d}\n", .{n}) catch "shed 0\n";
+            const r = a.shed(want);
+            const reply = std.fmt.bufPrint(&out, "shed {d} busy {d}\n", .{ r.cancelled, r.busy }) catch
+                "shed 0 busy 0\n";
             _ = linux.write(c.fd, reply.ptr, reply.len);
         } else {
             _ = linux.write(c.fd, &buf, rc);
