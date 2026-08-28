@@ -109,13 +109,6 @@ fn stepNeverAsks(id: TaskId) void {
     s.makeRunnable(id, .spawn);
 }
 
-fn stepAsksWakeReason(id: TaskId) void {
-    if (s.reasonFor(id) == .cancelled) return unwindProperly(id);
-    if (!s.charge(id, &q, quantum)) return;
-    w.spent += quantum;
-    s.makeRunnable(id, .spawn);
-}
-
 fn stepAsksState(id: TaskId) void {
     if (s.isCancelled(id)) return unwindProperly(id);
     if (!s.charge(id, &q, quantum)) return;
@@ -153,65 +146,25 @@ fn neverAsks() void {
     claim(s.live[t] and s.cancelled[t], "it is still here, cancelled, indefinitely", .{});
 }
 
-/// 2. Ask with the wake reason instead of the state.
+/// 2. Ask with the wake reason instead of the state. NO LONGER EXPRESSIBLE.
 ///
-/// This is not an occasional miss. For any task that keeps itself runnable
-/// across quanta, which is the ordinary pattern here and what every task in
-/// both servers does, `reasonFor` NEVER reports `.cancelled`. `makeRunnable`
-/// returns early when the task is already queued, so the `.cancelled` wake
-/// that `cancel` tries to record is dropped on the floor and the earlier
-/// `.spawn` stands.
+/// This was the sharpest scene in the file. A task that checked
+/// `reasonFor(t) == .cancelled` instead of `isCancelled(t)` did not miss the
+/// cancellation occasionally, it missed it always: `makeRunnable` returns
+/// early when the task is already queued, which is where a task making
+/// progress spends its life, so the `.cancelled` wake was dropped and the
+/// earlier `.spawn` stood. And it was a trap rather than an obvious error
+/// because it worked perfectly for a task that was PARKED when the cancel
+/// arrived. Correct for idle connections, silently wrong for busy ones.
 ///
-/// One delivery, into a channel allowed to drop it. Exactly the shape the
-/// whole design is supposed to avoid, reproduced inside this API by choosing
-/// the wrong one of two queries.
+/// `Wake` no longer has a `.cancelled` variant, so the check does not compile.
+/// Writing this scene down is what made it obvious that it should not: the
+/// same defect was quietly losing DEADLINES too, in code both servers ran, and
+/// `expire` had already unlinked the timer by then, so the deadline vanished
+/// with nothing left to fire it again.
 fn asksWakeReason() void {
     scene("2. The task asks with the wake reason instead of the state");
-    reset();
-    const tok = admitOne();
-    dispatch(stepAsksWakeReason, 3);
-
-    // Cancel while the task is queued, which is where it spends most of its
-    // life if it is making progress.
-    claim(s.queued[t], "the task is queued, having made itself runnable again", .{});
-    _ = s.cancel(tok);
-
-    claim(s.isCancelled(t), "the state says cancelled", .{});
-    claim(s.reasonFor(t) != .cancelled, "and the wake reason does not, and never will", .{
-        .reason = s.reasonFor(t),
-    });
-
-    dispatch(stepAsksWakeReason, 500);
-    claim(!w.unwound and w.holds, "so the task misses it completely and holds its resource", .{
-        .unwound = w.unwound,
-    });
-
-    // And the reason it is a trap rather than an obvious mistake: it works
-    // for a task that was PARKED when the cancel arrived. Not queued, so
-    // `makeRunnable` records the reason, so `reasonFor` reports it. The check
-    // is correct for idle connections and silently wrong for busy ones, which
-    // is the worst way for a thing to be wrong.
-    reset();
-    const tok_parked = admitOne();
-    _ = s.popRunnable(); // dequeue and park it, without making it runnable again
-    s.arm(t, 1_000_000);
-    claim(!s.queued[t], "a parked task is not queued", .{});
-    _ = s.cancel(tok_parked);
-    claim(s.reasonFor(t) == .cancelled, "so for a PARKED task the wake reason does report it", .{
-        .reason = s.reasonFor(t),
-    });
-    dispatch(stepAsksWakeReason, 10);
-    claim(w.unwound, "and the same broken check works here, which is why it gets trusted", .{});
-
-    // The same task, one word different.
-    reset();
-    const tok2 = admitOne();
-    dispatch(stepAsksState, 3);
-    _ = s.cancel(tok2);
-    dispatch(stepAsksState, 500);
-    claim(w.unwound and !w.holds, "asking with isCancelled instead: unwound, resource returned", .{
-        .unwound = w.unwound,
-    });
+    std.debug.print("  --    not expressible: Wake has no .cancelled variant to ask about\n", .{});
 }
 
 /// 3. Mint the token before admission. NO LONGER EXPRESSIBLE.
@@ -288,20 +241,23 @@ pub fn main() !void {
 
     std.debug.print(
         \\
-        \\Three ways left to get this wrong, and they are not three different bugs.
+        \\Two ways left to get this wrong, and they are not two different bugs.
         \\
-        \\  1 and 2 are the same bug: the task did not act on it. Neither is
-        \\    expressible under examples/cancel_supervised.zig, because there
-        \\    the task does not ask and so cannot forget to, or ask wrongly.
+        \\  1 is the task not acting on it, and it is not expressible under
+        \\    examples/cancel_supervised.zig, because there the task does not
+        \\    ask and so cannot forget to.
+        \\  2 is gone. It was asking with the wake reason, and Wake no longer
+        \\    has a variant to ask about. Cancellation is state only.
         \\  3 is gone. It was a setup ordering error, and admission now returns
         \\    the only token there is, so holding one for a task that was never
         \\    admitted has nowhere to come from.
         \\  4 survives the dispatcher. An unwind that does not unwind is the
         \\    bug that gets relocated rather than removed.
         \\
-        \\So: one bug, removed by a dispatcher. One ordering error, removed by a
-        \\return type. And one that no mechanism can remove, because no language
-        \\can make a function do its job. The cost of all of them is the same and it is
+        \\So: one bug removed by a dispatcher, one removed by deleting the way to
+        \\express it, one ordering error removed by a return type, and one that
+        \\no mechanism can remove, because no language can make a function do
+        \\its job. The cost of all of them is the same and it is
         \\bounded: a task that holds a resource forever. None of them produces
         \\a wrong answer, and none makes anybody else wait.
         \\

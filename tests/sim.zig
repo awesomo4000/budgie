@@ -150,7 +150,7 @@ const Sim = struct {
     fn step(sm: *Sim, t: TaskId, cfg: Cfg, r: std.Random) void {
         const tk = &sm.tasks[t];
 
-        if (sm.s.reasonFor(t) == .deadline) {
+        if (sm.s.isExpired(t)) {
             // Idle timeout: end the request, re-arm, wait for the next arrival.
             tk.ended += 1;
             tk.phase = .parked;

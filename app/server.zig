@@ -485,7 +485,7 @@ const App = struct {
         // checking is the same shape of mistake as per-call-site `catch`.
         if (c.phase != .cleanup) {
             if (a.s.isCancelled(t)) return a.enterCleanup(t, c, .cancelled);
-            if (a.s.reasonFor(t) == .deadline) return a.enterCleanup(t, c, .deadline_missed);
+            if (a.s.isExpired(t)) return a.enterCleanup(t, c, .deadline_missed);
         }
         if (c.is_ctrl) return a.stepCtrl(t, c);
         switch (c.phase) {
@@ -531,7 +531,13 @@ const App = struct {
     fn stepBackground(a: *App, t: TaskId) void {
         // A refill deadline arrived: top the budget back up. Same wheel, same
         // mechanism as a connection's idle timeout -- only the meaning differs.
-        if (a.s.reasonFor(t) == .deadline) {
+        //
+        // This was `reasonFor(t) == .deadline`, and it was silently broken: a
+        // refill that fired while this task was queued had its wake reason
+        // dropped, so the top-up never happened and the re-arm below never
+        // ran. One missed edge and background work stopped for the life of the
+        // process. Reading the state instead cannot miss it.
+        if (a.s.isExpired(t)) {
             _ = a.s.topUp(t, &a.q, K.bg_budget);
             a.s.arm(t, nowMs() + K.bg_period_ms);
         }

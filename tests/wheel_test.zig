@@ -52,6 +52,10 @@ const nil_id: u32 = 0xffff_ffff;
 /// path rather than finding a slot.
 const far: i64 = 10_000;
 
+/// A second scheduler for the scenes that need a clean one. `Sched` is about
+/// 0.6 MB, so these are file scope rather than stack.
+var s2: S.Sched = .{};
+
 pub fn main() !void {
     var s: S.Sched = .{};
     s.cur = 1000;
@@ -117,6 +121,33 @@ pub fn main() !void {
         .len = overflowLen(&s),
     });
     check(s.timer[1].slot != @as(u32, 0xffff_ffff), "and puts it in a slot", .{ .slot = s.timer[1].slot });
+
+    // A deadline that fires while its task is already runnable.
+    //
+    // This used to disappear. `expire` unlinks the timer and then calls
+    // `makeRunnable`, which returns early when the task is already queued, so
+    // the reason was dropped AND the timer was already gone. Both servers read
+    // `reasonFor(t) == .deadline` to decide a connection had missed its
+    // liveness bound, so such a connection kept its slot with no deadline left
+    // to reclaim it, and the background task, whose only re-arm lives inside
+    // that same branch, stopped refilling for the life of the process.
+    //
+    // A task making progress is queued between quanta, which is exactly when
+    // this happens.
+    s2.cur = 1000;
+    _ = s2.admit(4, .{ .prio = 1, .quota = 0, .cap = 1000, .reserve = 50 });
+    _ = s2.popRunnable(); // dispatched once
+    s2.arm(4, 1100);
+    s2.makeRunnable(4, .spawn); // and made itself runnable again, as tasks do
+    check(s2.queued[4] and s2.armed == 1, "a queued task with a deadline armed", .{ .armed = s2.armed });
+
+    s2.expire(1200);
+    check(s2.fires == 1, "the deadline fires", .{ .fires = s2.fires });
+    check(s2.isExpired(4), "and the task can still tell, though it was already queued", .{});
+    check(s2.armed == 0, "the timer is spent", .{ .armed = s2.armed });
+
+    s2.arm(4, 5000);
+    check(!s2.isExpired(4), "and a fresh deadline supersedes the old conclusion", .{});
 
     std.debug.print("\n{d} checks, {d} failures\n", .{ checks, failures });
     if (failures != 0) std.process.exit(1);

@@ -36,9 +36,26 @@ pub const prio_levels = 4;
 pub const prio_idle: u8 = prio_levels - 1;
 pub const max_tasks = 8192;
 
-/// Why a task became runnable. The app switches on this instead of scanning
-/// for its own timeout condition.
-pub const Wake = enum { spawn, io, deadline, cancelled };
+/// Why a task became runnable, restricted to things the TASK responds to.
+///
+/// It used to carry `.deadline` and `.cancelled` as well, and both were wrong
+/// to put here for the same reason. A wake reason is safe only when the
+/// condition behind it is re-observable: a task that misses `.io` finds out by
+/// reading the descriptor, so nothing is lost. A missed deadline or a missed
+/// cancellation cannot be recovered, because the moment is gone.
+///
+/// And they were missed, routinely. `makeRunnable` returns early when the task
+/// is already queued, which is where a task making progress spends most of its
+/// life, so the reason was simply dropped. `expire` had already unlinked the
+/// timer by then, so a deadline that fired while its task was queued vanished:
+/// no notification and no timer. Both terminal conditions are state now, read
+/// through `isCancelled` and `isExpired`, and state cannot be dropped because
+/// there is no delivery.
+///
+/// What is left is the split the call sites already showed. `.io` comes only
+/// from a reactor and `.spawn` from admission or from a task yielding with
+/// work left. Decisions ABOUT a task are not in here.
+pub const Wake = enum { spawn, io };
 
 /// What has been withdrawn from a task, if anything. See `Sched.faultOf`.
 ///
@@ -129,6 +146,16 @@ pub const Sched = struct {
     // --- cancellation ---
     gen: [max_tasks]u32 = @splat(0),
     cancelled: [max_tasks]bool = @splat(false),
+    /// A deadline fired for this task and has not been replaced. Set by
+    /// `expire`, cleared by `arm`, and by admission and release.
+    ///
+    /// State rather than a wake reason, because the wake reason was being
+    /// dropped whenever the task was already queued and the timer had already
+    /// been unlinked, so the deadline evaporated in silence. What it MEANS is
+    /// still the application's: a connection reads it as a liveness bound and
+    /// closes, and the background task reads it as its refill arriving. That
+    /// is why it is not in `Fault`.
+    expired: [max_tasks]bool = @splat(false),
 
 
     grant_size: i64 = 1000,
@@ -202,6 +229,7 @@ pub const Sched = struct {
         s.quota_of[id] = a.quota;
         s.cap[id] = a.cap;
         s.cancelled[id] = false;
+        s.expired[id] = false;
         s.gen[id] +%= 1;
         if (s.gen[id] == 0) s.gen[id] = 1; // zero means "names nothing"
         s.budget[id] = 0;
@@ -214,6 +242,7 @@ pub const Sched = struct {
         s.disarm(id);
         s.live[id] = false;
         s.cancelled[id] = false;
+        s.expired[id] = false;
         s.gen[id] +%= 1; // invalidates every outstanding token for this slot
     }
 
@@ -238,12 +267,25 @@ pub const Sched = struct {
         s.budget[tok.task] = 0;
         s.cap[tok.task] = 0; // and no further top-ups can be requested
         s.disarm(tok.task);
-        s.makeRunnable(tok.task, .cancelled);
+        // `.spawn` and not a reason of its own: the state is what carries the
+        // cancellation, and a reason recorded here would be dropped anyway
+        // whenever the task was already queued.
+        s.makeRunnable(tok.task, .spawn);
         return true;
     }
 
     pub fn isCancelled(s: *const Sched, id: TaskId) bool {
         return s.cancelled[id];
+    }
+
+    /// Whether a deadline fired for this task and has not been replaced.
+    ///
+    /// The application decides what that means. `app/server.zig` reads it two
+    /// ways in one file: a connection is past its liveness bound and gets a
+    /// 408, and the background task's refill has come due. Same wheel, same
+    /// bit, opposite conclusions, which is exactly why this is not a `Fault`.
+    pub fn isExpired(s: *const Sched, id: TaskId) bool {
+        return s.expired[id];
     }
 
     /// See `Fault`. Returns null when this task still has the authority to run.
@@ -357,6 +399,8 @@ pub const Sched = struct {
             s.unlink(id);
         }
         if (s.cur == 0) s.cur = at_ms;
+        // A new deadline supersedes whatever the last one concluded.
+        s.expired[id] = false;
         const t = &s.timer[id];
         t.at = at_ms;
         const delta = at_ms - s.cur;
@@ -466,7 +510,8 @@ pub const Sched = struct {
                 const id = s.bucket[slot];
                 s.unlink(id);
                 s.fires += 1;
-                s.makeRunnable(id, .deadline);
+                s.expired[id] = true;
+                s.makeRunnable(id, .spawn);
             }
             s.cur = at + 1;
         }
@@ -483,7 +528,8 @@ pub const Sched = struct {
                 // the wheel hand has passed, which would wrap into the future.
                 s.unlink(id);
                 s.fires += 1;
-                s.makeRunnable(id, .deadline);
+                s.expired[id] = true;
+                s.makeRunnable(id, .spawn);
             } else if (at - s.cur < @as(i64, wheel_slots)) {
                 s.unlink(id);
                 s.armed += 1;
