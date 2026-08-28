@@ -500,10 +500,7 @@ const App = struct {
         // checking is the same shape of mistake as per-call-site `catch`.
         if (c.phase != .cleanup) {
             if (a.s.isCancelled(t)) return a.enterCleanup(t, c, .cancelled);
-            if (a.s.reasonFor(t) == .deadline) {
-                if (t == a.r.dbg_watch) { std.debug.print("DBG watched task {d} hit the deadline\n", .{t}); a.r.dbg_watch = 0; }
-                return a.enterCleanup(t, c, .deadline_missed);
-            }
+            if (a.s.reasonFor(t) == .deadline) return a.enterCleanup(t, c, .deadline_missed);
         }
         if (c.is_ctrl) return a.stepCtrl(t, c);
         switch (c.phase) {
@@ -841,7 +838,13 @@ const App = struct {
             switch (b.parser.poll()) {
                 .need_input => if (used == 0) return false else continue,
                 .protocol_error => |pe| {
-                    if (a.bad_logged < 3) {
+                    // Diagnostic only, and behind the same switch as the
+                    // per-close line. The serving loop does no I/O of its own:
+                    // what it notices goes into counters and `rec`, and the
+                    // report happens after `runUntil` returns. A peer that can
+                    // make the loop write to a descriptor it does not control
+                    // can stall every other connection on it.
+                    if (!a.quiet and a.bad_logged < 3) {
                         a.bad_logged += 1;
                         std.debug.print("BAD[{s}] task={d} used={d} in_len={d} buf={d}\n  parser_buf=<{s}>\n", .{
                             @tagName(pe), t, used, b.in_len, c.buf.idx, b.parser.debugBuf(),
@@ -1003,11 +1006,6 @@ const App = struct {
         // The next request may already be buffered.
         if (b.in_len > 0 and a.drainIn(t, c, b)) return;
         a.releaseIfIdle(c);
-        // watch this connection from its first completed response onward
-        if (a.r.dbg_watch == 0) {
-            a.r.dbg_watch = t;
-            std.debug.print("DBG watching task {d} from finishWrite (watching={})\n", .{ t, a.r.watching(t) });
-        }
         if (!a.r.watching(t) and !a.drr.isThrottled(t)) a.r.armRecv(t, c.fd);
     }
 

@@ -196,8 +196,6 @@ pub const Reactor = struct {
     /// still in flight for the old incarnation is recognisably stale.
     arm_gen: [sched.max_tasks]u32 = @splat(0),
     stale_completions: u64 = 0,
-    dbg_last: i64 = 0,
-    dbg_watch: sched.TaskId = 0,
     gen_keys: bool = true,
     /// Buffers the app is holding because it could not take their bytes.
     /// While these are held they are NOT in the ring, so the kernel runs short
@@ -552,16 +550,6 @@ pub const Reactor = struct {
             }
         }
         r.cqes_total += n;
-        {
-            const now_ms = @divTrunc(nowNsLocal(), 1_000_000);
-            if (now_ms - r.dbg_last >= 200) {
-                if (r.dbg_watch != 0) {
-                    const t5 = r.dbg_watch;
-                    std.debug.print("DBG {d}ms t{d}: armed_recv={} needs_rearm={} armed={d} enters={d} cqes={d} tick_armed={}\n", .{ now_ms, t5, r.armed_recv[t5], r.needs_rearm[t5], r.armed, r.enters, r.cqes_total, r.tick_armed });
-                }
-                r.dbg_last = now_ms;
-            }
-        }
         for (cqes[0..n]) |cqe| {
             if (cqe.user_data == tag_timeout) {
                 r.tick_armed = false;
