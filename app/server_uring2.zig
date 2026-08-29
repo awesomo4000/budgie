@@ -542,8 +542,13 @@ const App = struct {
         return switch (c.phase) {
             .reading => a.stepReading(t, c),
             .working => a.stepWorking(t, c),
-            .writing => a.stepWriting(t, c),
-            .cleanup => unreachable, // handled above
+            // `.cleanup` is handled at the top, so arriving here means the
+            // check up there is wrong. Route it the same way rather than
+            // `unreachable`: this file ships ReleaseFast, where `unreachable`
+            // is undefined behaviour, and `beginCleanup` already states the
+            // policy -- being wrong should surface as an odd answer in a log,
+            // not as a panic in a server or worse in a release build.
+            .writing, .cleanup => a.stepWriting(t, c),
         };
     }
 
