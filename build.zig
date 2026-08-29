@@ -37,6 +37,7 @@ const tests = [_]Test{
     .{ .name = "parser_test" },
     .{ .name = "pipetest" },
     .{ .name = "cancel_test" },
+    .{ .name = "wheel_test" },
     .{ .name = "feedcmp" },
     .{ .name = "chunkfuzz" },
     .{ .name = "sim", .args = &.{ "42", "64", "30" }, .fast = true },
@@ -44,6 +45,7 @@ const tests = [_]Test{
     .{ .name = "server_test", .needs_server = true },
     .{ .name = "starve_test", .needs_server = true },
     .{ .name = "deadline_test", .needs_server = true },
+    .{ .name = "writepath_test", .needs_server = true },
 };
 
 pub fn build(b: *std.Build) void {
@@ -186,6 +188,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "uring_test", .src = "tests/server_test.zig" },
         .{ .name = "uring_starve_test", .src = "tests/starve_test.zig" },
         .{ .name = "uring_deadline_test", .src = "tests/deadline_test.zig" },
+        .{ .name = "uring_writepath_test", .src = "tests/writepath_test.zig" },
 
     };
 

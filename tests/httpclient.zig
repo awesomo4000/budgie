@@ -143,6 +143,33 @@ pub const Client = struct {
         _ = budgie.sys.setLinger(c.fd, @ptrCast(&linger), @sizeOf(@TypeOf(linger)));
     }
 
+    /// Shrink this end's receive buffer so the server's writes fill it and
+    /// start returning EAGAIN. Call before sending.
+    pub fn throttleReceive(c: Client, bytes: i32) void {
+        budgie.sys.setRecvBuf(c.fd, bytes);
+    }
+
+    /// Stop blocking in `send`, so a test can push until the server stops
+    /// draining and then say how far it got. A blocking send against a server
+    /// that has parked on its own write does not fail, it hangs.
+    pub fn setNonblocking(c: Client) void {
+        budgie.sys.setNonblock(c.fd);
+    }
+
+    /// Write what the kernel will take right now and return how much that was.
+    /// Zero means the connection is backed up, which is the state the caller
+    /// is usually trying to reach.
+    pub fn sendSome(c: Client, bytes: []const u8) usize {
+        var off: usize = 0;
+        while (off < bytes.len) {
+            const rc = sys.write(c.fd, bytes[off..].ptr, bytes.len - off);
+            if (sys.sysErr(rc)) return off;
+            if (rc == 0) return off;
+            off += rc;
+        }
+        return off;
+    }
+
     pub fn halfClose(c: Client) void {
         _ = sys.shutdown(c.fd, 1); // SHUT_WR
     }
@@ -171,6 +198,16 @@ pub fn statusIs(bytes: []const u8, code: []const u8) bool {
 
 pub fn request(target: []const u8, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "GET {s} HTTP/1.1\r\nHost: x\r\n\r\n", .{target}) catch unreachable;
+}
+
+/// Bytes in one `workRequest`. Fixed, so a caller that only managed a partial
+/// send can divide and know how many whole requests the server received.
+pub const work_request_bytes = "GET /work/0000 HTTP/1.1\r\nHost: x\r\n\r\n".len;
+
+/// A work request with the unit count zero-padded, so every request in a burst
+/// is the same length.
+pub fn workRequest(units: usize, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "GET /work/{d:0>4} HTTP/1.1\r\nHost: x\r\n\r\n", .{units}) catch unreachable;
 }
 
 /// How many 200 responses are in a buffer. Counting rather than parsing,

@@ -13,6 +13,11 @@
 //!   3. TIME TRAVEL virtual time jumps to the next scheduled event, so hours
 //!                  of deadline behaviour run in milliseconds.
 //!
+//! Run G exists for none of those. The timer wheel is 4096 slots of 1ms, and
+//! every deadline either server arms is 3000ms, so nothing here had ever been
+//! armed past one revolution and the overflow list was dead code under test. G
+//! sets the deadline to 10s and reaches it a hundred thousand times.
+//!
 //! usage: sim <seed> <tasks> <virtual_seconds> [conn_quota] [work_budget]
 
 const std = @import("std");
@@ -168,7 +173,12 @@ const Sim = struct {
                 if (charge > 0 and !sm.s.charge(t, &sm.q, charge)) {
                     sm.budget_denials += 1;
                     tk.phase = .parked;
-                    sm.s.disarm(t);
+                    // Re-arm without disarming first, which is what both
+                    // servers do -- `arm` unlinks and relinks by contract. The
+                    // extra `disarm` that used to be here hid a bug: it was
+                    // the only caller that took an entry off the overflow list
+                    // before re-arming, so `arm`'s own handling of that case
+                    // was never exercised, and it was wrong.
                     sm.s.arm(t, sm.clock.ms() + cfg.idle_deadline_ms);
                     sm.pushEvent(sm.clock.v_ns + 5_000_000, t);
                     return;
@@ -185,7 +195,6 @@ const Sim = struct {
                 tk.phase = .parked;
                 sm.s.setReserve(t, cfg.reserve);
                 sm.s.renewCap(t, cfg.cap);
-                sm.s.disarm(t);
                 sm.s.arm(t, sm.clock.ms() + cfg.idle_deadline_ms);
                 sm.pushEvent(sm.clock.v_ns + r.intRangeAtMost(i64, 500_000, 30_000_000), t);
             },
@@ -206,7 +215,7 @@ const Cfg = struct {
 
 /// `Sim` embeds a whole `Sched` (~0.6 MB), so six of them will not fit on an
 /// 8 MB stack. Static storage; the simulation is single-threaded by design.
-var sims: [6]Sim = undefined;
+var sims: [7]Sim = undefined;
 
 fn once(slot: usize, seed: u64, n_tasks: u32, virt_s: i64, cfg: Cfg) *Sim {
     const sm = &sims[slot];
@@ -248,6 +257,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const d = once(3, seed, ntask, virt_s, .{ .quantum = 100 });
     const e = once(4, seed, ntask, virt_s, .{ .conn_quota = 20000 });
     const f = once(5, seed, ntask, virt_s, .{ .conn_quota = 20000 });
+    // Past the wheel's 4096ms revolution, so every deadline parks on the
+    // overflow list instead of a slot. Nothing else here goes there: 3000ms
+    // fits inside one revolution, and so did every deadline either server
+    // armed, which is why a re-arm that corrupted the overflow list into a
+    // ring went unnoticed until it hung a real run at 100% CPU.
+    const g = once(6, seed, ntask, virt_s, .{ .idle_deadline_ms = 10_000 });
 
     std.debug.print(
         \\simulated {d} tasks for {d} virtual seconds in {d:.1} ms of wall clock
@@ -264,6 +279,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{ .name = "D  seed=N, quantum=100", .sm = d },
         .{ .name = "E  seed=N, conn_quota", .sm = e },
         .{ .name = "F  seed=N, conn_quota", .sm = f },
+        .{ .name = "G  seed=N, deadline=10s", .sm = g },
     };
     for (rows) |r| {
         std.debug.print("{s:<24} {x:0>16} {d:>8} {d:>10} {d:>8} {d:>10} {d:>8}\n", .{
@@ -276,4 +292,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.debug.print("SENSITIVITY A != C (seed)   : {}\n", .{a.trace != c.trace});
     std.debug.print("SENSITIVITY A != D (quantum): {}\n", .{a.trace != d.trace});
     std.debug.print("SENSITIVITY A != E (quota)  : {}\n", .{a.trace != e.trace});
+    // G is not a sensitivity run. Its trace matches A's because no deadline
+    // ever fires in this workload, so lengthening the deadline changes nothing
+    // observable. It is here to reach the overflow list at all, which every
+    // other run does exactly zero times.
+    std.debug.print("OVERFLOW    arms past the wheel: A {d}, G {d} (G trace == A: {})\n", .{
+        a.s.overflows, g.s.overflows, a.trace == g.trace,
+    });
 }

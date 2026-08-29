@@ -65,6 +65,16 @@ const Knobs = struct {
     /// for the run, instead of one write per answer. See the note on the same
     /// knob in app/server.zig.
     out_batch: i64 = 1,
+    /// Kernel send buffer for an accepted connection, in bytes. 0 leaves the
+    /// system default, which on both platforms auto-tunes into the megabytes.
+    ///
+    /// It is here because backpressure is otherwise unreachable. A test that
+    /// wants the server to meet EAGAIN has to leave several megabytes of
+    /// response unread, and the buffer keeps growing while it tries. Setting
+    /// this bounds the per-connection kernel memory, which is the same kind of
+    /// decision `io_bufs` is, and makes the parked-write path something a test
+    /// can provoke in one round trip.
+    send_buf_bytes: i64 = 0,
     uring_batch: i64 = 1,
     uring_window_us: i64 = 200,
     fixed_files: i64 = 1,
@@ -333,6 +343,14 @@ const App = struct {
     defer_max_ns: i64 = 0,
     served: u64 = 0,
     batched_answers: u64 = 0,
+    /// Backpressure, in its two shapes, counted so a test can assert the path
+    /// ran rather than assuming a small buffer was enough to provoke it. A
+    /// write that moved some bytes and stopped leaves `out_sent` partway
+    /// through and has to resume; a write that moved none found the peer's
+    /// window shut. They are separate counters because they are separate
+    /// paths, and a test that only reaches one of them has only covered one.
+    partial_writes: u64 = 0,
+    write_stalls: u64 = 0,
 
     // ----------------------------------------------------------- the kernel
 
@@ -482,10 +500,7 @@ const App = struct {
         // checking is the same shape of mistake as per-call-site `catch`.
         if (c.phase != .cleanup) {
             if (a.s.isCancelled(t)) return a.enterCleanup(t, c, .cancelled);
-            if (a.s.reasonFor(t) == .deadline) {
-                if (t == a.r.dbg_watch) { std.debug.print("DBG watched task {d} hit the deadline\n", .{t}); a.r.dbg_watch = 0; }
-                return a.enterCleanup(t, c, .deadline_missed);
-            }
+            if (a.s.reasonFor(t) == .deadline) return a.enterCleanup(t, c, .deadline_missed);
         }
         if (c.is_ctrl) return a.stepCtrl(t, c);
         switch (c.phase) {
@@ -509,6 +524,7 @@ const App = struct {
             const rc = linux.accept4(a.listener, null, null, linux.SOCK.NONBLOCK);
             if (sysErr(rc)) break;
             const fd: i32 = @intCast(rc);
+            if (K.send_buf_bytes > 0) sys.setSendBuf(fd, @intCast(K.send_buf_bytes));
             const t = a.freeTask() orelse {
                 _ = linux.close(fd);
                 break;
@@ -706,6 +722,7 @@ const App = struct {
         b.out_sent += @intCast(res);
         c.send_inflight = false;
         if (b.out_sent < b.out_len) {
+            a.partial_writes += 1;
             _ = a.r.submitSend(t, c.fd, b.out[b.out_sent..b.out_len]);
             c.send_inflight = true;
             return;
@@ -821,7 +838,13 @@ const App = struct {
             switch (b.parser.poll()) {
                 .need_input => if (used == 0) return false else continue,
                 .protocol_error => |pe| {
-                    if (a.bad_logged < 3) {
+                    // Diagnostic only, and behind the same switch as the
+                    // per-close line. The serving loop does no I/O of its own:
+                    // what it notices goes into counters and `rec`, and the
+                    // report happens after `runUntil` returns. A peer that can
+                    // make the loop write to a descriptor it does not control
+                    // can stall every other connection on it.
+                    if (!a.quiet and a.bad_logged < 3) {
                         a.bad_logged += 1;
                         std.debug.print("BAD[{s}] task={d} used={d} in_len={d} buf={d}\n  parser_buf=<{s}>\n", .{
                             @tagName(pe), t, used, b.in_len, c.buf.idx, b.parser.debugBuf(),
@@ -950,10 +973,14 @@ const App = struct {
                 // gone. Parking on a dead descriptor holds a task and a buffer
                 // that nothing reclaims.
                 if (!sys.wouldBlock(rc)) return a.finish(t, c, .peer_gone);
+                a.write_stalls += 1;
                 return a.r.watch(t, c.fd, .write);
             }
             b.out_sent += rc;
-            if (b.out_sent < b.out_len) return a.r.watch(t, c.fd, .write);
+            if (b.out_sent < b.out_len) {
+                a.partial_writes += 1;
+                return a.r.watch(t, c.fd, .write);
+            }
             return a.finishWrite(t, c, b);
         }
         if (!a.r.submitSend(t, c.fd, b.out[b.out_sent..b.out_len])) {
@@ -979,11 +1006,6 @@ const App = struct {
         // The next request may already be buffered.
         if (b.in_len > 0 and a.drainIn(t, c, b)) return;
         a.releaseIfIdle(c);
-        // watch this connection from its first completed response onward
-        if (a.r.dbg_watch == 0) {
-            a.r.dbg_watch = t;
-            std.debug.print("DBG watching task {d} from finishWrite (watching={})\n", .{ t, a.r.watching(t) });
-        }
         if (!a.r.watching(t) and !a.drr.isThrottled(t)) a.r.armRecv(t, c.fd);
     }
 
@@ -1121,6 +1143,8 @@ pub const Stats = struct {
     buf_exhausted: u64,
     top_ups: u64,
     top_up_denials: u64,
+    partial_writes: u64,
+    write_stalls: u64,
 };
 
 pub fn stats() Stats {
@@ -1145,6 +1169,8 @@ pub fn stats() Stats {
         .buf_exhausted = a.bufs.exhausted,
         .top_ups = a.s.top_ups,
         .top_up_denials = a.s.top_up_denials,
+        .partial_writes = a.partial_writes,
+        .write_stalls = a.write_stalls,
     };
 }
 

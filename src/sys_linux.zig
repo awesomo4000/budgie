@@ -46,6 +46,16 @@ pub fn setLinger(fd: i32, opt: *const anyopaque, len: u32) usize {
     return linux.setsockopt(fd, linux.SOL.SOCKET, 13, @ptrCast(opt), len); // SO_LINGER
 }
 
+/// Shrink the receive buffer, so a test can make the peer's writes block
+/// without having to send megabytes.
+pub fn setRecvBuf(fd: i32, bytes: c_int) void {
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.RCVBUF, @ptrCast(&bytes), @sizeOf(c_int));
+}
+
+pub fn setSendBuf(fd: i32, bytes: c_int) void {
+    _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.SNDBUF, @ptrCast(&bytes), @sizeOf(c_int));
+}
+
 pub fn setReuseAddr(fd: i32) void {
     const one: c_int = 1;
     _ = linux.setsockopt(fd, linux.SOL.SOCKET, linux.SO.REUSEADDR, @ptrCast(&one), @sizeOf(c_int));

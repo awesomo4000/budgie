@@ -14,6 +14,12 @@
 //!
 //! `sched` is the one file that touches no I/O. The readiness reactor runs on
 //! epoll or kqueue; the io_uring reactors are Linux-only and gated as such.
+//!
+//! None of it reports, either. No file here writes to stderr: what the kernel
+//! notices becomes a counter the caller reads, and the caller decides whether
+//! that ever reaches a terminal. One thread runs everything, so a write to a
+//! descriptor the application does not control stalls every connection on it
+//! until the write drains, and a peer that can provoke the write chooses when.
 
 const builtin = @import("builtin");
 
