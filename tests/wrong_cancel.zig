@@ -257,9 +257,19 @@ pub fn main() !void {
         \\So: one bug removed by a dispatcher, one removed by deleting the way to
         \\express it, one ordering error removed by a return type, and one that
         \\no mechanism can remove, because no language can make a function do
-        \\its job. The cost of all of them is the same and it is
-        \\bounded: a task that holds a resource forever. None of them produces
-        \\a wrong answer, and none makes anybody else wait.
+        \\its job.
+        \\
+        \\On the cost, which has changed since this was written and is the sort
+        \\of claim a catalogue goes stale by keeping. What these scenes measure
+        \\is the bare scheduler API, where a task that never releases holds
+        \\what it holds until the process ends. That is still true here and it
+        \\is no longer true of the servers: `iobuf.Pool` records which task it
+        \\handed each slot to and takes them back on teardown whatever the task
+        \\did, reporting `bufs_stranded` when it has to. There, the same
+        \\mistakes cost a missed courtesy rather than a leak.
+        \\
+        \\None of them, in either place, produces a wrong answer or makes
+        \\anybody else wait.
         \\
     , .{});
 

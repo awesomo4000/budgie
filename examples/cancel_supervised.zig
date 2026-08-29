@@ -18,6 +18,10 @@
 //!     because there is no call site.
 //!   - You cannot ship a task with no unwind path. `Supervised` will not
 //!     compile against a type that has no `unwind`.
+//!   - You cannot spend the wrong budget while unwinding, because the unwind
+//!     spends nothing. The dispatcher pays for the pass out of the reserve,
+//!     which `charge` has no path into, so the whole question of which account
+//!     cleanup draws on has left task code.
 //!
 //! What it does not buy: it cannot make your `unwind` do anything. `negligent`
 //! below has one, and it is empty, and the runtime calls it faithfully. The bug
@@ -118,7 +122,26 @@ fn Supervised(comptime T: type) type {
             // An unwind gets a disposition too, because unwinding is not
             // always one pass: a real server has a refusal to write and that
             // write can block.
-            const next = if (s.faultOf(t)) |f| T.unwind(t, f) else T.step(t);
+            const next = if (s.faultOf(t)) |f| blk: {
+                // The dispatcher pays for the unwind, so the unwind does not.
+                //
+                // This is the last thing a task could get wrong about budgets
+                // on the cleanup path: spend `charge` instead of
+                // `chargeReserve` and the call is refused, because a cancel
+                // zeroed the body budget, and the unwind quietly stops
+                // partway. You cannot spend the wrong budget if you do not
+                // spend anything, so the whole question leaves task code.
+                //
+                // Charged per pass rather than once on entry, because
+                // unwinding is not always one pass and each pass is real work.
+                // `app/server.zig` charges a flat amount once in
+                // `enterCleanup`; this is the same idea metered rather than
+                // stamped. Nothing refuses when a reserve runs out, which is a
+                // known gap and the reason `reserve` is a receipt today rather
+                // than a limit.
+                s.chargeReserve(t, unwind_cost);
+                break :blk T.unwind(t, f);
+            } else T.step(t);
             switch (next) {
                 .yield => s.makeRunnable(t, .spawn),
                 .done => {
@@ -262,8 +285,13 @@ const SearcherTask = struct {
         return .done;
     }
 
-    /// Called by the dispatcher, never by the task. The reserve funds this and
-    /// the body budget cannot reach it, so it works with `budget` at zero.
+    /// Called by the dispatcher, never by the task. It names no budget at all:
+    /// the dispatcher has already paid for this pass out of the reserve, which
+    /// `charge` has no path into. So there is nothing here to get wrong about
+    /// which account cleanup spends from.
+    ///
+    /// What is left is the only part that genuinely needs the task: giving
+    /// things back, and whatever counts as a courteous ending.
     pub fn unwind(t: TaskId, f: sched.Fault) Next {
         const w = &searchers[t];
         w.unwinds_called += 1;
@@ -273,7 +301,6 @@ const SearcherTask = struct {
         // gives nothing back.
         if (w.negligent) return .done;
 
-        s.chargeReserve(t, unwind_cost);
         dropSlot(t);
         w.ending = .unwound;
         std.debug.print("  {s:<10} {s} after {d} units, {d}ms later, reserve left {d}\n", .{
