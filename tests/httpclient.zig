@@ -197,7 +197,12 @@ pub fn statusIs(bytes: []const u8, code: []const u8) bool {
 }
 
 pub fn request(target: []const u8, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "GET {s} HTTP/1.1\r\nHost: x\r\n\r\n", .{target}) catch unreachable;
+    // `@panic` and not `catch unreachable`. The buffer belongs to the caller,
+    // so "this cannot fail" is a claim about somebody else's argument, and
+    // `unreachable` is undefined behaviour in a release build and an
+    // unexplained panic in a safe one. This says which buffer was too small.
+    return std.fmt.bufPrint(buf, "GET {s} HTTP/1.1\r\nHost: x\r\n\r\n", .{target}) catch
+        @panic("httpclient.request: target buffer too small");
 }
 
 /// Bytes in one `workRequest`. Fixed, so a caller that only managed a partial
@@ -207,7 +212,8 @@ pub const work_request_bytes = "GET /work/0000 HTTP/1.1\r\nHost: x\r\n\r\n".len;
 /// A work request with the unit count zero-padded, so every request in a burst
 /// is the same length.
 pub fn workRequest(units: usize, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "GET /work/{d:0>4} HTTP/1.1\r\nHost: x\r\n\r\n", .{units}) catch unreachable;
+    return std.fmt.bufPrint(buf, "GET /work/{d:0>4} HTTP/1.1\r\nHost: x\r\n\r\n", .{units}) catch
+        @panic("httpclient.workRequest: buffer smaller than work_request_bytes");
 }
 
 /// How many 200 responses are in a buffer. Counting rather than parsing,

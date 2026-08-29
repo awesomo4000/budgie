@@ -36,7 +36,7 @@ const check = hc.check;
 /// `GET /work/N` asks for N units of CPU work, so request cost is a parameter.
 fn workReq(units: i64, buf: []u8) []const u8 {
     var target: [64]u8 = undefined;
-    const t = std.fmt.bufPrint(&target, "/work/{d}", .{units}) catch unreachable;
+    const t = std.fmt.bufPrint(&target, "/work/{d}", .{units}) catch @panic("target buffer too small");
     return hc.request(t, buf);
 }
 

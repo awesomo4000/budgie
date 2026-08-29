@@ -177,7 +177,7 @@ fn tOversized(port: u16) !void {
     var big: [4096]u8 = undefined;
     @memset(&big, 'A');
     var head: [64]u8 = undefined;
-    const h = std.fmt.bufPrint(&head, "GET /", .{}) catch unreachable;
+    const h = std.fmt.bufPrint(&head, "GET /", .{}) catch @panic("head buffer too small");
     try c.send(h);
     c.send(&big) catch {};
     c.send("\r\n\r\n") catch {};

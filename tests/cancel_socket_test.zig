@@ -67,7 +67,7 @@ const Shed = struct { cancelled: usize, busy: usize };
 
 fn shed(c: Client, n: usize) !Shed {
     var cmd: [32]u8 = undefined;
-    try c.send(std.fmt.bufPrint(&cmd, "shed {d}\n", .{n}) catch unreachable);
+    try c.send(std.fmt.bufPrint(&cmd, "shed {d}\n", .{n}) catch @panic("shed command buffer too small"));
     var buf: [64]u8 = undefined;
     const got = c.recvUntil(&buf, "\n", 1, wait_ms);
     const line = buf[0..got];
