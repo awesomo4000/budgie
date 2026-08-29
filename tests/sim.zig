@@ -103,9 +103,12 @@ const Sim = struct {
         // Every task starts parked with a request arriving at a random time.
         for (1..sm.n_tasks + 1) |i| {
             const t: TaskId = @intCast(i);
-            sm.s.setPrio(t, 2);
-            sm.s.assignQuota(t, sup_conn);
-            sm.s.admit(t, cfg.cap, cfg.reserve);
+            _ = sm.s.admit(t, .{
+                .prio = 2,
+                .quota = sup_conn,
+                .cap = cfg.cap,
+                .reserve = cfg.reserve,
+            });
             _ = sm.s.popRunnable(); // consume the spawn wake; arrival drives it
             sm.s.queued[t] = false;
             sm.pushEvent(sm.clock.v_ns + r.intRangeAtMost(i64, 0, 50_000_000), t);
@@ -147,7 +150,7 @@ const Sim = struct {
     fn step(sm: *Sim, t: TaskId, cfg: Cfg, r: std.Random) void {
         const tk = &sm.tasks[t];
 
-        if (sm.s.reasonFor(t) == .deadline) {
+        if (sm.s.isExpired(t)) {
             // Idle timeout: end the request, re-arm, wait for the next arrival.
             tk.ended += 1;
             tk.phase = .parked;

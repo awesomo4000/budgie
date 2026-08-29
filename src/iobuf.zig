@@ -101,8 +101,28 @@ pub fn storeRegion(n_slots: usize) ![]u8 {
     return std.mem.sliceAsBytes(s)[0 .. n * @sizeOf(IoBuf)];
 }
 
+/// No owner recorded. Not a valid task id, and `releaseAllFor` will not match
+/// it, so a slot taken through the un-owned `acquire` is never reclaimed by
+/// somebody else's teardown.
+pub const no_owner: u32 = std.math.maxInt(u32);
+
 pub const Pool = struct {
     gen: [max_bufs]u32 = @splat(1),
+    /// Who each live slot was handed to. Provenance, and the whole difference
+    /// between reclaiming a resource and asking a task to hand it back.
+    ///
+    /// An unwind that forgets to release, or declines to, used to leak the
+    /// buffer for the life of the process, and nothing could tell: the only
+    /// evidence was the task failing to go away, and a task that reports
+    /// itself finished takes even that away. seL4 has no such problem because
+    /// objects are derived from untyped memory and the kernel wrote the
+    /// derivation down, so `revoke` needs no cooperation from the holder.
+    /// This is that idea at the smallest scale that works: one field per slot.
+    ///
+    /// The id is opaque here. The pool does not know what a task is, the same
+    /// way the scheduler does not know what a buffer is. It holds an
+    /// accounting structure, not a semantic one.
+    owner: [max_bufs]u32 = @splat(no_owner),
     free: [max_bufs]u16 = undefined,
     n_free: usize = 0,
     cap: usize = 0,
@@ -135,11 +155,17 @@ pub const Pool = struct {
     /// caller answers 503 rather than failing to allocate. That answer has to
     /// be written somewhere, which is what `cleanup_slots` is for.
     pub fn acquire(p: *Pool) ?Handle {
+        return p.acquireFor(no_owner);
+    }
+
+    /// The same, recording who it went to. Prefer this: an un-owned slot is
+    /// one nothing can reclaim on the holder's behalf.
+    pub fn acquireFor(p: *Pool, owner: u32) ?Handle {
         if (p.n_free <= p.cleanup_slots) {
             p.exhausted += 1;
             return null;
         }
-        return p.take();
+        return p.take(owner);
     }
 
     /// Take a buffer for an unwind, including the reserved one.
@@ -152,16 +178,21 @@ pub const Pool = struct {
     /// nothing written. Measured before this existed: 48 connections against a
     /// pool of 2 produced 42 `no_buffer` endings and zero delivered 503s.
     pub fn acquireForCleanup(p: *Pool) ?Handle {
+        return p.acquireForCleanupBy(no_owner);
+    }
+
+    pub fn acquireForCleanupBy(p: *Pool, owner: u32) ?Handle {
         if (p.n_free == 0) {
             p.exhausted += 1;
             return null;
         }
-        return p.take();
+        return p.take(owner);
     }
 
-    fn take(p: *Pool) ?Handle {
+    fn take(p: *Pool, owner: u32) ?Handle {
         p.n_free -= 1;
         const idx = p.free[p.n_free];
+        p.owner[idx] = owner;
         p.live += 1;
         if (p.live > p.high_water) p.high_water = p.live;
         p.acquires += 1;
@@ -172,12 +203,36 @@ pub const Pool = struct {
 
     pub fn release(p: *Pool, h: Handle) void {
         if (h.isNull() or p.gen[h.idx] != h.gen) return;
+        p.owner[h.idx] = no_owner;
         p.gen[h.idx] +%= 1;
         if (p.gen[h.idx] == 0) p.gen[h.idx] = 1;
         p.free[p.n_free] = h.idx;
         p.n_free += 1;
         p.live -= 1;
         p.releases += 1;
+    }
+
+    /// Take back everything this owner still holds, and say how much that was.
+    ///
+    /// Called on teardown whatever the task claims to have done, so a unwind
+    /// that releases nothing costs a missed courtesy rather than a leak. A
+    /// non-zero return is a task that ended while still holding something,
+    /// which is worth reporting: the reclaim already happened, but somebody
+    /// wrote an unwind that does not do its job.
+    ///
+    /// O(cap), on the teardown path only. A task holds at most one buffer
+    /// today, so a per-owner index would make this O(1); that is worth doing
+    /// if a connection-churn benchmark ever shows the walk, and not before.
+    pub fn releaseAllFor(p: *Pool, owner: u32) usize {
+        if (owner == no_owner or p.live == 0) return 0;
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < p.cap) : (i += 1) {
+            if (p.owner[i] != owner) continue;
+            p.release(.{ .idx = @intCast(i), .gen = p.gen[i] });
+            n += 1;
+        }
+        return n;
     }
 
     pub fn get(p: *Pool, h: Handle) ?*IoBuf {

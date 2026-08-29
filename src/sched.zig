@@ -36,14 +36,67 @@ pub const prio_levels = 4;
 pub const prio_idle: u8 = prio_levels - 1;
 pub const max_tasks = 8192;
 
-/// Why a task became runnable. The app switches on this instead of scanning
-/// for its own timeout condition.
-pub const Wake = enum { spawn, io, deadline, cancelled };
+/// Why a task became runnable, restricted to things the TASK responds to.
+///
+/// It used to carry `.deadline` and `.cancelled` as well, and both were wrong
+/// to put here for the same reason. A wake reason is safe only when the
+/// condition behind it is re-observable: a task that misses `.io` finds out by
+/// reading the descriptor, so nothing is lost. A missed deadline or a missed
+/// cancellation cannot be recovered, because the moment is gone.
+///
+/// And they were missed, routinely. `makeRunnable` returns early when the task
+/// is already queued, which is where a task making progress spends most of its
+/// life, so the reason was simply dropped. `expire` had already unlinked the
+/// timer by then, so a deadline that fired while its task was queued vanished:
+/// no notification and no timer. Both terminal conditions are state now, read
+/// through `isCancelled` and `isExpired`, and state cannot be dropped because
+/// there is no delivery.
+///
+/// What is left is the split the call sites already showed. `.io` comes only
+/// from a reactor and `.spawn` from admission or from a task yielding with
+/// work left. Decisions ABOUT a task are not in here.
+pub const Wake = enum { spawn, io };
+
+/// What has been withdrawn from a task, if anything. See `Sched.faultOf`.
+///
+/// One variant, and that is the honest count rather than a placeholder. Two
+/// other conditions look like they belong here and do not.
+///
+/// A fired deadline is not a fault. The same wheel means "you are late" for a
+/// connection and "refill my budget" for a periodic task, and only the
+/// application knows which of those it armed. `app/server.zig` uses it both
+/// ways in the same file.
+///
+/// A refused `charge` is not a fault either. It fails for two unrelated
+/// reasons, this request spending its per-request ceiling or the whole class
+/// running out of allowance for the period, and those want different answers:
+/// refuse the request, or park until the refill.
+///
+/// Cancellation is the one where the fact carries no policy. Somebody holding
+/// the right to stop this task has stopped it. What to do about that is the
+/// supervisor's business. That it happened is the scheduler's, and it is the
+/// only thing here the scheduler can state without guessing at intent.
+pub const Fault = enum { cancelled };
 
 /// A minted right to cancel one specific task instance. Generational: a token
 /// for a task whose slot has since been recycled is a no-op, not a kill of
 /// whoever inherited the slot. Same discipline as a pool handle.
-pub const CancelTok = struct { task: TaskId, gen: u32 };
+pub const CancelTok = struct {
+    task: TaskId = 0,
+    /// Zero is never a live generation. `admit` pre-increments and skips zero
+    /// on wrap, and `cancel` refuses a token carrying it.
+    ///
+    /// That invariant is load bearing rather than tidy. Without it a
+    /// default-constructed `.{}` is a token for task 0 at generation 0, and
+    /// both servers set `live[listener_task] = true` by hand without going
+    /// through admission, so the listener sits at generation 0 forever. An
+    /// uninitialised token would cancel the thing that accepts connections.
+    gen: u32 = 0,
+
+    /// A token that names nothing. Use it for a field that has to exist
+    /// before the task it will refer to does.
+    pub const none: CancelTok = .{};
+};
 
 pub const wheel_slots: usize = 4096; // 1ms per slot => 4.096s of range
 const nil: u32 = std.math.maxInt(u32);
@@ -93,6 +146,16 @@ pub const Sched = struct {
     // --- cancellation ---
     gen: [max_tasks]u32 = @splat(0),
     cancelled: [max_tasks]bool = @splat(false),
+    /// A deadline fired for this task and has not been replaced. Set by
+    /// `expire`, cleared by `arm`, and by admission and release.
+    ///
+    /// State rather than a wake reason, because the wake reason was being
+    /// dropped whenever the task was already queued and the timer had already
+    /// been unlinked, so the deadline evaporated in silence. What it MEANS is
+    /// still the application's: a connection reads it as a liveness bound and
+    /// closes, and the background task reads it as its refill arriving. That
+    /// is why it is not in `Fault`.
+    expired: [max_tasks]bool = @splat(false),
 
 
     grant_size: i64 = 1000,
@@ -118,31 +181,73 @@ pub const Sched = struct {
 
     // ------------------------------------------------------------ lifecycle
 
-    /// `cap` is the PER-REQUEST ceiling, not a pre-funded grant: `budget`
-    /// starts at zero and units only ever arrive through `topUp`, so the
-    /// supervisor tree stays conservative.
-    pub fn admit(s: *Sched, id: TaskId, cap: i64, reserve: i64) void {
+    /// Everything a task needs decided before it can be dispatched. No field
+    /// has a default, so the compiler makes the caller choose all four.
+    ///
+    /// It is one struct because the three settings used to be three separate
+    /// calls that all had to happen BEFORE `admit`, and getting any of them
+    /// out of order failed silently:
+    ///
+    ///   - `setPrio` after admission left the task queued in the old class
+    ///     for its first dispatch, because `makeRunnable` reads `prio` when it
+    ///     enqueues.
+    ///   - `assignQuota` after admission, or not at all, charged whichever
+    ///     supervisor node the slot's previous occupant used. Admission does
+    ///     not reset `quota_of`, so a recycled slot inherits it.
+    ///   - `cancelTok` before admission produced a token for the generation
+    ///     that admission was about to bump, so the cancel silently no-opped.
+    ///
+    /// None of those was reachable through the type system. All three are now
+    /// unreachable through it.
+    pub const Admission = struct {
+        prio: u8,
+        quota: quota.Id,
+        /// The PER-REQUEST ceiling, not a pre-funded grant: `budget` starts at
+        /// zero and units only ever arrive through `topUp`, so the supervisor
+        /// tree stays conservative.
+        cap: i64,
+        /// Funds the unwind. `charge` has no path into it and `chargeReserve`
+        /// cannot fail, which is what makes cleanup possible after a cancel
+        /// has taken the body budget away.
+        reserve: i64,
+    };
+
+    /// Admit a task and return the sole right to cancel it.
+    ///
+    /// The token comes back from here because this is the only place it can
+    /// honestly be minted. There was a `cancelTok(id)` that would hand anybody
+    /// holding a task id the authority to cancel that task, which is ambient
+    /// authority with a generation check bolted on rather than a capability.
+    /// In seL4 you cannot look up a capability by object id; you receive one
+    /// when the object is created, and dropping your last copy loses the
+    /// authority. This is that rule, as far as a plain copyable struct can
+    /// carry it: nothing here stops a holder copying the token, so it is a
+    /// bearer token rather than a slot in a CNode.
+    pub fn admit(s: *Sched, id: TaskId, a: Admission) CancelTok {
         s.live[id] = true;
-        s.cap[id] = cap;
+        s.prio[id] = @min(a.prio, prio_idle);
+        s.quota_of[id] = a.quota;
+        s.cap[id] = a.cap;
         s.cancelled[id] = false;
+        s.expired[id] = false;
         s.gen[id] +%= 1;
+        if (s.gen[id] == 0) s.gen[id] = 1; // zero means "names nothing"
         s.budget[id] = 0;
-        s.reserve[id] = reserve;
+        s.reserve[id] = a.reserve;
         s.makeRunnable(id, .spawn);
+        return .{ .task = id, .gen = s.gen[id] };
     }
 
     pub fn release(s: *Sched, id: TaskId) void {
         s.disarm(id);
         s.live[id] = false;
         s.cancelled[id] = false;
+        s.expired[id] = false;
         s.gen[id] +%= 1; // invalidates every outstanding token for this slot
     }
 
     // ---------------------------------------------------------- cancellation
 
-    pub fn cancelTok(s: *const Sched, id: TaskId) CancelTok {
-        return .{ .task = id, .gen = s.gen[id] };
-    }
 
     /// Cancel is two independent guarantees:
     ///   safety   - budget = 0, so the task structurally cannot do more body
@@ -152,7 +257,7 @@ pub const Sched = struct {
     ///              rather than at its deadline.
     /// Sticky, idempotent, and not a value anything can swallow.
     pub fn cancel(s: *Sched, tok: CancelTok) bool {
-        if (!s.live[tok.task] or s.gen[tok.task] != tok.gen) {
+        if (tok.gen == 0 or !s.live[tok.task] or s.gen[tok.task] != tok.gen) {
             s.cancels_stale += 1;
             return false;
         }
@@ -162,12 +267,31 @@ pub const Sched = struct {
         s.budget[tok.task] = 0;
         s.cap[tok.task] = 0; // and no further top-ups can be requested
         s.disarm(tok.task);
-        s.makeRunnable(tok.task, .cancelled);
+        // `.spawn` and not a reason of its own: the state is what carries the
+        // cancellation, and a reason recorded here would be dropped anyway
+        // whenever the task was already queued.
+        s.makeRunnable(tok.task, .spawn);
         return true;
     }
 
     pub fn isCancelled(s: *const Sched, id: TaskId) bool {
         return s.cancelled[id];
+    }
+
+    /// Whether a deadline fired for this task and has not been replaced.
+    ///
+    /// The application decides what that means. `app/server.zig` reads it two
+    /// ways in one file: a connection is past its liveness bound and gets a
+    /// 408, and the background task's refill has come due. Same wheel, same
+    /// bit, opposite conclusions, which is exactly why this is not a `Fault`.
+    pub fn isExpired(s: *const Sched, id: TaskId) bool {
+        return s.expired[id];
+    }
+
+    /// See `Fault`. Returns null when this task still has the authority to run.
+    pub fn faultOf(s: *const Sched, id: TaskId) ?Fault {
+        if (s.cancelled[id]) return .cancelled;
+        return null;
     }
 
     /// Refresh the body budget without touching the reserve.
@@ -275,6 +399,8 @@ pub const Sched = struct {
             s.unlink(id);
         }
         if (s.cur == 0) s.cur = at_ms;
+        // A new deadline supersedes whatever the last one concluded.
+        s.expired[id] = false;
         const t = &s.timer[id];
         t.at = at_ms;
         const delta = at_ms - s.cur;
@@ -384,7 +510,8 @@ pub const Sched = struct {
                 const id = s.bucket[slot];
                 s.unlink(id);
                 s.fires += 1;
-                s.makeRunnable(id, .deadline);
+                s.expired[id] = true;
+                s.makeRunnable(id, .spawn);
             }
             s.cur = at + 1;
         }
@@ -401,7 +528,8 @@ pub const Sched = struct {
                 // the wheel hand has passed, which would wrap into the future.
                 s.unlink(id);
                 s.fires += 1;
-                s.makeRunnable(id, .deadline);
+                s.expired[id] = true;
+                s.makeRunnable(id, .spawn);
             } else if (at - s.cur < @as(i64, wheel_slots)) {
                 s.unlink(id);
                 s.armed += 1;

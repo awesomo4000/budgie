@@ -180,7 +180,12 @@ fn accept() void {
         conns[t] = .{ .fd = fd };
         s.live[t] = true;
         s.setPrio(t, 2);
-        s.admit(t, 1000, 50); // execution budget, and a reserve for cleanup
+        _ = s.admit(t, .{
+            .prio = 1,
+            .quota = 0,
+            .cap = 1000,      // execution budget for one request
+            .reserve = 50,    // and a reserve for cleanup, which charge cannot reach
+        });
         r.open(t);
         r.watch(t, fd, .read);
     }

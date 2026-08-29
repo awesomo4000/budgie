@@ -32,6 +32,10 @@ const Test = struct {
     needs_echo: bool = false,
     /// server_test does the same with app/server.zig.
     needs_server: bool = false,
+    /// Build step name, when it should differ from the file name. The
+    /// catalogues of failure modes are named `wrong-*` so they group together
+    /// in `zig build --help` and read as what they are.
+    step: ?[]const u8 = null,
 };
 const tests = [_]Test{
     .{ .name = "parser_test" },
@@ -46,6 +50,8 @@ const tests = [_]Test{
     .{ .name = "starve_test", .needs_server = true },
     .{ .name = "deadline_test", .needs_server = true },
     .{ .name = "writepath_test", .needs_server = true },
+    .{ .name = "wrong_cancel", .step = "wrong-cancel" },
+    .{ .name = "cancel_socket_test", .needs_server = true },
 };
 
 pub fn build(b: *std.Build) void {
@@ -104,6 +110,44 @@ pub fn build(b: *std.Build) void {
         run.stdio = .inherit;
         if (b.args) |args| run.addArgs(args);
         b.step("echo", "Run the example server from examples/echo.zig").dependOn(&run.step);
+    }
+
+    // Cancellation on its own, no I/O. A scratchpad for the interface rather
+    // than a demonstration of a settled one.
+    {
+        const exe = b.addExecutable(.{
+            .name = "cancel",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/cancel.zig"),
+                .target = target,
+                .optimize = test_optimize,
+                .imports = &.{.{ .name = "budgie", .module = budgie }},
+            }),
+        });
+        b.installArtifact(exe);
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        if (b.args) |args| run.addArgs(args);
+        b.step("cancel", "Run the cancellation example from examples/cancel.zig").dependOn(&run.step);
+    }
+
+    // The same race with the cancellation check hoisted into a dispatcher.
+    // Read next to examples/cancel.zig; the comparison is the point.
+    {
+        const exe = b.addExecutable(.{
+            .name = "cancel-supervised",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("examples/cancel_supervised.zig"),
+                .target = target,
+                .optimize = test_optimize,
+                .imports = &.{.{ .name = "budgie", .module = budgie }},
+            }),
+        });
+        b.installArtifact(exe);
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        if (b.args) |args| run.addArgs(args);
+        b.step("cancel-supervised", "Run examples/cancel_supervised.zig").dependOn(&run.step);
     }
 
     // Scratch probe for the keep-alive stall investigation. Linux only.
@@ -189,6 +233,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "uring_starve_test", .src = "tests/starve_test.zig" },
         .{ .name = "uring_deadline_test", .src = "tests/deadline_test.zig" },
         .{ .name = "uring_writepath_test", .src = "tests/writepath_test.zig" },
+        .{ .name = "uring_cancel_socket_test", .src = "tests/cancel_socket_test.zig" },
 
     };
 
@@ -236,7 +281,8 @@ pub fn build(b: *std.Build) void {
         const solo = b.addRunArtifact(exe);
         solo.stdio = .inherit;
         if (b.args) |args| solo.addArgs(args) else solo.addArgs(t.args);
-        b.step(t.name, b.fmt("Run {s}", .{t.name})).dependOn(&solo.step);
+        const step_name = t.step orelse t.name;
+        b.step(step_name, b.fmt("Run {s}", .{t.name})).dependOn(&solo.step);
     }
 
     if (uring_mod) |um| {

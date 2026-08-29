@@ -11,15 +11,18 @@ pub fn main() !void {
     s.cur = 1000;
 
     // --- 1. cancel is prompt: a parked task becomes runnable immediately
-    s.admit(1, 1000, 50);
+    // The token comes back from admission; there is no other way to get one.
+    const tok = s.admit(1, .{ .prio = 1, .quota = 0, .cap = 1000, .reserve = 50 });
     while (s.popRunnable()) |_| {}          // consume the .spawn wake
     s.arm(1, 1_000_000);                     // parked with a far-off deadline
-    const tok = s.cancelTok(1);
     std.debug.print("before cancel: runnable={}\n", .{s.anyRunnable()});
     _ = s.cancel(tok);
     const woke = s.popRunnable().?;
-    std.debug.print("after cancel: woke task {d} reason={s} budget={d} reserve={d}\n",
-        .{ woke, @tagName(s.reasonFor(woke)), s.budget[1], s.reserve[1] });
+    // The wake reason is `.spawn`, and deliberately so. Cancellation is state,
+    // not an event: a reason recorded here would be dropped whenever the task
+    // was already queued, which is most of a busy task's life.
+    std.debug.print("after cancel: woke task {d} reason={s} cancelled={} budget={d} reserve={d}\n",
+        .{ woke, @tagName(s.reasonFor(woke)), s.isCancelled(woke), s.budget[1], s.reserve[1] });
 
     // --- 2. safety: body work impossible, cleanup still funded
     std.debug.print("charge(1,1) after cancel = {} (expect false)\n", .{s.charge(1, &q, 1)});
@@ -37,7 +40,7 @@ pub fn main() !void {
 
     // --- 5. generational: token for a recycled slot is a no-op
     s.release(1);
-    s.admit(1, 1000, 50);                    // different connection, same slot
+    _ = s.admit(1, .{ .prio = 1, .quota = 0, .cap = 1000, .reserve = 50 }); // different connection, same slot
     while (s.popRunnable()) |_| {}
     const ok = s.cancel(tok);                // stale token
     std.debug.print("stale token cancel = {} (expect false)  new task cancelled={} (expect false)\n",

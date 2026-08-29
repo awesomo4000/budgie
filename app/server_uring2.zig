@@ -282,6 +282,11 @@ const Conn = struct {
     /// Null while parked with nothing in flight. Acquired on the first read
     /// of a request, released when the connection goes idle again.
     buf: iobuf.Handle = .{},
+    /// The right to cancel this connection, handed back by admission. The
+    /// server holds it because the server admitted the task; nothing else in
+    /// the program can mint one. `.none` until accept fills it in, and a
+    /// `.none` token cancels nothing.
+    tok: sched.CancelTok = .none,
     /// A send is queued in the ring; its completion will advance the write.
     send_inflight: bool = false,
     /// A completion whose bytes did not fit. Its ring buffer is held out of
@@ -351,6 +356,10 @@ const App = struct {
     /// paths, and a test that only reaches one of them has only covered one.
     partial_writes: u64 = 0,
     write_stalls: u64 = 0,
+    /// Buffers the pool had to take back because the connection ended still
+    /// holding them. Should be zero; a number here names an unwind that does
+    /// not do its job.
+    bufs_stranded: usize = 0,
 
     // ----------------------------------------------------------- the kernel
 
@@ -500,7 +509,7 @@ const App = struct {
         // checking is the same shape of mistake as per-call-site `catch`.
         if (c.phase != .cleanup) {
             if (a.s.isCancelled(t)) return a.enterCleanup(t, c, .cancelled);
-            if (a.s.reasonFor(t) == .deadline) return a.enterCleanup(t, c, .deadline_missed);
+            if (a.s.isExpired(t)) return a.enterCleanup(t, c, .deadline_missed);
         }
         if (c.is_ctrl) return a.stepCtrl(t, c);
         switch (c.phase) {
@@ -531,9 +540,12 @@ const App = struct {
             };
             a.conn_store[t] = .{ .fd = fd };
             a.live_conn[t] = true;
-            a.s.setPrio(t, prio_conn);
-            a.s.assignQuota(t, sup_conn);
-            a.s.admit(t, K.work_budget, K.cleanup_reserve); // cap; grant arrives via topUp
+            a.conn_store[t].tok = a.s.admit(t, .{
+                .prio = prio_conn,
+                .quota = sup_conn,
+                .cap = K.work_budget,   // grant arrives via topUp
+                .reserve = K.cleanup_reserve,
+            });
             if (K.drr_quantum > 0) a.drr.admit(t);
             a.s.arm(t, nowMs() + K.idle_deadline_ms);
             a.r.registerFile(t, fd);
@@ -550,7 +562,13 @@ const App = struct {
     fn stepBackground(a: *App, t: TaskId) void {
         // A refill deadline arrived: top the budget back up. Same wheel, same
         // mechanism as a connection's idle timeout -- only the meaning differs.
-        if (a.s.reasonFor(t) == .deadline) {
+        //
+        // This was `reasonFor(t) == .deadline`, and it was silently broken: a
+        // refill that fired while this task was queued had its wake reason
+        // dropped, so the top-up never happened and the re-arm below never
+        // ran. One missed edge and background work stopped for the life of the
+        // process. Reading the state instead cannot miss it.
+        if (a.s.isExpired(t)) {
             _ = a.s.topUp(t, &a.q, K.bg_budget);
             a.s.arm(t, nowMs() + K.bg_period_ms);
         }
@@ -586,13 +604,52 @@ const App = struct {
             };
             a.conn_store[t] = .{ .fd = fd, .is_ctrl = true };
             a.live_conn[t] = true;
-            a.s.setPrio(t, prio_ctrl);
-            a.s.assignQuota(t, sup_ctrl);
-            a.s.admit(t, 1 << 20, 1 << 20);  // control surface: effectively uncapped
+            _ = a.s.admit(t, .{ .prio = prio_ctrl, .quota = sup_ctrl, .cap = 1 << 20, .reserve = 1 << 20 });
             a.r.watch(t, fd, .read);
         }
         a.r.watch(ctrl_listener_task, a.ctrl_listener, .read);
 
+    }
+
+    /// The outcome of a shed. `busy` is how many of the cancelled connections
+    /// had I/O in flight at the moment they were cancelled, which is decided
+    /// in the same pass as the cancel rather than sampled by the caller
+    /// before or after. A test that wants to prove it cancelled work in
+    /// progress cannot do that from outside without racing the server; this
+    /// makes it a fact the server reports.
+    const Shed = struct { cancelled: usize = 0, busy: usize = 0 };
+
+    /// Shed load: withdraw the authority to run from up to `want` connections.
+    ///
+    /// This is the case a deadline cannot cover. Every connection here is
+    /// healthy, responsive and inside its budget; somebody outside has simply
+    /// decided there should be fewer of them. The scheduler zeroes their
+    /// budgets, so they cannot serve another byte whether or not they notice,
+    /// and each one unwinds on its reserve and answers 503 before closing.
+    ///
+    /// It cancels with tokens the server was handed at admission. There is no
+    /// way to cancel a task this server did not admit, which is the point of
+    /// admission returning the token rather than a `cancelTok(id)` anyone
+    /// could call.
+    fn shed(a: *App, want: usize) Shed {
+        var out: Shed = .{};
+        var t: TaskId = 0;
+        while (t < max_tasks and out.cancelled < want) : (t += 1) {
+            if (!a.live_conn[t]) continue;
+            const c = &a.conn_store[t];
+            // Not the control connection giving the order, and not one that
+            // is already on its way out.
+            if (c.is_ctrl or c.phase == .cleanup) continue;
+            // Holding a buffer means bytes are in flight: the pool hands one
+            // out on the first read of a request and takes it back when the
+            // connection goes idle again.
+            const was_busy = !c.buf.isNull();
+            if (a.s.cancel(c.tok)) {
+                out.cancelled += 1;
+                if (was_busy) out.busy += 1;
+            }
+        }
+        return out;
     }
 
     fn stepCtrl(a: *App, t: TaskId, c: *Conn) void {
@@ -615,7 +672,21 @@ const App = struct {
             a.live_conn[t] = false;
             return;
         }
-        _ = linux.write(c.fd, &buf, rc);
+        // One command, and everything else still echoes, which is what the
+        // existing control-surface test checks.
+        const line = buf[0..rc];
+        if (std.mem.startsWith(u8, line, "shed ")) {
+            var end: usize = 5;
+            while (end < line.len and line[end] >= '0' and line[end] <= '9') end += 1;
+            const want = std.fmt.parseInt(usize, line[5..end], 10) catch 0;
+            var out: [64]u8 = undefined;
+            const r = a.shed(want);
+            const reply = std.fmt.bufPrint(&out, "shed {d} busy {d}\n", .{ r.cancelled, r.busy }) catch
+                "shed 0 busy 0\n";
+            _ = linux.write(c.fd, reply.ptr, reply.len);
+        } else {
+            _ = linux.write(c.fd, &buf, rc);
+        }
         a.r.watch(t, c.fd, .read);
     }
 
@@ -740,7 +811,7 @@ const App = struct {
     fn onData(a: *App, t: TaskId, c: *Conn, bytes: []const u8) bool {
         a.on_data += 1;
         if (c.buf.isNull()) {
-            c.buf = a.bufs.acquire() orelse {
+            c.buf = a.bufs.acquireFor(t) orelse {
                 a.enterCleanup(t, c, .no_buffer);
                 return true;
             };
@@ -952,7 +1023,7 @@ const App = struct {
         };
         // The unwind needs a buffer even if the body could not get one: that
         // is what a cleanup reserve means for memory.
-        if (c.buf.isNull()) c.buf = a.bufs.acquireForCleanup() orelse return a.finish(t, c, why);
+        if (c.buf.isNull()) c.buf = a.bufs.acquireForCleanupBy(t) orelse return a.finish(t, c, why);
         const b = a.bufs.get(c.buf) orelse return a.finish(t, c, why);
         b.out_sent = 0;
         b.out_len = (std.fmt.bufPrint(&b.out, "HTTP/1.1 {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ status, body.len, body }) catch
@@ -997,9 +1068,15 @@ const App = struct {
         // that belong to the next request and must survive untouched.
         b.out_len = 0;
         b.out_sent = 0;
+        // Reset the request state, keeping the three things that belong to the
+        // CONNECTION rather than to the request. This resets by listing what
+        // survives, so a new field that has to survive is one nobody has to
+        // remember: `tok` did not survive when it was added, every cancel came
+        // back stale, and shedding silently did nothing. It cost an afternoon.
         const fd = c.fd;
         const held = c.buf;
-        c.* = .{ .fd = fd, .buf = held };
+        const tok = c.tok;
+        c.* = .{ .fd = fd, .buf = held, .tok = tok };
         a.s.setReserve(t, K.cleanup_reserve);
         a.s.renewCap(t, K.work_budget);
         a.s.arm(t, nowMs() + K.idle_deadline_ms);
@@ -1021,8 +1098,17 @@ const App = struct {
         a.r.unregisterFile(t);
         a.s.disarm(t);
         a.s.release(t);
+        // Reclaim on provenance, not on the connection's own bookkeeping.
+        // `c.buf` is what this task THINKS it holds; the pool knows what it
+        // was actually handed. Those agree on every path that works, and the
+        // point of the second one is the paths that do not: an unwind that
+        // returns without releasing, or one that never runs. A non-zero count
+        // here means somebody left something behind, which is now a number
+        // rather than a slow leak nothing could see.
         a.bufs.release(c.buf);
         c.buf = .{};
+        const stranded = a.bufs.releaseAllFor(t);
+        if (stranded != 0) a.bufs_stranded += stranded;
         a.r.unregisterFile(t);
         _ = linux.close(c.fd);
         a.live_conn[t] = false;
@@ -1089,9 +1175,12 @@ pub fn start(want_port: u16) !u16 {
     a.r.watch(ctrl_listener_task, csock, .read);
 
 
-    a.s.setPrio(background_task, prio_idle);  // only when there is slack
-    a.s.assignQuota(background_task, sup_bg);
-    a.s.admit(background_task, quota.unlimited, 0);
+    _ = a.s.admit(background_task, .{
+        .prio = prio_idle,
+        .quota = sup_bg,
+        .cap = quota.unlimited,
+        .reserve = 0,
+    });
     a.s.arm(background_task, nowMs() + K.bg_period_ms);
 
     var act: posix.Sigaction = .{
@@ -1143,8 +1232,14 @@ pub const Stats = struct {
     buf_exhausted: u64,
     top_ups: u64,
     top_up_denials: u64,
+    /// Cancels taken, and cancels refused because the token named a task
+    /// instance that no longer exists. The second is not an error, but a test
+    /// wants to know it stayed at zero when it expected every token to be live.
+    cancels: u64,
+    cancels_stale: u64,
     partial_writes: u64,
     write_stalls: u64,
+    bufs_stranded: usize,
 };
 
 pub fn stats() Stats {
@@ -1169,8 +1264,11 @@ pub fn stats() Stats {
         .buf_exhausted = a.bufs.exhausted,
         .top_ups = a.s.top_ups,
         .top_up_denials = a.s.top_up_denials,
+        .cancels = a.s.cancels,
+        .cancels_stale = a.s.cancels_stale,
         .partial_writes = a.partial_writes,
         .write_stalls = a.write_stalls,
+        .bufs_stranded = a.bufs_stranded,
     };
 }
 
