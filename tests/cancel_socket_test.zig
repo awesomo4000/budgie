@@ -261,6 +261,12 @@ fn tAccounting() !void {
         .live = st.buf_live,
     });
     check(st.cancels_stale == 0, "no stale token was ever presented", .{ .stale = st.cancels_stale });
+    // The pool takes back anything a connection ended still holding. Zero here
+    // means every unwind did its own job and the net caught nothing, which is
+    // what it should read when the code is right.
+    check(st.bufs_stranded == 0, "no buffer had to be reclaimed behind a connection", .{
+        .stranded = st.bufs_stranded,
+    });
 }
 
 fn tStillHealthy(port: u16) !void {

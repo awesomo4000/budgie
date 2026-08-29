@@ -379,6 +379,10 @@ const App = struct {
     /// paths, and a test that only reaches one of them has only covered one.
     partial_writes: u64 = 0,
     write_stalls: u64 = 0,
+    /// Buffers the pool had to take back because the connection ended still
+    /// holding them. Should be zero; a number here names an unwind that does
+    /// not do its job.
+    bufs_stranded: usize = 0,
 
     // ----------------------------------------------------------- the kernel
 
@@ -712,7 +716,7 @@ const App = struct {
         if (c.buf.isNull()) {
             // Buffer exhaustion is an admission decision with a real answer,
             // not an allocation failure. Same shape as budget exhaustion.
-            c.buf = a.bufs.acquire() orelse return a.enterCleanup(t, c, .no_buffer);
+            c.buf = a.bufs.acquireFor(t) orelse return a.enterCleanup(t, c, .no_buffer);
         }
         const b = a.bufs.get(c.buf) orelse return a.finish(t, c, .peer_gone);
 
@@ -874,7 +878,7 @@ const App = struct {
         // is closing anyway, and that is a better failure than closing with
         // nothing said.
         if (c.buf.isNull()) {
-            c.buf = a.bufs.acquireForCleanup() orelse {
+            c.buf = a.bufs.acquireForCleanupBy(t) orelse {
                 var scratch: [128]u8 = undefined;
                 const msg = std.fmt.bufPrint(&scratch, "HTTP/1.1 {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ status, body.len, body }) catch return a.finish(t, c, why);
                 _ = sys.write(c.fd, msg.ptr, msg.len);
@@ -951,8 +955,17 @@ const App = struct {
         a.r.close(t);
         a.s.disarm(t);
         a.s.release(t);
+        // Reclaim on provenance, not on the connection's own bookkeeping.
+        // `c.buf` is what this task THINKS it holds; the pool knows what it
+        // was actually handed. Those agree on every path that works, and the
+        // point of the second one is the paths that do not: an unwind that
+        // returns without releasing, or one that never runs. A non-zero count
+        // here means somebody left something behind, which is now a number
+        // rather than a slow leak nothing could see.
         a.bufs.release(c.buf);
         c.buf = .{};
+        const stranded = a.bufs.releaseAllFor(t);
+        if (stranded != 0) a.bufs_stranded += stranded;
         sys.close(c.fd);
         a.live_conn[t] = false;
     }
@@ -1095,6 +1108,7 @@ pub const Stats = struct {
     cancels_stale: u64,
     partial_writes: u64,
     write_stalls: u64,
+    bufs_stranded: usize,
 };
 
 pub fn stats() Stats {
@@ -1123,6 +1137,7 @@ pub fn stats() Stats {
         .cancels_stale = a.s.cancels_stale,
         .partial_writes = a.partial_writes,
         .write_stalls = a.write_stalls,
+        .bufs_stranded = a.bufs_stranded,
     };
 }
 

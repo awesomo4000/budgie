@@ -129,6 +129,9 @@ pub fn main() !void {
         .acquires = st.buf_acquires,
         .releases = st.buf_releases,
     });
+    check(st.bufs_stranded == 0, "and none of them had to be reclaimed behind a connection", .{
+        .stranded = st.bufs_stranded,
+    });
 
     std.debug.print("  ({d} served, {d} refused, {d} exhaustions)\n", .{ served, refused, st.buf_exhausted });
     hc.report();
