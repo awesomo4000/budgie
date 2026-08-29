@@ -188,6 +188,11 @@ const Next = union(enum) {
     /// Stop, for this reason. Whether that means writing a refusal first is
     /// not the step's business.
     ending: Ending,
+    /// The unwind is done: the refusal is on the wire. Distinct from `ending`
+    /// because "already unwinding" and "finished unwinding" are different
+    /// states and treating them as one tore connections down early. See
+    /// `settle`.
+    unwound,
 };
 
 const sockaddr_in = sys.SockAddrIn;
@@ -554,10 +559,20 @@ const App = struct {
         // branch above. A bound that holds because of a side effect in the
         // callee is not one you can check by reading the caller.
         const resolved: Next = switch (next) {
-            .yield, .parked => next,
-            .ending => |why| if (why == .peer_gone or c.phase == .cleanup)
-                // Nobody to tell, or the refusal has already gone out.
+            .yield, .parked, .unwound => next,
+            .ending => |why| if (why == .peer_gone)
+                // Nobody to tell.
                 next
+            else if (c.phase == .cleanup)
+                // Already unwinding, and this is not that unwind finishing.
+                // A second reason arriving while the first refusal is still
+                // waiting to go out is redundant, and acting on it tears the
+                // connection down before the client is told anything. This
+                // cost the completion server every answer to a pipeline too
+                // deep to buffer: two overflow events, and the second one
+                // finished the connection while the 503 from the first was
+                // still queued.
+                .parked
             else
                 a.beginCleanup(t, c, why),
         };
@@ -578,6 +593,7 @@ const App = struct {
                 if (!a.r.watching(t) and !a.s.isArmed(t)) a.parked_nowhere += 1;
             },
             .ending => |why| a.finish(t, c, why),
+            .unwound => a.finish(t, c, c.ending),
         }
     }
 
@@ -990,7 +1006,7 @@ const App = struct {
             return a.park(t, c, .write);
         }
 
-        if (c.phase == .cleanup) return .{ .ending = c.ending };
+        if (c.phase == .cleanup) return .unwound;
 
         // keep-alive: reset the request state, KEEP any pipelined bytes.
         // `served` is counted in `stepWorking` now, because one write can
