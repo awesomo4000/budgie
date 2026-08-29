@@ -163,6 +163,27 @@ const sockaddr_in = extern struct {
     zero: [8]u8 = @splat(0),
 };
 
+/// What a step decided should happen next. Returned, never performed.
+/// See the same type in `app/server.zig` for why.
+///
+/// One difference here, and it is the interesting one. The readiness server
+/// has a single entry point: the scheduler dispatches a task and the step runs.
+/// This one has two, because a completion arrives during `Reactor.wait` and
+/// carries data with it, so real work happens in the callback rather than
+/// merely a note that the descriptor is ready. So `settle` is called from
+/// `run` AND from the completion path, which makes explicit something the
+/// other server gets to leave implicit.
+const Next = union(enum) {
+    yield,
+    parked,
+    ending: Ending,
+    /// The unwind is done: the refusal is on the wire. Distinct from `ending`
+    /// because "already unwinding" and "finished unwinding" are different
+    /// states and treating them as one tore connections down early. See
+    /// `settle`.
+    unwound,
+};
+
 fn sysErr(rc: usize) bool {
     return @as(isize, @bitCast(rc)) < 0;
 }
@@ -360,6 +381,9 @@ const App = struct {
     /// holding them. Should be zero; a number here names an unwind that does
     /// not do its job.
     bufs_stranded: usize = 0,
+    /// Connections that said they were waiting with nothing able to wake them.
+    /// Should be zero; a number here is a connection that stopped for good.
+    parked_nowhere: usize = 0,
 
     // ----------------------------------------------------------- the kernel
 
@@ -498,24 +522,76 @@ const App = struct {
         if (t == ctrl_listener_task) return a.acceptCtrl();
         if (!a.live_conn[t]) return;
         const c = &a.conn_store[t];
-
-        // THE FIX. Previously this checked only `.deadline`, and only that
-        // condition. A cancelled task in `.writing` would never notice:
-        // stepWriting calls no `charge`, so a zeroed budget is invisible to
-        // it, and it would keep writing forever.
-        //
-        // Both terminating conditions are now checked unconditionally, before
-        // the phase switch, in runtime code the app never edits. Per-phase
-        // checking is the same shape of mistake as per-call-site `catch`.
-        if (c.phase != .cleanup) {
-            if (a.s.isCancelled(t)) return a.enterCleanup(t, c, .cancelled);
-            if (a.s.isExpired(t)) return a.enterCleanup(t, c, .deadline_missed);
-        }
         if (c.is_ctrl) return a.stepCtrl(t, c);
-        switch (c.phase) {
+        a.settle(t, c, a.decide(t, c));
+    }
+
+    /// Ask the runtime before running the task, and give the task no way to
+    /// skip being asked. Same as `app/server.zig`.
+    fn decide(a: *App, t: TaskId, c: *Conn) Next {
+        if (c.phase == .cleanup) return a.stepWriting(t, c);
+
+        // A cancelled task in `.writing` would otherwise never notice:
+        // `stepWriting` calls no `charge`, so a zeroed budget is invisible to
+        // it and it would keep writing forever.
+        if (a.s.faultOf(t)) |f| return .{ .ending = switch (f) {
+            .cancelled => Ending.cancelled,
+        } };
+        if (a.s.isExpired(t)) return .{ .ending = .deadline_missed };
+
+        return switch (c.phase) {
             .reading => a.stepReading(t, c),
             .working => a.stepWorking(t, c),
+            // `.cleanup` is handled at the top, so arriving here means the
+            // check up there is wrong. Route it the same way rather than
+            // `unreachable`: this file ships ReleaseFast, where `unreachable`
+            // is undefined behaviour, and `beginCleanup` already states the
+            // policy -- being wrong should surface as an odd answer in a log,
+            // not as a panic in a server or worse in a release build.
             .writing, .cleanup => a.stepWriting(t, c),
+        };
+    }
+
+    /// The only place in this file that decides whether a connection runs
+    /// again. Everything else states an intention.
+    ///
+    /// Called from two places here, unlike the readiness server. A completion
+    /// arrives during `Reactor.wait` carrying data, so work happens in the
+    /// callback rather than in a dispatched step, and `onCompletion` has
+    /// decisions of its own to settle. That is a property of the completion
+    /// model rather than a wart: the reactor is not merely reporting that a
+    /// descriptor is ready, it is delivering the read.
+    fn settle(a: *App, t: TaskId, c: *Conn, next: Next) void {
+        const resolved: Next = switch (next) {
+            .yield, .parked, .unwound => next,
+            .ending => |why| if (why == .peer_gone)
+                // Nobody to tell.
+                next
+            else if (c.phase == .cleanup)
+                // Already unwinding, and this is not that unwind finishing.
+                // A second reason arriving while the first refusal is still
+                // waiting to go out is redundant, and acting on it tears the
+                // connection down before the client is told anything. This
+                // cost the completion server every answer to a pipeline too
+                // deep to buffer: two overflow events, and the second one
+                // finished the connection while the 503 from the first was
+                // still queued.
+                .parked
+            else
+                a.beginCleanup(t, c, why),
+        };
+
+        switch (resolved) {
+            .yield => a.s.makeRunnable(t, .spawn),
+            .parked => {
+                // A connection that parks with no reactor interest, no armed
+                // timer and no send in flight will never run again. See the
+                // same check in `app/server.zig`; `send_inflight` is the extra
+                // arrangement this backend has.
+                if (!a.r.watching(t) and !a.s.isArmed(t) and !c.send_inflight) a.parked_nowhere += 1;
+            },
+            .ending => |why| a.finish(t, c, why),
+            .unwound => a.finish(t, c, c.ending),
         }
     }
 
@@ -718,8 +794,9 @@ const App = struct {
 
     // --------------------------------------------------------------- phases
 
-    fn park(a: *App, t: TaskId, c: *Conn, i: @import("budgie").reactor_uring2.Interest) void {
+    fn park(a: *App, t: TaskId, c: *Conn, i: @import("budgie").reactor_uring2.Interest) Next {
         a.r.watch(t, c.fd, i);
+        return .parked;
     }
 
     /// Release the buffer when a connection goes idle with nothing pending.
@@ -747,11 +824,12 @@ const App = struct {
     /// In completion mode there is nothing to do when a connection is woken
     /// in the reading phase: bytes arrive through `onCompletion`, not by us
     /// asking. This only re-arms a multishot recv the kernel ended.
-    fn stepReading(a: *App, t: TaskId, c: *Conn) void {
+    fn stepReading(a: *App, t: TaskId, c: *Conn) Next {
         if (a.bufs.get(c.buf)) |b| {
-            if (b.in_len > 0 and a.drainIn(t, c, b)) return;
+            if (b.in_len > 0) if (a.drainIn(t, c, b)) |n| return n;
         }
         if (!a.r.watching(t)) a.r.armRecv(t, c.fd);
+        return .parked;
     }
 
     /// Returns true if the completion's buffer may go back to the ring.
@@ -763,7 +841,7 @@ const App = struct {
         const c = &a.conn_store[t];
         switch (comp.kind) {
             .eof, .err => {
-                a.finish(t, c, .peer_gone);
+                a.settle(t, c, .{ .ending = .peer_gone });
                 return true;
             },
             .writable => {
@@ -771,7 +849,7 @@ const App = struct {
                 return true;
             },
             .sent => {
-                a.onSent(t, c, comp.sent);
+                a.settle(t, c, a.onSent(t, c, comp.sent));
                 return true;
             },
             .data => {
@@ -780,25 +858,29 @@ const App = struct {
                 c.held_buf = comp.buf_id;
                 c.held_len = @intCast(comp.data.len);
                 a.backpressure_events += 1;
-                a.s.makeRunnable(t, .spawn);
+                // The bytes did not fit, so we keep the ring buffer and run
+                // the connection again to drain. That is a disposition like
+                // any other, so it goes through `settle` rather than reaching
+                // for the scheduler directly.
+                a.settle(t, c, .yield);
                 return false;
             },
         }
     }
 
     /// A send completed. Advance, resubmit the remainder, or finish.
-    fn onSent(a: *App, t: TaskId, c: *Conn, res: i32) void {
-        const b = a.bufs.get(c.buf) orelse return a.finish(t, c, .peer_gone);
-        if (res <= 0) return a.finish(t, c, .peer_gone);
+    fn onSent(a: *App, t: TaskId, c: *Conn, res: i32) Next {
+        const b = a.bufs.get(c.buf) orelse return .{ .ending = .peer_gone };
+        if (res <= 0) return .{ .ending = .peer_gone };
         b.out_sent += @intCast(res);
         c.send_inflight = false;
         if (b.out_sent < b.out_len) {
             a.partial_writes += 1;
             _ = a.r.submitSend(t, c.fd, b.out[b.out_sent..b.out_len]);
             c.send_inflight = true;
-            return;
+            return .parked;
         }
-        a.finishWrite(t, c, b);
+        return a.finishWrite(t, c, b);
     }
 
     /// Bytes in. There is exactly ONE place inbound bytes live -- `b.in` --
@@ -812,13 +894,13 @@ const App = struct {
         a.on_data += 1;
         if (c.buf.isNull()) {
             c.buf = a.bufs.acquireFor(t) orelse {
-                a.enterCleanup(t, c, .no_buffer);
+                a.settle(t, c, .{ .ending = .no_buffer });
                 return true;
             };
             a.rec("acquire", t, 0, 0, 0, 0, c);
         }
         const b = a.bufs.get(c.buf) orelse {
-            a.finish(t, c, .peer_gone);
+            a.settle(t, c, .{ .ending = .peer_gone });
             return true;
         };
 
@@ -833,7 +915,7 @@ const App = struct {
             // reaching here means the connection has accumulated a backlog
             // while busy: the peer is sending faster than we serve. That is a
             // resource limit, not a malformed request.
-            a.enterCleanup(t, c, .overloaded);
+            a.settle(t, c, .{ .ending = .overloaded });
             return true;
         }
         const before_in = b.in_len;
@@ -849,7 +931,7 @@ const App = struct {
             a.r.pauseRecv(t);
         }
 
-        if (c.phase == .reading) _ = a.drainIn(t, c, b);
+        if (c.phase == .reading) if (a.drainIn(t, c, b)) |n| a.settle(t, c, n);
         return true;
     }
 
@@ -887,7 +969,7 @@ const App = struct {
         c.held_len = 0;
     }
 
-    fn drainIn(a: *App, t: TaskId, c: *Conn, b: *iobuf.IoBuf) bool {
+    fn drainIn(a: *App, t: TaskId, c: *Conn, b: *iobuf.IoBuf) ?Next {
         const t0 = nowNs();
         defer a.book.observe(.parse, nowNs() - t0);
         while (b.in_len > 0) {
@@ -898,16 +980,13 @@ const App = struct {
                 std.mem.copyForwards(u8, b.in[0 .. b.in_len - used], b.in[used..b.in_len]);
                 b.in_len -= used;
                 const units = @divTrunc(@as(i64, @intCast(used)), 64) + 1;
-                if (!a.chargeAs(t, .parse, units)) {
-                    a.enterCleanup(t, c, .budget_exhausted);
-                    return true;
-                }
+                if (!a.chargeAs(t, .parse, units)) return .{ .ending = .budget_exhausted };
             }
             a.rec("drainIn", t, used, before_in, b.in_len, b.parser.bytesBuffered(), c);
             _ = before_p;
             a.releaseHeldIfRoom(c, b);
             switch (b.parser.poll()) {
-                .need_input => if (used == 0) return false else continue,
+                .need_input => if (used == 0) return null else continue,
                 .protocol_error => |pe| {
                     // Diagnostic only, and behind the same switch as the
                     // per-close line. The serving loop does no I/O of its own:
@@ -922,8 +1001,7 @@ const App = struct {
                         });
                         a.dumpTrace();
                     }
-                    a.enterCleanup(t, c, .bad_request);
-                    return true;
+                    return .{ .ending = .bad_request };
                 },
                 .request => |req| {
                     a.reqs_parsed += 1;
@@ -938,38 +1016,35 @@ const App = struct {
                     a.rec("dispatch", t, used, b.in_len, b.in_len, b.parser.bytesBuffered(), c);
                     b.parser = .{};
                     c.phase = .working;
-                    a.s.makeRunnable(t, .spawn);
-                    return true;
+                    return .yield;
                 },
             }
         }
-        return false;
+        return null;
     }
 
     /// Feeds buffered bytes to the parser, consuming exactly what it takes and
     /// keeping the rest. Returns true if the connection changed phase.
-    fn stepWorking(a: *App, t: TaskId, c: *Conn) void {
+    fn stepWorking(a: *App, t: TaskId, c: *Conn) Next {
         const t0 = nowNs();
         defer a.book.observe(.work, nowNs() - t0);
         const charge = @min(K.quantum_units, c.work_left);
-        if (charge > 0 and !a.chargeAs(t, .work, charge)) {
-            return a.enterCleanup(t, c, .budget_exhausted);
-        }
+        if (charge > 0 and !a.chargeAs(t, .work, charge)) return .{ .ending = .budget_exhausted };
         c.spent += charge;
         c.work_left -= charge;
         var j: i64 = 0;
         while (j < charge * 200) : (j += 1)
             c.sink = c.sink *% 6364136223846793005 +% 1442695040888963407;
 
-        if (c.work_left > 0) return a.s.makeRunnable(t, .spawn);
+        if (c.work_left > 0) return .yield;
 
-        const b = a.bufs.get(c.buf) orelse return a.finish(t, c, .peer_gone);
+        const b = a.bufs.get(c.buf) orelse return .{ .ending = .peer_gone };
 
         // Append rather than overwrite: anything already in `out` answers an
         // earlier request on this connection that has not been written yet.
         const answer = std.fmt.bufPrint(b.out[b.out_len..],
             "HTTP/1.1 200 OK\r\nContent-Length: 24\r\n\r\ndone, spent {d:>5} units\n", .{c.spent}) catch
-            return a.finish(t, c, .peer_gone);
+            return .{ .ending = .peer_gone };
         b.out_len += answer.len;
         a.served += 1;
 
@@ -982,18 +1057,19 @@ const App = struct {
             a.s.renewCap(t, K.work_budget);
             a.s.arm(t, nowMs() + K.idle_deadline_ms);
             a.batched_answers += 1;
-            return a.s.makeRunnable(t, .spawn);
+            return .yield;
         }
 
         b.out_sent = 0;
         c.phase = .writing;
-        a.s.makeRunnable(t, .spawn);
+        return .yield;
     }
 
     /// Worst case for one answer, so the batching loop knows when to stop.
     const max_answer_bytes = 96;
 
-    fn enterCleanup(a: *App, t: TaskId, c: *Conn, why: Ending) void {
+    /// Set a connection up to say why it is stopping. Called only by `settle`.
+    fn beginCleanup(a: *App, t: TaskId, c: *Conn, why: Ending) Next {
         c.ending = why;
         const t0 = nowNs();
         defer a.book.observe(.cleanup, nowNs() - t0);
@@ -1023,19 +1099,22 @@ const App = struct {
         };
         // The unwind needs a buffer even if the body could not get one: that
         // is what a cleanup reserve means for memory.
-        if (c.buf.isNull()) c.buf = a.bufs.acquireForCleanupBy(t) orelse return a.finish(t, c, why);
-        const b = a.bufs.get(c.buf) orelse return a.finish(t, c, why);
+        if (c.buf.isNull()) c.buf = a.bufs.acquireForCleanupBy(t) orelse return .{ .ending = why };
+        const b = a.bufs.get(c.buf) orelse return .{ .ending = why };
         b.out_sent = 0;
         b.out_len = (std.fmt.bufPrint(&b.out, "HTTP/1.1 {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ status, body.len, body }) catch
-            return a.finish(t, c, why)).len;
-        a.s.makeRunnable(t, .spawn);
+            return .{ .ending = why }).len;
+        return .yield;
     }
 
-    fn stepWriting(a: *App, t: TaskId, c: *Conn) void {
-        if (c.send_inflight) return; // completion will drive it
+    fn stepWriting(a: *App, t: TaskId, c: *Conn) Next {
+        // A submitted send is already in the ring. The completion will drive
+        // the rest, so this dispatch has nothing to do and nothing to arrange:
+        // `send_inflight` IS the arrangement.
+        if (c.send_inflight) return .parked;
         const t0 = nowNs();
         defer a.book.observe(.write, nowNs() - t0);
-        const b = a.bufs.get(c.buf) orelse return a.finish(t, c, .peer_gone);
+        const b = a.bufs.get(c.buf) orelse return .{ .ending = .peer_gone };
         if (b.out_sent >= b.out_len) return a.finishWrite(t, c, b);
         if (K.async_send == 0) {
             const rc = linux.write(c.fd, b.out[b.out_sent..].ptr, b.out_len - b.out_sent);
@@ -1043,27 +1122,25 @@ const App = struct {
                 // EAGAIN means wait; EPIPE and ECONNRESET mean the peer is
                 // gone. Parking on a dead descriptor holds a task and a buffer
                 // that nothing reclaims.
-                if (!sys.wouldBlock(rc)) return a.finish(t, c, .peer_gone);
+                if (!sys.wouldBlock(rc)) return .{ .ending = .peer_gone };
                 a.write_stalls += 1;
-                return a.r.watch(t, c.fd, .write);
+                return a.park(t, c, .write);
             }
             b.out_sent += rc;
             if (b.out_sent < b.out_len) {
                 a.partial_writes += 1;
-                return a.r.watch(t, c.fd, .write);
+                return a.park(t, c, .write);
             }
             return a.finishWrite(t, c, b);
         }
-        if (!a.r.submitSend(t, c.fd, b.out[b.out_sent..b.out_len])) {
-            a.s.makeRunnable(t, .spawn); // ring full; retry next pass
-            return;
-        }
+        if (!a.r.submitSend(t, c.fd, b.out[b.out_sent..b.out_len])) return .yield; // ring full; retry
         c.send_inflight = true;
+        return .parked;
     }
 
     /// The response is fully out. Either close (cleanup path) or recycle.
-    fn finishWrite(a: *App, t: TaskId, c: *Conn, b: *iobuf.IoBuf) void {
-        if (c.phase == .cleanup) return a.finish(t, c, c.ending);
+    fn finishWrite(a: *App, t: TaskId, c: *Conn, b: *iobuf.IoBuf) Next {
+        if (c.phase == .cleanup) return .unwound;
         // Reset the parser and the OUTPUT only. `b.in` holds pipelined bytes
         // that belong to the next request and must survive untouched.
         b.out_len = 0;
@@ -1081,9 +1158,10 @@ const App = struct {
         a.s.renewCap(t, K.work_budget);
         a.s.arm(t, nowMs() + K.idle_deadline_ms);
         // The next request may already be buffered.
-        if (b.in_len > 0 and a.drainIn(t, c, b)) return;
+        if (b.in_len > 0) if (a.drainIn(t, c, b)) |n| return n;
         a.releaseIfIdle(c);
         if (!a.r.watching(t) and !a.drr.isThrottled(t)) a.r.armRecv(t, c.fd);
+        return .parked;
     }
 
     fn finish(a: *App, t: TaskId, c: *Conn, why: Ending) void {
@@ -1240,6 +1318,7 @@ pub const Stats = struct {
     partial_writes: u64,
     write_stalls: u64,
     bufs_stranded: usize,
+    parked_nowhere: usize,
 };
 
 pub fn stats() Stats {
@@ -1269,6 +1348,7 @@ pub fn stats() Stats {
         .partial_writes = a.partial_writes,
         .write_stalls = a.write_stalls,
         .bufs_stranded = a.bufs_stranded,
+        .parked_nowhere = a.parked_nowhere,
     };
 }
 
