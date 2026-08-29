@@ -278,6 +278,16 @@ pub const Sched = struct {
         return s.cancelled[id];
     }
 
+    /// Whether this task has a deadline that has not yet fired.
+    ///
+    /// The counterpart to `isExpired`, and useful for the same reason: a task
+    /// that says it is waiting should be waiting for something. Between this
+    /// and the reactor's `watching`, an application can check that a parked
+    /// task has some way to be woken rather than taking its word for it.
+    pub fn isArmed(s: *const Sched, id: TaskId) bool {
+        return s.isLinked(id);
+    }
+
     /// Whether a deadline fired for this task and has not been replaced.
     ///
     /// The application decides what that means. `app/server.zig` reads it two

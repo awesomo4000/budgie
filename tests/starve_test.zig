@@ -132,6 +132,9 @@ pub fn main() !void {
     check(st.bufs_stranded == 0, "and none of them had to be reclaimed behind a connection", .{
         .stranded = st.bufs_stranded,
     });
+    check(st.parked_nowhere == 0, "and none parked with nothing able to wake them", .{
+        .stuck = st.parked_nowhere,
+    });
 
     std.debug.print("  ({d} served, {d} refused, {d} exhaustions)\n", .{ served, refused, st.buf_exhausted });
     hc.report();

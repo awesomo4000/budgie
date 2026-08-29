@@ -360,6 +360,11 @@ const App = struct {
     /// holding them. Should be zero; a number here names an unwind that does
     /// not do its job.
     bufs_stranded: usize = 0,
+    /// Always zero here. This server still performs its own transitions rather
+    /// than stating them, so there is no single place that could check whether
+    /// a parked connection has anything able to wake it. The field exists
+    /// because the socket tests are one source built against both servers.
+    parked_nowhere: usize = 0,
 
     // ----------------------------------------------------------- the kernel
 
@@ -1240,6 +1245,7 @@ pub const Stats = struct {
     partial_writes: u64,
     write_stalls: u64,
     bufs_stranded: usize,
+    parked_nowhere: usize,
 };
 
 pub fn stats() Stats {
@@ -1269,6 +1275,7 @@ pub fn stats() Stats {
         .partial_writes = a.partial_writes,
         .write_stalls = a.write_stalls,
         .bufs_stranded = a.bufs_stranded,
+        .parked_nowhere = a.parked_nowhere,
     };
 }
 

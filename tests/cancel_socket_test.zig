@@ -267,6 +267,9 @@ fn tAccounting() !void {
     check(st.bufs_stranded == 0, "no buffer had to be reclaimed behind a connection", .{
         .stranded = st.bufs_stranded,
     });
+    check(st.parked_nowhere == 0, "no connection parked with nothing able to wake it", .{
+        .stuck = st.parked_nowhere,
+    });
 }
 
 fn tStillHealthy(port: u16) !void {

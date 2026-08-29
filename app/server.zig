@@ -409,6 +409,9 @@ const App = struct {
     /// holding them. Should be zero; a number here names an unwind that does
     /// not do its job.
     bufs_stranded: usize = 0,
+    /// Connections that said they were waiting with nothing able to wake them.
+    /// Should be zero; a number here is a connection that stopped for good.
+    parked_nowhere: usize = 0,
 
     // ----------------------------------------------------------- the kernel
 
@@ -540,14 +543,41 @@ const App = struct {
     /// The only place in this file that decides whether a connection runs
     /// again. Everything else states an intention.
     fn settle(a: *App, t: TaskId, c: *Conn, next: Next) void {
-        switch (next) {
-            .yield => a.s.makeRunnable(t, .spawn),
-            .parked => {},
-            .ending => |why| {
+        // An ending that has not yet told the client why goes through
+        // `beginCleanup` first, which returns what to do with the connection
+        // afterwards. That is exactly one extra step and never a chain, so it
+        // resolves here rather than calling back into `settle`.
+        //
+        // The recursive version was correct and terminated at depth two, but
+        // only because `beginCleanup` sets `phase` to `.cleanup` before any
+        // path that can return an ending, so the re-entry always took the
+        // branch above. A bound that holds because of a side effect in the
+        // callee is not one you can check by reading the caller.
+        const resolved: Next = switch (next) {
+            .yield, .parked => next,
+            .ending => |why| if (why == .peer_gone or c.phase == .cleanup)
                 // Nobody to tell, or the refusal has already gone out.
-                if (why == .peer_gone or c.phase == .cleanup) return a.finish(t, c, why);
-                a.settle(t, c, a.beginCleanup(t, c, why));
+                next
+            else
+                a.beginCleanup(t, c, why),
+        };
+
+        switch (resolved) {
+            .yield => a.s.makeRunnable(t, .spawn),
+            .parked => {
+                // "Waiting for something" is a claim, and it is checkable.
+                //
+                // A connection that parks with no reactor interest and no
+                // armed timer will never run again, which is the same silent
+                // hang that forgetting to yield used to be, arriving from the
+                // other direction. It should not be possible: every path that
+                // parks either watches an fd or arms a deadline, and every
+                // connection carries an idle deadline besides. So a non-zero
+                // count here is a real bug, not a tuning matter, and the
+                // socket tests assert it stays at zero.
+                if (!a.r.watching(t) and !a.s.isArmed(t)) a.parked_nowhere += 1;
             },
+            .ending => |why| a.finish(t, c, why),
         }
     }
 
@@ -1157,6 +1187,7 @@ pub const Stats = struct {
     partial_writes: u64,
     write_stalls: u64,
     bufs_stranded: usize,
+    parked_nowhere: usize,
 };
 
 pub fn stats() Stats {
@@ -1186,6 +1217,7 @@ pub fn stats() Stats {
         .partial_writes = a.partial_writes,
         .write_stalls = a.write_stalls,
         .bufs_stranded = a.bufs_stranded,
+        .parked_nowhere = a.parked_nowhere,
     };
 }
 
