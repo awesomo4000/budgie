@@ -19,11 +19,12 @@
 //!   - You cannot ship a task with no unwind path. `Supervised` will not
 //!     compile against a type that has no `unwind`.
 //!
-//! What it does not buy, and this is the part worth watching: it cannot make
-//! your `unwind` do anything. `negligent` below has one, and it is empty, and
-//! the runtime calls it faithfully. The bug did not go away. It moved from an
-//! absence to a presence, which is the trade this file exists to show. An
-//! empty function is visible in a diff and a missing line is not.
+//! What it does not buy: it cannot make your `unwind` do anything. `negligent`
+//! below has one, and it is empty, and the runtime calls it faithfully. The bug
+//! did not go away. It moved from an absence to a presence, which is the trade
+//! this file exists to show. An empty function is visible in a diff and a
+//! missing line is not. What the pool below does is make that bug cheap: a
+//! do-nothing unwind now costs a missed courtesy rather than a leak.
 //!
 //! Tasks here also do not touch their own runnability. `step` and `unwind`
 //! return a `Next`, and the dispatcher requeues, parks or releases. A function
@@ -33,7 +34,12 @@
 //! happened. Afterwards the only callers of `makeRunnable` are the reactor,
 //! `expire` and `cancel`.
 //!
-//! Read the report at the end before deciding that is all upside.
+//! That trade looked like a straight win until the report at the end said
+//! otherwise: `.done` is a claim, and believing it meant the runtime lost its
+//! only evidence of a bad unwind. So the slot pool records who it gave each
+//! slot to, the dispatcher reclaims on that record rather than on the claim,
+//! and the claim is kept only to catch the discrepancy. What seL4 gets from a
+//! derivation tree, a pool gets from one field per slot.
 //!
 //! Run it with `zig build cancel-supervised`, and `zig build cancel` for the
 //! hand-written one.
@@ -115,7 +121,21 @@ fn Supervised(comptime T: type) type {
             const next = if (s.faultOf(t)) |f| T.unwind(t, f) else T.step(t);
             switch (next) {
                 .yield => s.makeRunnable(t, .spawn),
-                .done => s.release(t),
+                .done => {
+                    // `.done` is a claim, not a fact, so it is not what
+                    // reclaims anything. The pool is walked for this task
+                    // either way. What the claim is good for is catching the
+                    // discrepancy: a task that says it is finished while still
+                    // holding things is a bug worth naming, and now it is one
+                    // the runtime can see.
+                    const left = reclaim(t);
+                    if (left != 0) {
+                        std.debug.print("  !! task {d} said done still holding {d}\n", .{ t, left });
+                        false_claims += 1;
+                        reclaimed_behind += left;
+                    }
+                    s.release(t);
+                },
                 .parked => {
                     // "Waiting for something" is checkable, cheaply. A task
                     // that parks without arranging a wake never runs again,
@@ -134,6 +154,8 @@ fn Supervised(comptime T: type) type {
 }
 
 var parked_nowhere: usize = 0;
+var false_claims: usize = 0;
+var reclaimed_behind: usize = 0;
 
 // ---------------------------------------------------------------- task state
 
@@ -141,7 +163,6 @@ const Searcher = struct {
     name: []const u8 = "",
     work_left: i64 = 0,
     spent: i64 = 0,
-    holds_slot: bool = false,
     waits: bool = false,
     /// Has an `unwind` that does nothing. The compiler is satisfied and the
     /// slot still leaks.
@@ -154,23 +175,64 @@ const Ending = enum { running, found, unwound };
 
 var searchers: [n_searchers + 1]Searcher = @splat(.{});
 var toks: [n_searchers + 1]sched.CancelTok = @splat(.{ .task = 0, .gen = 0 });
-var slots_held: usize = 0;
+/// The slot pool, and the only reason a lie about being finished is survivable.
+///
+/// A slot stands in for anything a task holds that outlives one dispatch: a
+/// buffer from `iobuf.Pool`, a descriptor, an entry in someone's table. What
+/// matters is not what it is but that the pool RECORDS WHO IT GAVE IT TO.
+///
+/// That is the whole of it. seL4 can `revoke` because objects are derived from
+/// untyped memory and the kernel wrote down the derivation, so reclaiming
+/// needs no cooperation from the thread that holds them. We had no equivalent,
+/// so reclamation was the task's job, so a task that skipped it leaked, and
+/// `.done` had to be taken on faith. With an owner recorded, the runtime takes
+/// its things back whether or not the task admits to having them.
+const n_slots = 8;
+var slot_owner: [n_slots]?TaskId = @splat(null);
+
+fn takeSlot(t: TaskId) bool {
+    for (&slot_owner) |*o| {
+        if (o.* == null) {
+            o.* = t;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Voluntary. What a well-behaved task does on its way out.
+fn dropSlot(t: TaskId) void {
+    for (&slot_owner) |*o| {
+        if (o.* == t) o.* = null;
+    }
+}
+
+/// Involuntary, and the point of the exercise. Returns how many the task was
+/// still holding when it claimed to be finished.
+fn reclaim(t: TaskId) usize {
+    var n: usize = 0;
+    for (&slot_owner) |*o| {
+        if (o.* == t) {
+            o.* = null;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+fn slotsHeld() usize {
+    var n: usize = 0;
+    for (slot_owner) |o| {
+        if (o != null) n += 1;
+    }
+    return n;
+}
+
 var winner: ?TaskId = null;
 var cancel_sent_ms: i64 = 0;
 
 fn nowMs() i64 {
     return @divTrunc(budgie.clock.monotonicNs(), 1_000_000);
-}
-
-fn takeSlot(w: *Searcher) void {
-    w.holds_slot = true;
-    slots_held += 1;
-}
-
-fn dropSlot(w: *Searcher) void {
-    if (!w.holds_slot) return;
-    w.holds_slot = false;
-    slots_held -= 1;
 }
 
 // ------------------------------------------------------------- the behaviour
@@ -193,7 +255,7 @@ const SearcherTask = struct {
         if (w.work_left > 0) return .yield;
 
         w.ending = .found;
-        dropSlot(w);
+        dropSlot(t);
         if (winner == null) winner = t;
         std.debug.print("  {s:<10} found an answer after {d} units\n", .{ w.name, w.spent });
         s.makeRunnable(supervisor, .spawn); // waking ANOTHER task is not the same thing
@@ -212,7 +274,7 @@ const SearcherTask = struct {
         if (w.negligent) return .done;
 
         s.chargeReserve(t, unwind_cost);
-        dropSlot(w);
+        dropSlot(t);
         w.ending = .unwound;
         std.debug.print("  {s:<10} {s} after {d} units, {d}ms later, reserve left {d}\n", .{
             w.name, @tagName(f), w.spent, nowMs() - cancel_sent_ms, s.reserve[t],
@@ -263,11 +325,11 @@ pub fn main() !void {
     for (plan, 1..) |p, i| {
         const t: TaskId = @intCast(i);
         searchers[t] = p;
-        takeSlot(&searchers[t]);
+        _ = takeSlot(t);
         toks[t] = s.admit(t, .{ .prio = 1, .quota = 0, .cap = work_cap, .reserve = reserve });
     }
 
-    std.debug.print("four searchers, {d} slots held\n\n", .{slots_held});
+    std.debug.print("four searchers, {d} slots held\n\n", .{slotsHeld()});
 
     const started = nowMs();
     var turns: usize = 0;
@@ -318,38 +380,33 @@ fn report(why: Exit, elapsed_ms: i64, turns: usize) void {
     std.debug.print("cancels: {d} taken, {d} stale\n", .{ s.cancels, s.cancels_stale });
     if (parked_nowhere != 0) std.debug.print("tasks that parked with nothing to wake them: {d}\n", .{parked_nowhere});
 
-    // Who lied, and what it cost.
-    var bad: usize = 0;
-    for (1..n_searchers + 1) |i| {
-        const t: TaskId = @intCast(i);
-        const w = &searchers[t];
-        if (!w.holds_slot) continue;
-        bad += 1;
-        std.debug.print(
-            "  {s:<10} unwind ran {d} time(s), reported itself finished, and released nothing\n",
-            .{ w.name, w.unwinds_called },
-        );
+    // Who lied, and what it cost, which is now much less than it did.
+    if (false_claims != 0) {
+        std.debug.print("tasks that claimed done while still holding: {d} ({d} slots taken back)\n", .{
+            false_claims, reclaimed_behind,
+        });
     }
-    std.debug.print("slots still held: {d} (want 0)\n", .{slots_held});
+    std.debug.print("slots still held: {d} (want 0)\n", .{slotsHeld()});
 
-    if (bad == 0) return;
     std.debug.print(
         \\
-        \\And here is what the disposition cost us, which is worth more than what
-        \\it bought.
+        \\The negligent task still does nothing in its unwind, and the leak is
+        \\gone anyway, because the pool wrote down who it gave each slot to and
+        \\the dispatcher walks that on the way out. `.done` no longer reclaims
+        \\anything; it is only compared against what the task was actually
+        \\holding, which is how the false claim above became visible.
         \\
-        \\In the hand-written version the negligent task stayed live and cancelled
-        \\forever, so a scan of the scheduler could find it. Here it returned
-        \\`.done`, the dispatcher believed it and called `release`, and the task
-        \\slot came back clean. The runtime now cannot tell a good unwind from a
-        \\bad one, because the only evidence it had was the task failing to go
-        \\away, and we just gave the task a way to say it went away.
+        \\That is the difference between reclamation and a graceful shutdown.
+        \\Reclamation is the runtime's, because the runtime handed the thing
+        \\over and remembers doing it, and no cooperation is required. A
+        \\graceful shutdown is the task's, because only the task knows what a
+        \\courteous ending looks like: which 503 to send, what to log, who to
+        \\tell. An unwind that does nothing now costs a missed courtesy rather
+        \\than a resource held until the process dies.
         \\
-        \\So `.done` is not a fact, it is a claim. The leak above is real and the
-        \\scheduler has no idea. That argues two things: the runtime should
-        \\reclaim what a task holds rather than trusting it to, and until it does,
-        \\something has to notice a task that was cancelled and never gave
-        \\anything back.
+        \\Nothing about this needs the scheduler. The pool is application code
+        \\and the ledger lives in it. What seL4 gets from a derivation tree, a
+        \\pool gets from one field per slot.
         \\
     , .{});
 }
