@@ -127,6 +127,10 @@ The kqueue port reused the reactor whole. Of `reactor.zig`'s 400 lines, about 15
 
 That interchangeability covers the readiness backends. The io_uring completion build asks for a different application shape, since there the kernel fills buffers and hands back completions, so `app/server_uring2.zig` is its own file. The portability claim covers the readiness backends and stops there.
 
+The claim is now checked rather than asserted, which it was not until recently. `app/server.zig` builds against epoll, kqueue and io_uring readiness with nothing in it changing, and the same socket tests run against all three. That matters because for a while it was false and nothing said so: nothing built against the readiness io_uring reactor, so when the server grew `open`, `close`, `read` and a byte-fairness interface, that reactor silently stopped fitting. An alternative nobody exercises does not rot quietly on its own. The interface moves and the alternative stops being an alternative, which is worse, because the portability claim is the thing the alternatives exist to support.
+
+Having all three also gives the control that separates two questions usually asked as one: whether io_uring is faster because of the submission interface, or because of completion semantics. Same server, three reactors, one difference at a time.
+
 ## Determinism
 
 `tests/sim.zig` imports the unmodified scheduler and runs it on a virtual clock. The same seed gives a byte-identical trace hash over a million dispatches, and six hours of virtual time takes seconds of real time.
@@ -154,9 +158,12 @@ src/
   sys.zig              sockets and process introspection, per platform
   root.zig             module root
 
-app/         the two servers, epoll/kqueue and io_uring completion
-examples/    echo.zig, the small backend-independent server
-tests/       parser, cancellation, pipelining, chunk fuzzing, the simulator
+app/         two servers. `server.zig` builds against epoll, kqueue or
+             io_uring readiness; `server_uring2.zig` is the completion one
+examples/    echo.zig, and cancellation with and without a dispatcher
+tests/       parser, pipelining, chunk fuzzing, the simulator, and socket
+             tests over every backend: deadlines, pool exhaustion, the write
+             path, cancellation, and a seeded chaos run
 bench/       load generators and microbenchmarks
 docs/        APIGUIDE.md, LESSONS.md, architecture diagram
 results/     CSVs and plots from the original measurements
