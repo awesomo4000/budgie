@@ -44,10 +44,10 @@ const Client = hc.Client;
 const check = hc.check;
 
 const n_slots = 32;
-const steps = 4000;
+var steps: usize = 4000;
 /// Small enough that acquiring is a real contest, so the 503 admission path
 /// runs constantly instead of never.
-const io_bufs = 8;
+var io_bufs: i64 = 8;
 /// Short enough that connections left alone expire while others are still
 /// being driven, so the deadline path interleaves with everything else.
 ///
@@ -55,7 +55,7 @@ const io_bufs = 8;
 /// thousand steps with no sleeps finish long before that. A test that claims
 /// to exercise a path and never does is worse than one that does not claim it,
 /// so the number is now small enough to be true.
-const deadline_ms = 60;
+var deadline_ms: i64 = 60;
 
 var bound_port: std.atomic.Value(u16) = .init(0);
 var start_failed: std.atomic.Value(bool) = .init(false);
@@ -241,7 +241,7 @@ fn actHalfClose(s: *Slot) void {
 /// deadline is. Sitting still is a thing clients do, and it is the only way to
 /// reach one of the four answers this server can give.
 fn actWait() void {
-    hc.sleepMs(deadline_ms + 15);
+    hc.sleepMs(@intCast(deadline_ms + 15));
 }
 
 fn actShed(port: u16, r: std.Random) void {
@@ -259,14 +259,24 @@ fn actShed(port: u16, r: std.Random) void {
 pub fn main(init: std.process.Init.Minimal) !void {
     hc.ignoreSigpipe();
 
-    var argv: [4][]const u8 = undefined;
+    var argv: [8][]const u8 = undefined;
     var argc: usize = 0;
     for (init.args.vector) |a| {
-        if (argc == 4) break;
+        if (argc == 8) break;
         argv[argc] = std.mem.span(a);
         argc += 1;
     }
+    // usage: chaos <seed> [io_bufs] [deadline_ms] [steps]
+    //
+    // The shape of the run is worth varying as well as the seed. A pool of one
+    // or two makes every acquire a contest and drives the cleanup reserve,
+    // which is a different regime from a pool of thirty-two where exhaustion
+    // barely happens; a deadline of 20ms cuts across requests mid-flight where
+    // 200ms mostly does not.
     const seed: u64 = if (argc > 1) try std.fmt.parseInt(u64, argv[1], 10) else 0x9e3779b9;
+    if (argc > 2) io_bufs = try std.fmt.parseInt(i64, argv[2], 10);
+    if (argc > 3) deadline_ms = try std.fmt.parseInt(i64, argv[3], 10);
+    if (argc > 4) steps = try std.fmt.parseInt(usize, argv[4], 10);
 
     server.knobs().io_bufs = io_bufs;
     server.knobs().idle_deadline_ms = deadline_ms;
@@ -274,7 +284,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.debug.print("chaos_test: server on 127.0.0.1:{d}, seed {d}, io_bufs {d}, deadline {d}ms\n", .{
         port, seed, io_bufs, deadline_ms,
     });
-    std.debug.print("  (replay a failure with: zig build chaos -- {d})\n", .{seed});
+    std.debug.print("  (replay with: zig build chaos -- {d} {d} {d} {d})\n", .{ seed, io_bufs, deadline_ms, steps });
 
     var prng = std.Random.DefaultPrng.init(seed);
     const r = prng.random();
