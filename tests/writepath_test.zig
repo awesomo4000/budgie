@@ -207,13 +207,13 @@ fn tPeerStopsReading(port: u16) !void {
     hc.sleepMs(200);
     const before = server.stats();
 
-    const c = try Client.connect(port);
-    defer c.close();
     // Both ends. The server's send buffer bounds what it can hold; this end's
     // receive window bounds what it can hand over. Linux needs the second,
     // because on loopback the send buffer drains as fast as the receiver will
-    // take it and a wide window means it never fills.
-    c.throttleReceive(2048);
+    // take it and a wide window means it never fills. The window is set before
+    // the handshake, which is the only time it counts on every platform.
+    const c = try Client.connectWithRecvBuf(port, 2048);
+    defer c.close();
     c.setNonblocking();
 
     const burst = try std.heap.page_allocator.alloc(u8, n * hc.work_request_bytes);
@@ -284,9 +284,8 @@ fn tPeerNeverReads(port: u16) !void {
     hc.sleepMs(200);
     const before = server.stats();
 
-    const c = try Client.connect(port);
+    const c = try Client.connectWithRecvBuf(port, 2048);
     defer c.close();
-    c.throttleReceive(2048);
     c.setNonblocking();
 
     var rq: [hc.work_request_bytes]u8 = undefined;
@@ -328,8 +327,7 @@ fn tManySlowReaders(port: u16) !void {
     const req = buildBurst(burst, n);
 
     while (opened < conns) : (opened += 1) {
-        clients[opened] = Client.connect(port) catch break;
-        clients[opened].throttleReceive(4096);
+        clients[opened] = Client.connectWithRecvBuf(port, 4096) catch break;
         clients[opened].send(req) catch {};
     }
     hc.sleepMs(500); // everyone waiting at once

@@ -95,6 +95,23 @@ pub fn ignoreSigpipe() void {
     std.posix.sigaction(.PIPE, &act, null);
 }
 
+/// Wait for one socket to become readable, or for the timeout to pass. True
+/// means readable.
+///
+/// A seam rather than a direct `std.posix.poll` call because that does not
+/// compile for Windows in 0.16: `std.posix.pollfd` aliases a `ws2_32.pollfd`
+/// which the types-only ws2_32 module does not declare. The Windows side uses
+/// `WSAPoll`, which is the same idea for sockets.
+///
+/// Error and timeout are the same answer here. Every caller treated them the
+/// same anyway, and collapsing them removes a distinction nobody acted on.
+pub fn waitReadable(fd: i32, timeout_ms: i32) bool {
+    if (comptime builtin.os.tag == .windows) return impl.pollReadable(fd, timeout_ms);
+    var p = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const n = std.posix.poll(&p, timeout_ms) catch return false;
+    return n > 0;
+}
+
 // --- platform-independent, so they stay here rather than being written twice
 
 pub fn sysErr(rc: usize) bool {

@@ -269,6 +269,16 @@ pub const stall_fault_after: u32 = 3; // consecutive missed ticks -> fault
 var shared: Shared = .{};
 
 fn onTick(_: posix.SIG) callconv(.c) void {
+    tick();
+}
+
+/// The tick itself, separated from how it is delivered.
+///
+/// On Linux and macOS a signal handler calls this; on Windows a timer-queue
+/// callback does. The body is the same because everything it touches is either
+/// atomic or private to whichever single thread delivers the tick, and both
+/// delivery mechanisms give it one.
+fn tick() void {
     const in_k = shared.in_kernel.load(.monotonic);
     if (in_k) {
         _ = shared.took_in_kernel.fetchAdd(1, .monotonic);
@@ -1221,21 +1231,21 @@ pub fn start(want_port: u16) !u16 {
     });
     a.s.arm(background_task, nowMs() + K.bg_period_ms);
 
-    // The preemption tick, and the one place Windows currently has no answer.
+    // The preemption tick, installed two different ways.
     //
-    // Everywhere else the tick is a SIGALRM handler that sets `should_yield`,
-    // which the yield fast path already loads. Windows has no signals, so
-    // there is nothing to install and `armIntervalTimer` there is a no-op. The
-    // equivalent is a thread that sleeps and sets the same atomic, or a
-    // waitable timer, and neither is a translation of this code: a thread
-    // setting a flag is not a preemption point the way a signal is, and the
-    // watchdog below reads `in_kernel` on the assumption that the reader is
-    // the interrupted thread itself.
-    //
-    // Left off rather than approximated. A server here runs with no tick, so
-    // a task that never reaches a yield point is not caught, which is a thing
-    // to know about this port rather than a thing to hide.
-    if (comptime builtin.os.tag != .windows) {
+    // A signal handler on Linux and macOS; a timer-queue callback on Windows,
+    // which has no signals. Both end up calling `tick`, and the difference
+    // that matters is documented on `sys_windows.armIntervalTimer`: a signal
+    // runs on the interrupted thread and a callback runs beside it. Since the
+    // handler only ever set a flag and counted, neither one preempts anything
+    // and the two behave the same.
+    if (comptime builtin.os.tag == .windows) {
+        sys.impl.tick_handler = &tick;
+        if (K.lazy_tick == 0) {
+            armTimer(K.tick_ms);
+            a.tick_armed = true;
+        }
+    } else {
         var act: posix.Sigaction = .{
             .handler = .{ .handler = onTick },
             .mask = posix.sigemptyset(),

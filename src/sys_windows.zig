@@ -29,6 +29,7 @@
 //! `ignoreSigpipe` below.
 
 const std = @import("std");
+const win = std.os.windows;
 const ws2 = std.os.windows.ws2_32;
 
 const SOCKET = usize;
@@ -64,7 +65,25 @@ const c = struct {
     extern "ws2_32" fn send(s: SOCKET, buf: [*]const u8, len: c_int, flags: c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn setsockopt(s: SOCKET, level: c_int, optname: c_int, optval: ?*const anyopaque, optlen: c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn getsockname(s: SOCKET, name: *anyopaque, namelen: *c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn WSAPoll(fdArray: [*]WSAPOLLFD, fds: c_ulong, timeout: c_int) callconv(.winapi) c_int;
+    extern "ws2_32" fn getsockopt(s: SOCKET, level: c_int, optname: c_int, optval: *anyopaque, optlen: *c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn ioctlsocket(s: SOCKET, cmd: c_long, argp: *c_ulong) callconv(.winapi) c_int;
+
+    extern "kernel32" fn CreateTimerQueueTimer(
+        phNewTimer: *?*anyopaque,
+        TimerQueue: ?*anyopaque,
+        Callback: *const fn (?*anyopaque, u8) callconv(.winapi) void,
+        Parameter: ?*anyopaque,
+        DueTime: u32,
+        Period: u32,
+        Flags: u32,
+    ) callconv(.winapi) win.BOOL;
+
+    extern "kernel32" fn DeleteTimerQueueTimer(
+        TimerQueue: ?*anyopaque,
+        Timer: ?*anyopaque,
+        CompletionEvent: ?*anyopaque,
+    ) callconv(.winapi) win.BOOL;
 
     extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
     extern "kernel32" fn GetProcessTimes(
@@ -212,14 +231,108 @@ pub fn getsockname(fd: i32, addr: *SockAddrIn) usize {
     return wrap(c.getsockname(sock(fd), addr, &len));
 }
 
-/// Accepted sockets do NOT inherit non-blocking mode, so it is set here. That
-/// is the same as Darwin needing a second call and unlike Linux's `accept4`.
+/// Sockets already accepted by the reactor, waiting to be collected.
+///
+/// This is the one place the Windows port could not keep the same shape as the
+/// other two, and it is worth saying why rather than burying it.
+///
+/// A listening socket has no readiness on IOCP. There is nothing to ask about
+/// it: a zero-byte `WSARecv` against one fails with `WSAENOTCONN`, because
+/// there is no connection to receive on. The only completion-model way to wait
+/// for an inbound connection is `AcceptEx`, and `AcceptEx` does not report that
+/// a connection is available, it performs the accept. By the time anything
+/// knows a client arrived, the socket already exists.
+///
+/// So on Windows the accept happens in the reactor and `acceptNonblock` is a
+/// collection point rather than a system call. The queue is the handoff. The
+/// server above sees the same thing it sees everywhere else: a task wakes, asks
+/// for a socket, and gets one or gets a would-block.
+///
+/// A short ring rather than one slot, because `AcceptEx` can be posted more
+/// than once and the reactor may collect several completions from one `wait`
+/// before the accept task runs again.
+const accept_ring = 32;
+
+var accepted: [accept_ring]i32 = @splat(-1);
+var accepted_head: usize = 0;
+var accepted_tail: usize = 0;
+
+/// Hand a socket the reactor accepted to the queue. Called by the IOCP backend
+/// and by nothing else. Returns false if the ring is full, which tells the
+/// caller to close the socket rather than drop it on the floor.
+pub fn pushAccepted(fd: i32) bool {
+    const next = (accepted_tail + 1) % accept_ring;
+    if (next == accepted_head) return false;
+    accepted[accepted_tail] = fd;
+    accepted_tail = next;
+    return true;
+}
+
+pub fn acceptedPending() usize {
+    return (accepted_tail + accept_ring - accepted_head) % accept_ring;
+}
+
+/// Take the next socket the reactor accepted, or fall back to a real `accept`.
+///
+/// The fallback is not decoration. Anything that listens without a reactor --
+/// a test with its own loop, a tool -- still gets working behaviour, and a
+/// mixed setup works too, because `AcceptEx` and `accept` draw from the same
+/// backlog. When neither has anything, this reports a would-block by setting
+/// the error the way the platform would have, so `wouldBlock` above answers
+/// correctly and the caller needs no special case.
 pub fn acceptNonblock(listener: i32) usize {
+    if (accepted_head != accepted_tail) {
+        const fd = accepted[accepted_head];
+        accepted_head = (accepted_head + 1) % accept_ring;
+        // Set again here rather than trusting where it came from. `AcceptEx`
+        // sockets are created non-blocking, but the completion path then sets
+        // `SO_UPDATE_ACCEPT_CONTEXT`, which copies properties from the listener
+        // onto the socket, and the documented list of what that touches is not
+        // the same as the list of what it actually touches. A socket that
+        // silently reverted to blocking does not fail loudly: the server writes
+        // to a full buffer, the whole loop stops, and every other connection
+        // waits with no error anywhere. Costing one call to rule that out is a
+        // good trade.
+        setNonblock(fd);
+        return @bitCast(@as(isize, fd));
+    }
+
+    // Accepted sockets do NOT inherit non-blocking mode, so it is set here.
+    // That is the same as Darwin needing a second call and unlike Linux's
+    // `accept4`.
     const s = c.accept(sock(listener), null, null);
     if (s == INVALID_SOCKET) return @bitCast(@as(isize, -1));
     const fd: i32 = @intCast(s);
     setNonblock(fd);
     return wrapSock(s);
+}
+
+/// Whether this socket is listening. The IOCP backend has to know, because a
+/// listener is armed with `AcceptEx` and everything else with a zero-byte
+/// receive, and the reactor above does not track which is which.
+pub fn isListening(fd: i32) bool {
+    var on: c_int = 0;
+    var len: c_int = @sizeOf(c_int);
+    if (c.getsockopt(sock(fd), ws2.SOL.SOCKET, SO_ACCEPTCONN, &on, &len) != 0) return false;
+    return on != 0;
+}
+
+const SO_ACCEPTCONN: c_int = 0x0002;
+
+const WSAPOLLFD = extern struct { fd: SOCKET, events: i16, revents: i16 };
+const POLLRDNORM: i16 = 0x0100;
+
+/// Wait for one socket to become readable, or for the timeout.
+///
+/// `WSAPoll` rather than `poll`, and this exists at all because Zig 0.16's
+/// `std.posix.pollfd` does not compile for Windows: it aliases a `ws2_32.pollfd`
+/// that the types-only ws2_32 module never declares. So `std.posix.poll` is not
+/// available here regardless of whether it would work.
+///
+/// `POLLIN` is spelled `POLLRDNORM`, and unlike `poll` this one is sockets only.
+pub fn pollReadable(fd: i32, timeout_ms: i32) bool {
+    var p = [_]WSAPOLLFD{.{ .fd = sock(fd), .events = POLLRDNORM, .revents = 0 }};
+    return c.WSAPoll(&p, 1, timeout_ms) > 0;
 }
 
 pub fn connect(fd: i32, addr: *const SockAddrIn) usize {
@@ -242,9 +355,30 @@ pub fn write(fd: i32, buf: [*]const u8, len: usize) usize {
     return wrap(c.send(sock(fd), buf, @intCast(@min(len, std.math.maxInt(c_int))), 0));
 }
 
+/// Close, with the half-close that makes it mean what `close` means on the
+/// other two platforms.
+///
+/// Closing a socket that still has unreceived data in its receive buffer is an
+/// abortive close on Windows: the stack sends RST, and everything sitting in
+/// the send buffer is thrown away. That is not a hypothetical. The server
+/// answers a connection it could not find a buffer for by writing "503 no
+/// buffer" and closing, without ever reading the request, so there is always
+/// unread data on exactly the connections whose answer matters most. Measured
+/// on this machine, with the request unread: close alone delivered 0 bytes of
+/// a 78-byte response, and a `shutdown` first delivered all 78.
+///
+/// The `shutdown` sends FIN, which flushes what is queued, and the close then
+/// tears down what is left. Callers see the POSIX behaviour they were written
+/// against, which is the entire job of this file.
+///
+/// The result is ignored on purpose. A socket that is already gone cannot be
+/// shut down, and that is not a reason to skip closing it.
 pub fn close(fd: i32) void {
+    _ = c.shutdown(sock(fd), SD_SEND);
     _ = c.closesocket(sock(fd));
 }
+
+const SD_SEND: c_int = 1;
 
 // ------------------------------------------------------ time and the process
 
@@ -256,20 +390,60 @@ pub fn sleepRelNs(ns: u64) void {
     c.Sleep(@intCast(@min(ms, std.math.maxInt(u32))));
 }
 
-/// Not implemented, and the reason is the interesting part.
+/// The preemption tick, as a timer-queue timer.
 ///
-/// The other two platforms arm an interval timer that raises a signal, and the
-/// signal handler sets `should_yield` so a running task can be asked to stop
-/// hogging the loop. Windows has no signals. The equivalent is a thread that
-/// sleeps and sets the same atomic, or a waitable timer queued to an APC, and
-/// either is a real design decision rather than a translation, because a
-/// thread setting a flag is not a preemption point in the way a signal is.
+/// Everywhere else this is `setitimer` and a SIGALRM handler. Windows has no
+/// signals, so the nearest honest equivalent is a kernel timer that calls back
+/// on a thread of its own, which is what `CreateTimerQueueTimer` is.
 ///
-/// Left unimplemented rather than faked: a server built here would run with no
-/// tick, which is a thing worth noticing rather than a thing to paper over.
-pub fn armIntervalTimer(interval_ms: u64) void {
-    _ = interval_ms;
+/// It is not the same thing, and the difference is worth being clear about. A
+/// signal interrupts the running thread and the handler executes on it; a timer
+/// callback runs *beside* the running thread. So this cannot interrupt a task
+/// that is in a tight loop, it can only set the flag the task will read at its
+/// next yield point. For asking a well-behaved task to yield, which is what the
+/// flag is for, the two are equivalent. For catching a task that reaches no
+/// yield point at all, the signal version can at least run its watchdog while
+/// the task spins, and so can this, because the callback thread is not the
+/// stuck one. What is genuinely lost is nothing, as it turns out: the handler
+/// never preempted anybody either, it only ever set a flag and counted.
+///
+/// `WT_EXECUTEINTIMERTHREAD` runs the callback on the timer thread instead of
+/// handing it to the thread pool. That is documented as being for callbacks
+/// that finish quickly, which this one does: some atomics and a comparison.
+/// It also serialises callbacks for this timer, so the handler-private counters
+/// have one writer, same as under a signal handler.
+///
+/// Zero deletes the timer, which is what `lazy_tick` asks for before a real
+/// sleep.
+pub var tick_handler: ?*const fn () void = null;
+
+var timer_handle: ?*anyopaque = null;
+
+fn timerCallback(param: ?*anyopaque, fired: u8) callconv(.winapi) void {
+    _ = param;
+    _ = fired;
+    if (tick_handler) |f| f();
 }
+
+pub fn armIntervalTimer(ms: u64) void {
+    if (timer_handle) |h| {
+        // The completion event is the invalid-handle sentinel, which means
+        // "wait for any callback in progress to finish". Without it a callback
+        // can still be running against state the caller is about to change.
+        // Safe here because this is never called from inside the callback.
+        _ = c.DeleteTimerQueueTimer(null, h, INVALID_HANDLE_VALUE);
+        timer_handle = null;
+    }
+    if (ms == 0) return;
+    var h: ?*anyopaque = null;
+    const period: u32 = @intCast(@min(ms, std.math.maxInt(u32)));
+    if (c.CreateTimerQueueTimer(&h, null, timerCallback, null, period, period, WT_EXECUTEINTIMERTHREAD) != .FALSE) {
+        timer_handle = h;
+    }
+}
+
+const WT_EXECUTEINTIMERTHREAD: u32 = 0x0000_0020;
+const INVALID_HANDLE_VALUE: ?*anyopaque = @ptrFromInt(std.math.maxInt(usize));
 
 pub fn rssKb() u64 {
     var pmc: PROCESS_MEMORY_COUNTERS = undefined;
