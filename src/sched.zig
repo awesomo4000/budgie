@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const quota = @import("quota.zig");
+const Violation = @import("invariant.zig").Violation;
 
 pub const TaskId = u32;
 
@@ -178,6 +179,16 @@ pub const Sched = struct {
     overflows: u64 = 0,
     cancels: u64 = 0,
     cancels_stale: u64 = 0,
+    /// Unwinds that spent more than their reserve allowed.
+    ///
+    /// `chargeReserve` cannot fail, which is the whole point: cleanup must not
+    /// be refused at the moment it is needed. But "cannot fail" was being
+    /// taken to mean "need not be looked at", so an unwind that overran its
+    /// allowance took the number negative and nothing anywhere noticed. The
+    /// per-task check cannot see it either, because the overrunning task is
+    /// usually released moments later and the evidence goes with it. So it is
+    /// counted at the moment it happens.
+    reserve_overruns: u64 = 0,
 
     // ------------------------------------------------------------ lifecycle
 
@@ -243,6 +254,12 @@ pub const Sched = struct {
         s.live[id] = false;
         s.cancelled[id] = false;
         s.expired[id] = false;
+        // Belt and braces, and known to be so: a mutation test that removed this
+        // changed nothing, because `cancel` already refuses on `!live` while the
+        // slot is empty and `admit` bumps the generation before anyone can
+        // re-occupy it. Kept because invalidating a token the moment its task
+        // ends is the property we want to be able to state, rather than one
+        // that happens to fall out of two other checks.
         s.gen[id] +%= 1; // invalidates every outstanding token for this slot
     }
 
@@ -321,9 +338,6 @@ pub const Sched = struct {
 
     // --------------------------------------------------------- quota handle
 
-    pub fn assignQuota(s: *Sched, id: TaskId, q: quota.Id) void {
-        s.quota_of[id] = q;
-    }
 
     /// Draw execution units into this task's grant. The scheduler asks the
     /// tree; it does not implement conservation itself.
@@ -374,11 +388,6 @@ pub const Sched = struct {
         return null;
     }
 
-    /// True when work exists in any class strictly above `c`.
-    pub fn runnableAbove(s: *const Sched, c: u8) bool {
-        const mask = (@as(u32, 1) << @intCast(c)) - 1;
-        return (s.nonempty & mask) != 0;
-    }
 
     pub fn reasonFor(s: *const Sched, id: TaskId) Wake {
         return s.wake[id];
@@ -574,5 +583,70 @@ pub const Sched = struct {
     /// entire enforcement: no other function in the program touches it.
     pub fn chargeReserve(s: *Sched, id: TaskId, units: i64) void {
         s.reserve[id] -= units;
+        if (s.reserve[id] < 0) s.reserve_overruns += 1;
+    }
+
+    // ---------------------------------------------------------- invariants
+
+    /// Everything the scheduler can say about itself that should be true at
+    /// any quiescent point, whatever the workload. Returns the first thing
+    /// that is not.
+    ///
+    /// O(max_tasks) plus a bounded walk of the overflow list, so this is for
+    /// tests and for a supervisor that wants to look, not for the dispatch
+    /// path.
+    ///
+    /// The reserve check is the reason this function is worth having on its
+    /// own. `reserve` was a receipt nothing read: `chargeReserve` subtracts
+    /// and cannot fail, so an unwind that overran its allowance took the
+    /// number negative and no code anywhere noticed. Now something does.
+    pub fn check(s: *const Sched) ?Violation {
+        // `queued` means "this id is in a ring", not "this task is alive".
+        // `release` deliberately leaves it set, because the ring entry
+        // outlives the task and `popRunnable` skips dead ids and clears the
+        // flag when it reaches them. Asserting a queued task is live was
+        // wrong, and the check found that out by failing on a real server.
+        //
+        // What IS true is that the flag and the rings agree, and that no id is
+        // in a ring twice. A duplicate would get dispatched twice in one
+        // round, on one `queued` flag, which is the sort of thing that would
+        // look like a mysterious double-serve.
+        var in_ring: usize = 0;
+        var c: usize = 0;
+        while (c < prio_levels) : (c += 1) {
+            var k: usize = 0;
+            while (k < s.len[c]) : (k += 1) {
+                const id = s.ring[c][(s.head[c] + k) % max_tasks];
+                if (!s.queued[id])
+                    return .{ .what = "everything in a ring is marked queued", .who = id, .got = 0, .want = 1 };
+                in_ring += 1;
+            }
+        }
+        var marked: usize = 0;
+        var q: TaskId = 0;
+        while (q < max_tasks) : (q += 1) {
+            if (s.queued[q]) marked += 1;
+        }
+        if (marked != in_ring)
+            return .{ .what = "no task is in a ring twice", .got = @intCast(in_ring), .want = @intCast(marked) };
+
+        var armed_seen: usize = 0;
+        var id: TaskId = 0;
+        while (id < max_tasks) : (id += 1) {
+            if (s.isLinked(id)) armed_seen += 1;
+            if (!s.live[id]) continue;
+
+            if (s.reserve[id] < 0)
+                return .{ .what = "a live task has reserve left to unwind with", .who = id, .got = s.reserve[id], .want = 0 };
+            if (s.gen[id] == 0)
+                return .{ .what = "a live task has a nameable generation", .who = id, .got = 0, .want = 1 };
+            if (s.cancelled[id] and (s.budget[id] != 0 or s.cap[id] != 0))
+                return .{ .what = "a cancelled task cannot fund more work", .who = id, .got = s.budget[id] + s.cap[id], .want = 0 };
+        }
+        if (s.reserve_overruns != 0)
+            return .{ .what = "no unwind spent more reserve than it had", .got = @intCast(s.reserve_overruns), .want = 0 };
+        if (armed_seen != s.armed)
+            return .{ .what = "the armed count matches the timers", .got = @intCast(armed_seen), .want = @intCast(s.armed) };
+        return null;
     }
 };

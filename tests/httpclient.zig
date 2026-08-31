@@ -197,7 +197,12 @@ pub fn statusIs(bytes: []const u8, code: []const u8) bool {
 }
 
 pub fn request(target: []const u8, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "GET {s} HTTP/1.1\r\nHost: x\r\n\r\n", .{target}) catch unreachable;
+    // `@panic` and not `catch unreachable`. The buffer belongs to the caller,
+    // so "this cannot fail" is a claim about somebody else's argument, and
+    // `unreachable` is undefined behaviour in a release build and an
+    // unexplained panic in a safe one. This says which buffer was too small.
+    return std.fmt.bufPrint(buf, "GET {s} HTTP/1.1\r\nHost: x\r\n\r\n", .{target}) catch
+        @panic("httpclient.request: target buffer too small");
 }
 
 /// Bytes in one `workRequest`. Fixed, so a caller that only managed a partial
@@ -206,8 +211,19 @@ pub const work_request_bytes = "GET /work/0000 HTTP/1.1\r\nHost: x\r\n\r\n".len;
 
 /// A work request with the unit count zero-padded, so every request in a burst
 /// is the same length.
-pub fn workRequest(units: usize, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "GET /work/{d:0>4} HTTP/1.1\r\nHost: x\r\n\r\n", .{units}) catch unreachable;
+///
+/// Takes a pointer to an array of exactly the right size rather than a slice,
+/// which is the strongest of the options for a call that "cannot fail": the
+/// buffer being too small stops being a runtime panic and becomes a compile
+/// error at the call site. `@panic` is what to reach for when the size is not
+/// comptime-known, as in `request` above, where the target is a runtime slice
+/// and the output length is not knowable here.
+///
+/// The output length is fixed because the units are zero-padded to four
+/// digits, which is the whole reason `work_request_bytes` can be a constant.
+pub fn workRequest(units: usize, buf: *[work_request_bytes]u8) []const u8 {
+    return std.fmt.bufPrint(buf, "GET /work/{d:0>4} HTTP/1.1\r\nHost: x\r\n\r\n", .{units}) catch
+        @panic("httpclient.workRequest: work_request_bytes is wrong");
 }
 
 /// How many 200 responses are in a buffer. Counting rather than parsing,
@@ -255,6 +271,43 @@ pub fn check(ok: bool, comptime name: []const u8, detail: anytype) void {
     } else {
         failures += 1;
         std.debug.print("  FAIL  {s}  {any}\n", .{ name, detail });
+    }
+}
+
+/// Ask the server whether everything that should be true of it is, and return
+/// what it said if the answer is no.
+///
+/// Over the control surface rather than by calling `invariants()` directly,
+/// because the answer has to be computed on the server's thread. The check
+/// reads state that the loop updates across several non-atomic writes, so from
+/// here it sees torn values and fails on a different invariant every few runs.
+/// Asking the server means it answers between dispatches, where its own state
+/// is whole.
+///
+/// `port` is the serving port; the control surface is one above it.
+var invariant_reply: [256]u8 = undefined;
+
+pub fn askInvariants(port: u16) ?[]const u8 {
+    const c = Client.connect(port + 1) catch return "no control connection";
+    defer c.close();
+    c.send("invariants\n") catch return "control connection would not take the command";
+    var buf: [256]u8 = undefined;
+    const n = c.recvUntil(&buf, "\n", 1, 5000);
+    var end: usize = n;
+    while (end > 0 and (buf[end - 1] == '\n' or buf[end - 1] == '\r')) end -= 1;
+    if (std.mem.eql(u8, buf[0..end], "ok")) return null;
+    if (end == 0) return "control surface said nothing";
+    @memcpy(invariant_reply[0..end], buf[0..end]);
+    return invariant_reply[0..end];
+}
+
+pub fn checkInvariants(port: u16, label: []const u8) void {
+    checks += 1;
+    if (askInvariants(port)) |why| {
+        failures += 1;
+        std.debug.print("  FAIL  invariants hold {s}  {s}\n", .{ label, why });
+    } else {
+        std.debug.print("  ok    invariants hold {s}\n", .{label});
     }
 }
 

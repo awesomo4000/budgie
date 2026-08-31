@@ -36,7 +36,7 @@ const check = hc.check;
 /// `GET /work/N` asks for N units of CPU work, so request cost is a parameter.
 fn workReq(units: i64, buf: []u8) []const u8 {
     var target: [64]u8 = undefined;
-    const t = std.fmt.bufPrint(&target, "/work/{d}", .{units}) catch unreachable;
+    const t = std.fmt.bufPrint(&target, "/work/{d}", .{units}) catch @panic("target buffer too small");
     return hc.request(t, buf);
 }
 
@@ -443,7 +443,21 @@ fn serverThread() void {
     server.runUntil(std.math.maxInt(i64));
 }
 
+/// Retries, because the control surface binds the serving port plus one and
+/// that can already be taken. `start` now reports that rather than silently
+/// producing a server with no control surface, so the honest response is to
+/// ask for a different ephemeral port.
 fn startServer() !u16 {
+    var attempt: usize = 0;
+    while (attempt < 8) : (attempt += 1) {
+        bound_port.store(0, .release);
+        start_failed.store(false, .release);
+        if (startOnce()) |p| return p else |_| {}
+    }
+    return error.ServerNeverStarted;
+}
+
+fn startOnce() !u16 {
     var thread = try std.Thread.spawn(.{}, serverThread, .{});
     thread.detach();
     var waited: usize = 0;
@@ -480,5 +494,6 @@ pub fn main() !void {
     try tBuffersBalance();
     try tEndingsAccountForConnections();
 
+    hc.checkInvariants(port, "after every case above");
     hc.report();
 }

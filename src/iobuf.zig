@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const http = @import("http.zig");
+const Violation = @import("invariant.zig").Violation;
 
 pub const max_bufs = 8192;
 pub const nil: u16 = 0xffff;
@@ -154,12 +155,15 @@ pub const Pool = struct {
     /// Refusing here is the admission decision the pool exists to make: the
     /// caller answers 503 rather than failing to allocate. That answer has to
     /// be written somewhere, which is what `cleanup_slots` is for.
-    pub fn acquire(p: *Pool) ?Handle {
-        return p.acquireFor(no_owner);
-    }
-
-    /// The same, recording who it went to. Prefer this: an un-owned slot is
-    /// one nothing can reclaim on the holder's behalf.
+    /// Take a buffer, recording who it went to.
+    ///
+    /// There is no un-owned version. There was, kept when provenance was added
+    /// so the servers could adopt it one at a time, and once both had it the
+    /// old one had no callers and every reason to have none: a slot taken
+    /// without an owner is one `releaseAllFor` can never reclaim, which is
+    /// exactly the leak the ledger exists to prevent. Leaving it there was
+    /// leaving the footgun loaded and pointing at the next person to write an
+    /// acquire.
     pub fn acquireFor(p: *Pool, owner: u32) ?Handle {
         if (p.n_free <= p.cleanup_slots) {
             p.exhausted += 1;
@@ -177,10 +181,6 @@ pub const Pool = struct {
     /// the identical call, fails identically, and the connection closes with
     /// nothing written. Measured before this existed: 48 connections against a
     /// pool of 2 produced 42 `no_buffer` endings and zero delivered 503s.
-    pub fn acquireForCleanup(p: *Pool) ?Handle {
-        return p.acquireForCleanupBy(no_owner);
-    }
-
     pub fn acquireForCleanupBy(p: *Pool, owner: u32) ?Handle {
         if (p.n_free == 0) {
             p.exhausted += 1;
@@ -233,6 +233,31 @@ pub const Pool = struct {
             n += 1;
         }
         return n;
+    }
+
+    /// What the pool can say about itself. Conservation, mostly: every slot is
+    /// either free or handed out, and the counters agree with the state.
+    ///
+    /// `acquires == releases + live` is the one that has caught things before.
+    /// It is the check the socket tests already make by hand, here so a caller
+    /// gets it without knowing to ask.
+    pub fn check(p: *const Pool) ?Violation {
+        if (p.n_free + p.live != p.cap)
+            return .{ .what = "every slot is free or live", .got = @intCast(p.n_free + p.live), .want = @intCast(p.cap) };
+        if (p.acquires != p.releases + p.live)
+            return .{ .what = "every buffer acquired is live or released", .got = @intCast(p.acquires), .want = @intCast(p.releases + p.live) };
+
+        // An owner recorded against a slot that is on the free list means the
+        // provenance record and the free list disagree, which is how a
+        // reclaim could hand back something already reclaimed.
+        var owned: usize = 0;
+        var i: usize = 0;
+        while (i < p.cap) : (i += 1) {
+            if (p.owner[i] != no_owner) owned += 1;
+        }
+        if (owned > p.live)
+            return .{ .what = "no more owners recorded than live slots", .got = @intCast(owned), .want = @intCast(p.live) };
+        return null;
     }
 
     pub fn get(p: *Pool, h: Handle) ?*IoBuf {
