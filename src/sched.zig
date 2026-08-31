@@ -254,6 +254,12 @@ pub const Sched = struct {
         s.live[id] = false;
         s.cancelled[id] = false;
         s.expired[id] = false;
+        // Belt and braces, and known to be so: a mutation test that removed this
+        // changed nothing, because `cancel` already refuses on `!live` while the
+        // slot is empty and `admit` bumps the generation before anyone can
+        // re-occupy it. Kept because invalidating a token the moment its task
+        // ends is the property we want to be able to state, rather than one
+        // that happens to fall out of two other checks.
         s.gen[id] +%= 1; // invalidates every outstanding token for this slot
     }
 
