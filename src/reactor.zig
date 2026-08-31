@@ -35,6 +35,7 @@ pub const has_byte_fairness = true;
 pub const backend = switch (builtin.os.tag) {
     .linux => @import("backend_epoll.zig"),
     .macos, .ios, .tvos, .watchos, .visionos, .freebsd, .netbsd, .openbsd, .dragonfly => @import("backend_kqueue.zig"),
+    .windows => @import("backend_iocp.zig"),
     else => @compileError("no readiness backend for this OS"),
 };
 const Backend = backend.Backend;

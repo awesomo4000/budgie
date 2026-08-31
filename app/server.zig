@@ -11,6 +11,7 @@
 //! lives in sched.zig. Swapping poll for epoll touches reactor.zig only.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const Sched = @import("budgie").sched.Sched;
 const TaskId = @import("budgie").sched.TaskId;
@@ -1220,15 +1221,31 @@ pub fn start(want_port: u16) !u16 {
     });
     a.s.arm(background_task, nowMs() + K.bg_period_ms);
 
-    var act: posix.Sigaction = .{
-        .handler = .{ .handler = onTick },
-        .mask = posix.sigemptyset(),
-        .flags = posix.SA.RESTART,
-    };
-    posix.sigaction(.ALRM, &act, null);
-    if (K.lazy_tick == 0) {
-        armTimer(K.tick_ms);
-        a.tick_armed = true;
+    // The preemption tick, and the one place Windows currently has no answer.
+    //
+    // Everywhere else the tick is a SIGALRM handler that sets `should_yield`,
+    // which the yield fast path already loads. Windows has no signals, so
+    // there is nothing to install and `armIntervalTimer` there is a no-op. The
+    // equivalent is a thread that sleeps and sets the same atomic, or a
+    // waitable timer, and neither is a translation of this code: a thread
+    // setting a flag is not a preemption point the way a signal is, and the
+    // watchdog below reads `in_kernel` on the assumption that the reader is
+    // the interrupted thread itself.
+    //
+    // Left off rather than approximated. A server here runs with no tick, so
+    // a task that never reaches a yield point is not caught, which is a thing
+    // to know about this port rather than a thing to hide.
+    if (comptime builtin.os.tag != .windows) {
+        var act: posix.Sigaction = .{
+            .handler = .{ .handler = onTick },
+            .mask = posix.sigemptyset(),
+            .flags = posix.SA.RESTART,
+        };
+        posix.sigaction(.ALRM, &act, null);
+        if (K.lazy_tick == 0) {
+            armTimer(K.tick_ms);
+            a.tick_armed = true;
+        }
     }
 
     std.debug.print("listening on 127.0.0.1:{d}  budget={d} reserve={d} quantum={d}\n", .{
