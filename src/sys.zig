@@ -95,6 +95,12 @@ pub fn ignoreSigpipe() void {
     std.posix.sigaction(.PIPE, &act, null);
 }
 
+pub const PollFd = impl.PollFd;
+pub const poll_in = impl.poll_in;
+pub const poll_out = impl.poll_out;
+pub const pollFd = impl.pollFd;
+pub const pollSet = impl.pollSet;
+
 /// Wait for one socket to become readable, or for the timeout to pass. True
 /// means readable.
 ///

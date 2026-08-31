@@ -9,7 +9,9 @@ const sockaddr_in = sys.SockAddrIn;
 fn sysErr(rc: usize) bool { return @as(isize, @bitCast(rc)) < 0; }
 pub fn main(init: std.process.Init.Minimal) !void {
     var argv: [5][]const u8 = undefined; var argc: usize = 0;
-    for (init.args.vector) |a| { if (argc == 5) break; argv[argc] = std.mem.span(a); argc += 1; }
+    var it = try init.args.iterateAllocator(std.heap.page_allocator);
+    defer it.deinit();
+    while (it.next()) |a| { if (argc == 5) break; argv[argc] = a; argc += 1; }
     const port = try std.fmt.parseInt(u16, argv[1], 10);
     const n = try std.fmt.parseInt(usize, argv[2], 10);
     const hold_s = try std.fmt.parseInt(i64, argv[3], 10);

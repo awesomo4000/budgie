@@ -335,6 +335,29 @@ pub fn pollReadable(fd: i32, timeout_ms: i32) bool {
     return c.WSAPoll(&p, 1, timeout_ms) > 0;
 }
 
+// --- the poll seam, for the load generators
+
+/// `poll` over a whole set. Same three names as the other two platforms, but
+/// the struct is not the same: the descriptor field is a `SOCKET`, not an
+/// `int`. That is why callers go through `pollFd` instead of assigning the
+/// descriptor directly.
+///
+/// `POLLIN` is `POLLRDNORM` here and `POLLOUT` is `POLLWRNORM`.
+pub const PollFd = WSAPOLLFD;
+pub const poll_in: i16 = POLLRDNORM;
+pub const poll_out: i16 = POLLWRNORM;
+
+pub fn pollFd(fd: i32) SOCKET {
+    return sock(fd);
+}
+
+pub fn pollSet(fds: []PollFd, timeout_ms: i32) usize {
+    const rc = c.WSAPoll(fds.ptr, @intCast(fds.len), timeout_ms);
+    return if (rc < 0) 0 else @intCast(rc);
+}
+
+const POLLWRNORM: i16 = 0x0010;
+
 pub fn connect(fd: i32, addr: *const SockAddrIn) usize {
     return wrap(c.connect(sock(fd), addr, @sizeOf(SockAddrIn)));
 }

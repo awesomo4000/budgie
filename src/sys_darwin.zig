@@ -174,3 +174,20 @@ pub fn cpuMs() u64 {
     const s = @as(u64, @intCast(ru.stime.sec)) * 1000 + @as(u64, @intCast(@divTrunc(ru.stime.usec, 1000)));
     return u + s;
 }
+
+// --- the poll seam, for the load generators
+
+/// `poll` over a whole set, which the load generators need and `waitReadable`
+/// does not cover. Same three names on every platform; the struct differs,
+/// which is why callers build it through `pollFd` rather than by hand.
+pub const PollFd = std.posix.pollfd;
+pub const poll_in: i16 = std.posix.POLL.IN;
+pub const poll_out: i16 = std.posix.POLL.OUT;
+
+pub fn pollFd(fd: i32) i32 {
+    return fd;
+}
+
+pub fn pollSet(fds: []PollFd, timeout_ms: i32) usize {
+    return std.posix.poll(fds, timeout_ms) catch 0;
+}

@@ -17,11 +17,13 @@ fn sysErr(rc: usize) bool {
 fn nowNs() i64 { return budgie.clock.monotonicNs(); }
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    var it = try init.args.iterateAllocator(std.heap.page_allocator);
+    defer it.deinit();
     var argv: [6][]const u8 = undefined;
     var argc: usize = 0;
-    for (init.args.vector) |a| {
+    while (it.next()) |a| {
         if (argc == 6) break;
-        argv[argc] = std.mem.span(a);
+        argv[argc] = a;
         argc += 1;
     }
     const port = try std.fmt.parseInt(u16, argv[1], 10);
