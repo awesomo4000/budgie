@@ -532,6 +532,7 @@ pub const Backend = struct {
     /// on any other platform after a connection evaporated.
     fn finishAccept(be: *Backend, op: *Op, status: usize) void {
         _ = be;
+        const listener = op.fd;
         const conn = op.conn;
         op.conn = -1;
         if (conn < 0) return;
@@ -541,12 +542,14 @@ pub const Backend = struct {
             return;
         }
 
-        const listener: SOCKET = @intCast(op.fd);
-        _ = c.setsockopt(@intCast(conn), 0xffff, SO_UPDATE_ACCEPT_CONTEXT, &listener, @sizeOf(SOCKET));
+        const listener_sock: SOCKET = @intCast(listener);
+        _ = c.setsockopt(@intCast(conn), 0xffff, SO_UPDATE_ACCEPT_CONTEXT, &listener_sock, @sizeOf(SOCKET));
 
-        // A full ring means the server is not collecting, so the honest thing
-        // is to refuse the connection rather than hold it open unanswered.
-        if (!sys_windows.pushAccepted(conn)) _ = c.closesocket(@intCast(conn));
+        // Tagged with the listener, because this server listens twice and the
+        // two are accepted by different tasks. A full queue means the server is
+        // not collecting, so the honest thing is to refuse the connection
+        // rather than hold it open unanswered.
+        if (!sys_windows.pushAccepted(listener, conn)) _ = c.closesocket(@intCast(conn));
     }
 
     /// Which block a completed `OVERLAPPED` belongs to. Pointer arithmetic

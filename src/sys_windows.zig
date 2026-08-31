@@ -248,42 +248,73 @@ pub fn getsockname(fd: i32, addr: *SockAddrIn) usize {
 /// server above sees the same thing it sees everywhere else: a task wakes, asks
 /// for a socket, and gets one or gets a would-block.
 ///
-/// A short ring rather than one slot, because `AcceptEx` can be posted more
-/// than once and the reactor may collect several completions from one `wait`
-/// before the accept task runs again.
+/// Room for several, because `AcceptEx` can be posted more than once and the
+/// reactor may collect several completions from one `wait` before the accept
+/// task runs again.
+///
+/// Entries carry the listener they arrived on, and that is not bookkeeping for
+/// its own sake. This server listens twice: once for requests and once, on the
+/// next port up, for the control surface, and they are accepted by different
+/// tasks with different priorities. A single undifferentiated queue lets the
+/// request-accept loop take a control connection and treat it as HTTP, which is
+/// exactly what happened: the control generator connected, its socket was
+/// handed to the wrong handler, and it sat waiting for a reply that was never
+/// going to come.
 const accept_ring = 32;
 
-var accepted: [accept_ring]i32 = @splat(-1);
-var accepted_head: usize = 0;
-var accepted_tail: usize = 0;
+const Accepted = struct { listener: i32 = -1, fd: i32 = -1 };
 
-/// Hand a socket the reactor accepted to the queue. Called by the IOCP backend
-/// and by nothing else. Returns false if the ring is full, which tells the
-/// caller to close the socket rather than drop it on the floor.
-pub fn pushAccepted(fd: i32) bool {
-    const next = (accepted_tail + 1) % accept_ring;
-    if (next == accepted_head) return false;
-    accepted[accepted_tail] = fd;
-    accepted_tail = next;
+var accepted: [accept_ring]Accepted = @splat(.{});
+var accepted_n: usize = 0;
+
+/// Hand a socket the reactor accepted to the queue, tagged with the listener it
+/// came in on. Called by the IOCP backend and by nothing else. Returns false if
+/// there is no room, which tells the caller to close the socket rather than
+/// drop it on the floor.
+pub fn pushAccepted(listener: i32, fd: i32) bool {
+    if (accepted_n == accept_ring) return false;
+    accepted[accepted_n] = .{ .listener = listener, .fd = fd };
+    accepted_n += 1;
     return true;
 }
 
 pub fn acceptedPending() usize {
-    return (accepted_tail + accept_ring - accepted_head) % accept_ring;
+    return accepted_n;
 }
 
-/// Take the next socket the reactor accepted, or fall back to a real `accept`.
+/// Take the oldest queued socket for this listener, keeping the rest in order.
+/// A linear scan over at most thirty-two entries, which is cheaper than the
+/// bookkeeping a per-listener ring would need for two listeners.
+fn takeAccepted(listener: i32) ?i32 {
+    var i: usize = 0;
+    while (i < accepted_n) : (i += 1) {
+        if (accepted[i].listener != listener) continue;
+        const fd = accepted[i].fd;
+        var j = i;
+        while (j + 1 < accepted_n) : (j += 1) accepted[j] = accepted[j + 1];
+        accepted_n -= 1;
+        return fd;
+    }
+    return null;
+}
+
+/// Close every queued socket for a listener that is going away, so a shutdown
+/// does not leave connections open with nobody owning them.
+pub fn dropAccepted(listener: i32) void {
+    while (takeAccepted(listener)) |fd| close(fd);
+}
+
+/// Take the next socket the reactor accepted on this listener, or fall back to
+/// a real `accept`.
 ///
 /// The fallback is not decoration. Anything that listens without a reactor --
 /// a test with its own loop, a tool -- still gets working behaviour, and a
 /// mixed setup works too, because `AcceptEx` and `accept` draw from the same
-/// backlog. When neither has anything, this reports a would-block by setting
-/// the error the way the platform would have, so `wouldBlock` above answers
-/// correctly and the caller needs no special case.
+/// backlog. When neither has anything, this reports a would-block the way the
+/// platform would, so `wouldBlock` above answers correctly and the caller needs
+/// no special case.
 pub fn acceptNonblock(listener: i32) usize {
-    if (accepted_head != accepted_tail) {
-        const fd = accepted[accepted_head];
-        accepted_head = (accepted_head + 1) % accept_ring;
+    if (takeAccepted(listener)) |fd| {
         // Set again here rather than trusting where it came from. `AcceptEx`
         // sockets are created non-blocking, but the completion path then sets
         // `SO_UPDATE_ACCEPT_CONTEXT`, which copies properties from the listener
