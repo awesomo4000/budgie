@@ -138,7 +138,20 @@ const Sim = struct {
     }
 
     /// Admit a task and keep the token. The only place a token comes from.
-    fn admitTask(sm: *Sim, t: TaskId, cfg: Cfg, r: std.Random) void {
+    ///
+    /// `staggered` is for the opening loop only, where every task is admitted
+    /// before anything runs and the arrival times are spread out to avoid a
+    /// thundering herd at t=0. There, and only there, the ring holds exactly
+    /// the task just admitted, so consuming its spawn wake takes that task.
+    ///
+    /// Doing the same thing for a recycled slot was a bug, and the invariant
+    /// found it: `popRunnable` pops the highest-priority FIFO entry, which
+    /// mid-run is somebody else, so it discarded an unrelated task's dispatch
+    /// and then cleared `queued` for a task still sitting in a ring. Four
+    /// seeds in ten reported "everything in a ring is marked queued". For a
+    /// recycled slot, admission IS the arrival, which is also what a server
+    /// does: it admits a connection because one turned up.
+    fn admitTask(sm: *Sim, t: TaskId, cfg: Cfg, r: std.Random, staggered: bool) void {
         sm.toks[t] = sm.s.admit(t, .{
             .prio = 2,
             .quota = sup_conn,
@@ -147,9 +160,11 @@ const Sim = struct {
         });
         sm.tasks[t] = .{ .live = true };
         sm.admits += 1;
-        _ = sm.s.popRunnable(); // consume the spawn wake; arrival drives it
-        sm.s.queued[t] = false;
-        sm.pushEvent(sm.clock.v_ns + r.intRangeAtMost(i64, 0, 50_000_000), t);
+        if (staggered) {
+            _ = sm.s.popRunnable(); // safe here: the ring holds only this task
+            sm.s.queued[t] = false;
+            sm.pushEvent(sm.clock.v_ns + r.intRangeAtMost(i64, 0, 50_000_000), t);
+        }
         sm.s.arm(t, sm.clock.ms() + cfg.idle_deadline_ms);
         if (cfg.cancel_permille > 0 and r.uintLessThan(u32, 1000) < cfg.cancel_permille) {
             // Somebody decides, at some point, to stop this one. Scheduled
@@ -197,7 +212,7 @@ const Sim = struct {
         const r = sm.rng.random();
 
         // Every task starts parked with a request arriving at a random time.
-        for (1..sm.n_tasks + 1) |i| sm.admitTask(@intCast(i), cfg, r);
+        for (1..sm.n_tasks + 1) |i| sm.admitTask(@intCast(i), cfg, r, true);
 
         while (sm.clock.v_ns < until_ns) {
             sm.steps += 1;
@@ -237,7 +252,7 @@ const Sim = struct {
                 else
                     // The slot was released; this is the next connection
                     // arriving on it.
-                    sm.admitTask(e.task, cfg, r),
+                    sm.admitTask(e.task, cfg, r, false),
                 .cancel => {
                     // Through the token, which is the only way. If the task
                     // instance it names has already gone, this is a counted
