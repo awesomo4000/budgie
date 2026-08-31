@@ -15,7 +15,21 @@ const linux = std.os.linux;
 const Sched = @import("budgie").sched.Sched;
 const TaskId = @import("budgie").sched.TaskId;
 const max_tasks = @import("budgie").sched.max_tasks;
-const Reactor = @import("budgie").reactor.Reactor;
+// Which reactor, chosen by the build rather than named here. That is what lets
+// this one file be the epoll server, the kqueue server and the
+// io_uring-readiness server with nothing in it changing.
+//
+// It was `@import("budgie").reactor.Reactor`, which made the choice here and
+// left the third backend unbuildable against this file. The README's claim
+// that swapping backends touches the reactor only was true for epoll against
+// kqueue and had quietly stopped being true for io_uring readiness, because
+// this file grew `open`, `close`, `read` and the DRR calls and that reactor
+// never did.
+const reactor = if (@import("build_options").uring_readiness)
+    @import("budgie").reactor_uring
+else
+    @import("budgie").reactor;
+const Reactor = reactor.Reactor;
 const quota = @import("budgie").quota;
 const acct = @import("budgie").accounts;
 const Label = acct.Label;
@@ -442,7 +456,9 @@ const App = struct {
             // 16384 moved rounds 1088 -> 305 and the fairness share not at
             // all. The tick is a rate the quantum cannot influence, so the
             // per-client rate is quantum/tick and is actually controllable.
-            if (a.r.quantum > 0 and !a.r.service_rounds) _ = a.r.advanceRound();
+            if (comptime reactor.has_byte_fairness) {
+                if (a.r.quantum > 0 and !a.r.service_rounds) _ = a.r.advanceRound();
+            }
         }
 
         // 1. Drain by priority. Higher classes drain completely; the idle
@@ -815,7 +831,7 @@ const App = struct {
 
     // --------------------------------------------------------------- phases
 
-    fn park(a: *App, t: TaskId, c: *Conn, i: @import("budgie").reactor.Interest) Next {
+    fn park(a: *App, t: TaskId, c: *Conn, i: reactor.Interest) Next {
         a.r.watch(t, c.fd, i);
         return .parked;
     }
@@ -1138,17 +1154,24 @@ pub fn start(want_port: u16) !u16 {
 
     // Background task: always runnable, budget refilled on a period.
     try a.bufs.init(@intCast(K.io_bufs));
-    if (K.drr_quantum < 0) {
-        // EXPERIMENTAL, NOT THE DEFAULT. Converges to a fair share and costs
-        // an order of magnitude of throughput doing it -- see the note on
-        // `Reactor.auto`. A fixed quantum of 1024 is the better operating
-        // point today: 31.9% share at 74k req/s, against 48.3% at 6.3k.
-        a.r.auto = true;
-        a.r.quantum = 4096; // seed; honest rounds correct it
-    } else {
-        a.r.quantum = K.drr_quantum;
+    // Only where there is byte fairness to configure. `reactor_uring` reads
+    // with a plain syscall and meters nothing, and says so with
+    // `has_byte_fairness = false` rather than carrying fields that accept a
+    // setting and ignore it.
+    if (comptime reactor.has_byte_fairness) {
+        if (K.drr_quantum < 0) {
+            // EXPERIMENTAL, NOT THE DEFAULT. Converges to a fair share and
+            // costs an order of magnitude of throughput doing it -- see the
+            // note on `Reactor.auto`. A fixed quantum of 1024 is the better
+            // operating point today: 31.9% share at 74k req/s, against 48.3%
+            // at 6.3k.
+            a.r.auto = true;
+            a.r.quantum = 4096; // seed; honest rounds correct it
+        } else {
+            a.r.quantum = K.drr_quantum;
+        }
+        a.r.service_rounds = K.service_rounds != 0;
     }
-    a.r.service_rounds = K.service_rounds != 0;
     if (false) {
     }
     a.s.grant_size = K.grant;
@@ -1420,7 +1443,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         "\nsteps={d} accepted={d} served={d} reactor_waits={d} avg_armed={d} rearms={d}\n",
         .{ a.steps, a.accepted, a.served, a.r.waits, if (a.r.waits > 0) a.r.fds_polled / a.r.waits else 0, a.s.rearms },
     );
-    std.debug.print("fair: quantum={d} (auto={}) peak_round={d} q_range={d}..{d} n_max={d} honest={d} rounds={d} throttles={d} resumes={d} bytes={d}\n", .{ a.r.quantum, a.r.auto, a.r.peak_round_bytes, a.r.q_min, a.r.q_max, a.r.n_max, a.r.honest_rounds, a.r.rounds, a.r.throttles, a.r.resumes, a.r.bytes_in });
+    if (comptime reactor.has_byte_fairness) {
+        std.debug.print("fair: quantum={d} (auto={}) peak_round={d} q_range={d}..{d} n_max={d} honest={d} rounds={d} throttles={d} resumes={d} bytes={d}\n", .{ a.r.quantum, a.r.auto, a.r.peak_round_bytes, a.r.q_min, a.r.q_max, a.r.n_max, a.r.honest_rounds, a.r.rounds, a.r.throttles, a.r.resumes, a.r.bytes_in });
+    } else {
+        std.debug.print("fair: none on this backend (bytes={d})\n", .{a.r.bytes_in});
+    }
     std.debug.print("iobufs: cap={d} live={d} high_water={d} acquires={d} releases={d} exhausted={d}  ({d} bytes each)\n", .{
         a.bufs.cap, a.bufs.live, a.bufs.high_water, a.bufs.acquires, a.bufs.releases, a.bufs.exhausted, @sizeOf(iobuf.IoBuf),
     });

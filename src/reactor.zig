@@ -25,6 +25,12 @@ const sched = @import("sched.zig");
 
 pub const Interest = @import("interest.zig").Interest;
 
+/// Whether this backend meters bytes per connection and can throttle a greedy
+/// one. Declared rather than assumed, so an application can configure DRR only
+/// where there is DRR to configure, and a backend without it says so instead
+/// of accepting settings it quietly ignores.
+pub const has_byte_fairness = true;
+
 /// The platform wakeup primitive. Selected here and nowhere else.
 pub const backend = switch (builtin.os.tag) {
     .linux => @import("backend_epoll.zig"),

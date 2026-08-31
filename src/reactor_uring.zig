@@ -28,17 +28,25 @@ const linux = std.os.linux;
 const IoUring = linux.IoUring;
 const sched = @import("sched.zig");
 
-pub const Interest = enum {
-    read,
-    write,
+/// The same type `reactor.zig` uses, not a copy of it. They were structurally
+/// identical and separately declared, which is exactly how two backends drift
+/// apart without anyone noticing: the application names one of them, and
+/// swapping reactors then fails to compile for a reason that has nothing to do
+/// with the reactor.
+pub const Interest = @import("interest.zig").Interest;
 
-    fn mask(i: Interest) u32 {
-        return switch (i) {
-            .read => linux.POLL.IN,
-            .write => linux.POLL.OUT,
-        };
-    }
-};
+/// No byte fairness here. See `reactor.zig` for what the flag is for; the
+/// honest answer for this backend is that `read` is a plain syscall with
+/// nothing metering it, and saying so is better than growing inert `quantum`
+/// and `auto` fields that take a value and do nothing with it.
+pub const has_byte_fairness = false;
+
+fn mask(i: Interest) u32 {
+    return switch (i) {
+        .read => linux.POLL.IN,
+        .write => linux.POLL.OUT,
+    };
+}
 
 const queue_depth: u16 = 4096;
 const max_cqes = 1024;
@@ -56,20 +64,76 @@ pub const Reactor = struct {
     enters: u64 = 0,
     sqes_total: u64 = 0,
     overflow_submits: u64 = 0,
+    bytes_in: u64 = 0,
 
     pub fn init(r: *Reactor) !void {
         r.ring = try IoUring.init(queue_depth, 0);
     }
 
+    pub fn deinit(r: *Reactor) void {
+        r.ring.deinit();
+    }
+
+    // ------------------------------------------------- the rest of the shape
+    //
+    // `app/server.zig` grew a wider reactor interface than this file had, and
+    // nobody noticed because nothing built the server against it. The claim in
+    // the README that swapping backends touches `reactor.zig` only had quietly
+    // stopped being true for this one.
+    //
+    // These are the difference, and they are honest rather than decorative:
+    // readiness mode does its own reads, and this backend has no byte-fairness
+    // to account for. Saying "no throttling" is a true statement about this
+    // reactor, not a stub that pretends.
+
+    /// Readiness mode does the read itself, so this is the plain syscall. The
+    /// epoll reactor also meters bytes here for DRR; there is nothing to meter
+    /// when there is no DRR.
+    pub fn read(r: *Reactor, task: sched.TaskId, fd: i32, buf: []u8) isize {
+        _ = task;
+        const n = linux.read(fd, buf.ptr, buf.len);
+        const sn: isize = @bitCast(n);
+        if (sn > 0) r.bytes_in += @intCast(sn);
+        return sn;
+    }
+
+    /// No per-client state, so nothing to set up or tear down.
+    pub fn open(r: *Reactor, task: sched.TaskId) void {
+        _ = r;
+        _ = task;
+    }
+
+    pub fn close(r: *Reactor, task: sched.TaskId) void {
+        _ = r;
+        _ = task;
+    }
+
+    /// No byte-fairness on this backend. A round never completes because there
+    /// are no rounds, and nobody is ever throttled.
+    pub fn advanceRound(r: *Reactor) usize {
+        _ = r;
+        return 0;
+    }
+
+    pub fn throttledCount(r: *const Reactor) usize {
+        _ = r;
+        return 0;
+    }
+
+    pub fn roundComplete(r: *const Reactor) bool {
+        _ = r;
+        return false;
+    }
+
     pub fn watch(r: *Reactor, task: sched.TaskId, fd: i32, i: Interest) void {
-        _ = r.ring.poll_add(@as(u64, task), fd, i.mask()) catch {
+        _ = r.ring.poll_add(@as(u64, task), fd, mask(i)) catch {
             // Submission ring full: flush and retry once. Rare, and counted so
             // it cannot hide.
             r.overflow_submits += 1;
             _ = r.ring.submit() catch return;
             r.enters += 1;
             r.queued_sqes = 0;
-            _ = r.ring.poll_add(@as(u64, task), fd, i.mask()) catch return;
+            _ = r.ring.poll_add(@as(u64, task), fd, mask(i)) catch return;
         };
         r.queued_sqes += 1;
         r.sqes_total += 1;

@@ -76,6 +76,21 @@ pub fn build(b: *std.Build) void {
 
     const is_linux = target.result.os.tag == .linux;
 
+    // Which reactor `app/server.zig` builds against, as a build option rather
+    // than a module. A module was the obvious shape and it does not work: the
+    // reactor source would then belong to both the standalone module and to
+    // `budgie`, and Zig refuses a file in two modules. An options module is
+    // per-executable and the `budgie` module stays shared.
+    //
+    // `src/reactor.zig` picks epoll or kqueue for the platform;
+    // `src/reactor_uring.zig` is io_uring in readiness mode, which is the same
+    // model over a different interface and therefore the control that
+    // separates "io_uring is faster" from "completion semantics are faster".
+    const reactor_default = b.addOptions();
+    reactor_default.addOption(bool, "uring_readiness", false);
+    const reactor_readiness = b.addOptions();
+    reactor_readiness.addOption(bool, "uring_readiness", true);
+
     for (apps) |name| {
         if (!is_linux and isLinuxOnly(name)) continue;
         const exe = b.addExecutable(.{
@@ -84,7 +99,10 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(b.fmt("app/{s}.zig", .{name})),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "budgie", .module = budgie }},
+                .imports = &.{
+                    .{ .name = "budgie", .module = budgie },
+                    .{ .name = "build_options", .module = reactor_default.createModule() },
+                },
             }),
         });
         b.installArtifact(exe);
@@ -214,8 +232,34 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("app/server.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "budgie", .module = budgie }},
+        .imports = &.{
+            .{ .name = "budgie", .module = budgie },
+            .{ .name = "build_options", .module = reactor_default.createModule() },
+        },
     });
+
+    // The same server source over io_uring in readiness mode. Not a copy of
+    // the file: one module binding differs. If this ever stops compiling, the
+    // reactor interface has drifted, which is the thing that happened silently
+    // last time and took the third backend out of the build without a word.
+    const server_uringr_mod = if (is_linux) b.createModule(.{
+        .root_source_file = b.path("app/server.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "budgie", .module = budgie },
+            .{ .name = "build_options", .module = reactor_readiness.createModule() },
+        },
+    }) else null;
+
+    if (server_uringr_mod) |m| {
+        const exe = b.addExecutable(.{ .name = "server_uringr", .root_module = m });
+        b.installArtifact(exe);
+        const run = b.addRunArtifact(exe);
+        run.stdio = .inherit;
+        if (b.args) |args| run.addArgs(args);
+        b.step("server_uringr", "Run app/server.zig over io_uring readiness mode").dependOn(&run.step);
+    }
 
     // The io_uring completion server, same idea. The socket tests are written
     // against a module named `server`, so pointing that name at this instead
@@ -287,6 +331,34 @@ pub fn build(b: *std.Build) void {
         b.step(step_name, b.fmt("Run {s}", .{t.name})).dependOn(&solo.step);
     }
 
+    // The identical socket tests over io_uring in readiness mode. Same server
+    // source as the default build, one option different, so a divergence here
+    // is a reactor difference and cannot be anything else.
+    if (server_uringr_mod) |um| {
+        for (uring_variants) |v| {
+            const exe = b.addExecutable(.{
+                .name = b.fmt("r{s}", .{v.name}),
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(v.src),
+                    .target = target,
+                    .optimize = test_optimize,
+                    .imports = &.{
+                        .{ .name = "budgie", .module = budgie },
+                        .{ .name = "server", .module = um },
+                        .{ .name = "httpclient", .module = httpclient_mod },
+                    },
+                }),
+            });
+            const run = b.addRunArtifact(exe);
+            run.stdio = .inherit;
+            test_step.dependOn(&run.step);
+            const solo = b.addRunArtifact(exe);
+            solo.stdio = .inherit;
+            if (b.args) |args| solo.addArgs(args);
+            b.step(b.fmt("r{s}", .{v.name}), b.fmt("Run {s} over io_uring readiness", .{v.src})).dependOn(&solo.step);
+        }
+    }
+
     if (uring_mod) |um| {
         for (uring_variants) |v| {
             const exe = b.addExecutable(.{
@@ -339,13 +411,20 @@ pub fn build(b: *std.Build) void {
         else
             &.{ "parser_test", "pipetest", "cancel_test", "feedcmp", "chunkfuzz", "sim" };
         for (names) |name| {
+            const check_imports: []const std.Build.Module.Import = if (std.mem.eql(u8, dir, "app"))
+                &.{
+                    .{ .name = "budgie", .module = check_mod },
+                    .{ .name = "build_options", .module = reactor_default.createModule() },
+                }
+            else
+                &.{.{ .name = "budgie", .module = check_mod }};
             const exe = b.addExecutable(.{
                 .name = b.fmt("check-{s}", .{name}),
                 .root_module = b.createModule(.{
                     .root_source_file = b.path(b.fmt("{s}/{s}.zig", .{ dir, name })),
                     .target = check_target,
                     .optimize = optimize,
-                    .imports = &.{.{ .name = "budgie", .module = check_mod }},
+                    .imports = check_imports,
                 }),
             });
             check_step.dependOn(&exe.step);
