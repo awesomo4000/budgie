@@ -18,6 +18,7 @@
 
 const std = @import("std");
 const http = @import("http.zig");
+const Violation = @import("invariant.zig").Violation;
 
 pub const max_bufs = 8192;
 pub const nil: u16 = 0xffff;
@@ -233,6 +234,31 @@ pub const Pool = struct {
             n += 1;
         }
         return n;
+    }
+
+    /// What the pool can say about itself. Conservation, mostly: every slot is
+    /// either free or handed out, and the counters agree with the state.
+    ///
+    /// `acquires == releases + live` is the one that has caught things before.
+    /// It is the check the socket tests already make by hand, here so a caller
+    /// gets it without knowing to ask.
+    pub fn check(p: *const Pool) ?Violation {
+        if (p.n_free + p.live != p.cap)
+            return .{ .what = "every slot is free or live", .got = @intCast(p.n_free + p.live), .want = @intCast(p.cap) };
+        if (p.acquires != p.releases + p.live)
+            return .{ .what = "every buffer acquired is live or released", .got = @intCast(p.acquires), .want = @intCast(p.releases + p.live) };
+
+        // An owner recorded against a slot that is on the free list means the
+        // provenance record and the free list disagree, which is how a
+        // reclaim could hand back something already reclaimed.
+        var owned: usize = 0;
+        var i: usize = 0;
+        while (i < p.cap) : (i += 1) {
+            if (p.owner[i] != no_owner) owned += 1;
+        }
+        if (owned > p.live)
+            return .{ .what = "no more owners recorded than live slots", .got = @intCast(owned), .want = @intCast(p.live) };
+        return null;
     }
 
     pub fn get(p: *Pool, h: Handle) ?*IoBuf {

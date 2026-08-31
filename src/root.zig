@@ -31,6 +31,10 @@ pub const sched = @import("sched.zig");
 /// from every ancestor, all-or-nothing.
 pub const quota = @import("quota.zig");
 
+/// One shape for "something that should be true is not", so a scheduler
+/// violation and a pool violation are the same type.
+pub const invariant = @import("invariant.zig");
+
 /// Per-phase telemetry with application-defined labels.
 pub const accounts = @import("accounts.zig");
 

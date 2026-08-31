@@ -42,7 +42,21 @@ fn serverThread() void {
     server.runUntil(std.math.maxInt(i64));
 }
 
+/// Retries, because the control surface binds the serving port plus one and
+/// that can already be taken. `start` now reports that rather than silently
+/// producing a server with no control surface, so the honest response is to
+/// ask for a different ephemeral port.
 fn startServer() !u16 {
+    var attempt: usize = 0;
+    while (attempt < 8) : (attempt += 1) {
+        bound_port.store(0, .release);
+        start_failed.store(false, .release);
+        if (startOnce()) |p| return p else |_| {}
+    }
+    return error.ServerNeverStarted;
+}
+
+fn startOnce() !u16 {
     var thread = try std.Thread.spawn(.{}, serverThread, .{});
     thread.detach();
     var waited: usize = 0;
@@ -249,7 +263,11 @@ fn tCtrlDoesNotShedItself(port: u16, ctrl: Client) !void {
 
 fn buffersBalanced() bool {
     const st = server.stats();
-    return st.buf_acquires == st.buf_releases;
+    // The whole condition, not half of it. Polling only on acquires ==
+    // releases and then re-reading `buf_live` left a window: a teardown still
+    // in flight satisfies the first and not the second, and this failed once
+    // in six Linux runs with acquires 36, releases 35, live 1.
+    return st.buf_acquires == st.buf_releases and st.buf_live == 0;
 }
 
 fn tAccounting() !void {
@@ -299,5 +317,6 @@ pub fn main() !void {
     try tStillHealthy(port);
     try tAccounting();
 
+    hc.checkInvariants(port, "after shedding");
     hc.report();
 }

@@ -274,6 +274,39 @@ pub fn check(ok: bool, comptime name: []const u8, detail: anytype) void {
     }
 }
 
+/// Ask the server whether everything that should be true of it is.
+///
+/// Over the control surface rather than by calling `invariants()` directly,
+/// because the answer has to be computed on the server's thread. The check
+/// reads state that the loop updates across several non-atomic writes, so from
+/// here it sees torn values and fails on a different invariant every few runs.
+/// Asking the server means it answers between dispatches, where its own state
+/// is whole.
+///
+/// `port` is the serving port; the control surface is one above it.
+pub fn checkInvariants(port: u16, label: []const u8) void {
+    checks += 1;
+    const c = Client.connect(port + 1) catch {
+        failures += 1;
+        std.debug.print("  FAIL  invariants hold {s}  (no control connection)\n", .{label});
+        return;
+    };
+    defer c.close();
+    c.send("invariants\n") catch {};
+    var buf: [256]u8 = undefined;
+    const n = c.recvUntil(&buf, "\n", 1, 5000);
+    // 0.16 moved the trim helpers; the reply is one short line, so slice it.
+    var end: usize = n;
+    while (end > 0 and (buf[end - 1] == '\n' or buf[end - 1] == '\r')) end -= 1;
+    const got = buf[0..end];
+    if (std.mem.eql(u8, got, "ok")) {
+        std.debug.print("  ok    invariants hold {s}\n", .{label});
+    } else {
+        failures += 1;
+        std.debug.print("  FAIL  invariants hold {s}  {s}\n", .{ label, got });
+    }
+}
+
 pub fn report() void {
     std.debug.print("\n{d} checks, {d} failures\n", .{ checks, failures });
     if (failures != 0) std.process.exit(1);

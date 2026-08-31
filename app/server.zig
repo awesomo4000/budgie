@@ -32,6 +32,7 @@ const posix = std.posix;
 const http = @import("budgie").http;
 const Clock = @import("budgie").clock.Clock;
 const iobuf = @import("budgie").iobuf;
+const Violation = @import("budgie").invariant.Violation;
 const sys = @import("budgie").sys;
 
 /// Every knob is runtime-settable so a sweep needs no recompile. Defaults
@@ -739,9 +740,9 @@ const App = struct {
         if (sysErr(rc)) {
             if (!sys.wouldBlock(rc)) {
                 a.r.unwatch(t);
+                a.live_conn[t] = false;
                 a.s.release(t);
                 sys.close(c.fd);
-                a.live_conn[t] = false;
                 return;
             }
             return a.r.watch(t, c.fd, .read);
@@ -756,6 +757,26 @@ const App = struct {
         // One command, and everything else still echoes, which is what the
         // existing control-surface test checks.
         const line = buf[0..rc];
+        // Checked HERE, on the server's own thread, between dispatches.
+        //
+        // The tests used to call `invariants()` directly from the test thread
+        // and it failed intermittently on a different invariant each run, for
+        // the obvious reason once seen: these are quiescent-point properties,
+        // and `s.armed`, `accepted`, `endings` and `live_conn` are all updated
+        // across several non-atomic writes while the loop runs. There is no
+        // amount of polling that fixes reading torn state; the check has to
+        // run where the state is whole. It is also what an operator would
+        // want, which is a good sign it belongs on the control surface.
+        if (std.mem.startsWith(u8, line, "invariants")) {
+            var out: [192]u8 = undefined;
+            const reply = if (invariants()) |v|
+                std.fmt.bufPrint(&out, "violated {f}\n", .{v}) catch "violated (unprintable)\n"
+            else
+                "ok\n";
+            _ = sys.write(c.fd, reply.ptr, reply.len);
+            a.r.watch(t, c.fd, .read);
+            return;
+        }
         if (std.mem.startsWith(u8, line, "shed ")) {
             var end: usize = 5;
             while (end < line.len and line[end] >= '0' and line[end] <= '9') end += 1;
@@ -1053,6 +1074,12 @@ const App = struct {
         a.r.unwatch(t);
         a.r.close(t);
         a.s.disarm(t);
+        // The app stops believing in this connection BEFORE the scheduler slot
+        // goes, so there is never a moment where `live_conn` says yes and
+        // `s.live` says no. That window is only a few instructions wide and it
+        // is real: the invariant check, run from a test thread against a
+        // running server, caught a connection in it.
+        a.live_conn[t] = false;
         a.s.release(t);
         // Reclaim on provenance, not on the connection's own bookkeeping.
         // `c.buf` is what this task THINKS it holds; the pool knows what it
@@ -1066,7 +1093,6 @@ const App = struct {
         const stranded = a.bufs.releaseAllFor(t);
         if (stranded != 0) a.bufs_stranded += stranded;
         sys.close(c.fd);
-        a.live_conn[t] = false;
     }
 };
 
@@ -1095,8 +1121,18 @@ pub fn start(want_port: u16) !u16 {
     app_storage = .{ .listener = sock };
     const a = &app_storage;
     a.conn_store = &conn_store_bss;
-    a.s.live[listener_task] = true;
-    a.s.setPrio(listener_task, prio_listen);            // accept ahead of serving
+    // Through `admit`, not by hand. Setting `live` directly created a task
+    // that had never been admitted: no cap, no reserve, no quota, and a
+    // generation still at zero, which is what made a default-constructed
+    // `CancelTok` name the listener. That was patched at `cancel`; this is the
+    // cause. The one visible effect is a spurious first dispatch, where
+    // `doAccept` finds nothing to accept and re-arms its watch.
+    _ = a.s.admit(listener_task, .{
+        .prio = prio_listen,        // accept ahead of serving
+        .quota = sup_root,
+        .cap = quota.unlimited,     // it charges nothing
+        .reserve = 0,               // and never unwinds
+    });
     try a.r.init();
     a.r.watch(listener_task, sock, .read);
 
@@ -1122,15 +1158,35 @@ pub fn start(want_port: u16) !u16 {
     a.q.define(sup_ctrl, sup_root, quota.unlimited, .periodic, K.sup_period_ms, "ctrl");
 
     // Control listener on port+1, top priority class.
+    //
+    // Both results are checked, which they were not. If port+1 was already
+    // taken the bind failed, the listen failed, and `start` returned the
+    // serving port as though everything had worked: the control surface simply
+    // did not exist and nothing said so. It surfaced when the invariant check
+    // started using that surface and `starve_test` failed on Linux with "no
+    // control connection", intermittently, because ephemeral port collisions
+    // are a matter of luck and a machine running twelve test binaries in a row
+    // has plenty of it.
     const csr = sys.tcpSocketNonblock();
+    if (sysErr(csr)) return error.ControlSocketFailed;
     const csock: i32 = @intCast(csr);
     sys.setReuseAddr(csock);
     var caddr = sockaddr_in{ .port = sys.hostToNetPort(sys.netToHostPort(addr.port) + 1), .addr = sys.loopback };
-    _ = sys.bind(csock, &caddr);
-    _ = sys.listen(csock, 64);
+    if (sysErr(sys.bind(csock, &caddr))) {
+        sys.close(csock);
+        return error.ControlBindFailed;
+    }
+    if (sysErr(sys.listen(csock, 64))) {
+        sys.close(csock);
+        return error.ControlListenFailed;
+    }
     a.ctrl_listener = csock;
-    a.s.live[ctrl_listener_task] = true;
-    a.s.setPrio(ctrl_listener_task, prio_ctrl);
+    _ = a.s.admit(ctrl_listener_task, .{
+        .prio = prio_ctrl,
+        .quota = sup_ctrl,
+        .cap = quota.unlimited,
+        .reserve = 0,
+    });
     a.r.watch(ctrl_listener_task, csock, .read);
 
     _ = a.s.admit(background_task, .{
@@ -1172,6 +1228,62 @@ pub fn runUntil(stop_ms: i64) void {
 /// One iteration, for a test that wants to interleave rather than block.
 pub fn stepOnce() void {
     app_storage.step();
+}
+
+/// Everything that should be true of this server at a quiescent point,
+/// whatever the workload. Returns the first thing that is not.
+///
+/// It exists because every socket test was asserting a hand-picked subset:
+/// one checked buffers balanced, another checked endings were counted, a third
+/// checked nothing was stranded. Each test guarded what its author happened to
+/// think of, so a bug outside that subset was invisible to it. Now a test
+/// asserts the whole set without knowing what is in it, and adding a check
+/// here strengthens every test at once.
+///
+/// The scheduler and the pool answer for themselves; what is left is the
+/// cross-cutting part, where two components have to agree with each other.
+///
+/// O(max_tasks). For tests and for an operator looking, not for the loop.
+pub fn invariants() ?Violation {
+    const a = &app_storage;
+    if (a.s.check()) |v| return v;
+    if (a.bufs.check()) |v| return v;
+
+    if (a.bufs_stranded != 0)
+        return .{ .what = "no connection ended still holding a buffer", .got = @intCast(a.bufs_stranded), .want = 0 };
+    if (a.parked_nowhere != 0)
+        return .{ .what = "no connection parked with nothing able to wake it", .got = @intCast(a.parked_nowhere), .want = 0 };
+
+    var live: u64 = 0;
+    var t: TaskId = 0;
+    while (t < max_tasks) : (t += 1) {
+        if (!a.live_conn[t]) continue;
+        // A connection the app thinks is alive whose task the scheduler has
+        // released is a connection nothing will ever dispatch again.
+        if (!a.s.live[t])
+            return .{ .what = "a live connection has a live task", .who = t, .got = 0, .want = 1 };
+        // And a buffer handle it holds must still name a buffer, or the next
+        // `get` returns null and the connection is torn down as `peer_gone`
+        // for a reason that has nothing to do with the peer.
+        const c = &a.conn_store[t];
+        if (!c.buf.isNull() and a.bufs.get(c.buf) == null)
+            return .{ .what = "a held buffer handle is still valid", .who = t, .got = 0, .want = 1 };
+        // Control connections are deliberately outside the count below: they
+        // are accepted by `acceptCtrl`, which does not touch `accepted`, and
+        // they close without an `Ending`. Counting them here compared one
+        // population against another and failed with an operator holding a
+        // control channel open, which is the normal way to use it.
+        if (!c.is_ctrl) live += 1;
+    }
+
+    // Conservation of connections: everything accepted has either ended or is
+    // still here.
+    var ended: u64 = 0;
+    for (a.endings) |e| ended += e;
+    if (a.accepted != ended + live)
+        return .{ .what = "every accepted connection has ended or is live", .got = @intCast(a.accepted), .want = @intCast(ended + live) };
+
+    return null;
 }
 
 /// Live counters, so a test can assert internal consistency rather than only
