@@ -274,7 +274,8 @@ pub fn check(ok: bool, comptime name: []const u8, detail: anytype) void {
     }
 }
 
-/// Ask the server whether everything that should be true of it is.
+/// Ask the server whether everything that should be true of it is, and return
+/// what it said if the answer is no.
 ///
 /// Over the control surface rather than by calling `invariants()` directly,
 /// because the answer has to be computed on the server's thread. The check
@@ -284,26 +285,29 @@ pub fn check(ok: bool, comptime name: []const u8, detail: anytype) void {
 /// is whole.
 ///
 /// `port` is the serving port; the control surface is one above it.
-pub fn checkInvariants(port: u16, label: []const u8) void {
-    checks += 1;
-    const c = Client.connect(port + 1) catch {
-        failures += 1;
-        std.debug.print("  FAIL  invariants hold {s}  (no control connection)\n", .{label});
-        return;
-    };
+var invariant_reply: [256]u8 = undefined;
+
+pub fn askInvariants(port: u16) ?[]const u8 {
+    const c = Client.connect(port + 1) catch return "no control connection";
     defer c.close();
-    c.send("invariants\n") catch {};
+    c.send("invariants\n") catch return "control connection would not take the command";
     var buf: [256]u8 = undefined;
     const n = c.recvUntil(&buf, "\n", 1, 5000);
-    // 0.16 moved the trim helpers; the reply is one short line, so slice it.
     var end: usize = n;
     while (end > 0 and (buf[end - 1] == '\n' or buf[end - 1] == '\r')) end -= 1;
-    const got = buf[0..end];
-    if (std.mem.eql(u8, got, "ok")) {
-        std.debug.print("  ok    invariants hold {s}\n", .{label});
-    } else {
+    if (std.mem.eql(u8, buf[0..end], "ok")) return null;
+    if (end == 0) return "control surface said nothing";
+    @memcpy(invariant_reply[0..end], buf[0..end]);
+    return invariant_reply[0..end];
+}
+
+pub fn checkInvariants(port: u16, label: []const u8) void {
+    checks += 1;
+    if (askInvariants(port)) |why| {
         failures += 1;
-        std.debug.print("  FAIL  invariants hold {s}  {s}\n", .{ label, got });
+        std.debug.print("  FAIL  invariants hold {s}  {s}\n", .{ label, why });
+    } else {
+        std.debug.print("  ok    invariants hold {s}\n", .{label});
     }
 }
 

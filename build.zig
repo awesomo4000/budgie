@@ -52,6 +52,7 @@ const tests = [_]Test{
     .{ .name = "writepath_test", .needs_server = true },
     .{ .name = "wrong_cancel", .step = "wrong-cancel" },
     .{ .name = "cancel_socket_test", .needs_server = true },
+    .{ .name = "chaos_test", .needs_server = true, .step = "chaos" },
 };
 
 pub fn build(b: *std.Build) void {
@@ -234,6 +235,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "uring_deadline_test", .src = "tests/deadline_test.zig" },
         .{ .name = "uring_writepath_test", .src = "tests/writepath_test.zig" },
         .{ .name = "uring_cancel_socket_test", .src = "tests/cancel_socket_test.zig" },
+        .{ .name = "uring_chaos_test", .src = "tests/chaos_test.zig" },
 
     };
 
