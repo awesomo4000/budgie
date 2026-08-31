@@ -373,16 +373,17 @@ fn served(sm: *const Sim) u64 {
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
-    var argv: [8][]const u8 = undefined;
-    var argc: usize = 0;
-    for (init.args.vector) |a| {
-        if (argc == 8) break;
-        argv[argc] = std.mem.span(a);
-        argc += 1;
-    }
-    const seed = if (argc > 1) try std.fmt.parseInt(u64, argv[1], 10) else 42;
-    const ntask = if (argc > 2) try std.fmt.parseInt(u32, argv[2], 10) else 64;
-    const virt_s = if (argc > 3) try std.fmt.parseInt(i64, argv[3], 10) else 60;
+    // Iterate the arguments rather than walking `init.args.vector` directly.
+    // That field is a POSIX shape: on Windows it is UTF-16 code units of the
+    // raw command line, so `std.mem.span` on it is a compile error rather than
+    // a runtime surprise. `iterateAllocator` is the form that works on all
+    // three, and costs an allocator the simulation does not otherwise need.
+    var it = try init.args.iterateAllocator(std.heap.page_allocator);
+    defer it.deinit();
+    _ = it.skip(); // program name
+    const seed = if (it.next()) |a| try std.fmt.parseInt(u64, a, 10) else 42;
+    const ntask = if (it.next()) |a| try std.fmt.parseInt(u32, a, 10) else 64;
+    const virt_s = if (it.next()) |a| try std.fmt.parseInt(i64, a, 10) else 60;
 
     const w0 = wallNs();
     const a = once(0, seed, ntask, virt_s, .{});

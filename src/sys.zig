@@ -28,12 +28,13 @@ const builtin = @import("builtin");
 
 /// The platform implementation. Selected here and nowhere else.
 ///
-/// Linux and Darwin only. The kqueue backend under `reactor.zig` would work on
-/// the other BSDs, but `rssKb` here is a Mach call, so claiming them would be
+/// Linux, Darwin and Windows. The kqueue backend under `reactor.zig` would work
+/// on the other BSDs, but `rssKb` here is a Mach call, so claiming them would be
 /// claiming something untested and, in that one function, wrong.
 pub const impl = switch (builtin.os.tag) {
     .linux => @import("sys_linux.zig"),
     .macos, .ios, .tvos, .watchos, .visionos => @import("sys_darwin.zig"),
+    .windows => @import("sys_windows.zig"),
     else => @compileError("no platform implementation in sys.zig for this OS"),
 };
 
@@ -78,7 +79,14 @@ pub const cpuMs = impl.cpuMs;
 ///
 /// Every write in this project already checks its return value, so EPIPE lands
 /// on a path that closes the connection and reclaims the task.
+///
+/// Nothing to do on Windows, and this is one of the rare cases where the
+/// platform is simply better. There is no SIGPIPE: a send to a peer that has
+/// gone away returns `WSAECONNRESET` as an ordinary failed call, which is what
+/// the code above already handles. The default disposition problem does not
+/// exist, so there is no default to change.
 pub fn ignoreSigpipe() void {
+    if (comptime builtin.os.tag == .windows) return;
     var act: std.posix.Sigaction = .{
         .handler = .{ .handler = std.posix.SIG.IGN },
         .mask = std.posix.sigemptyset(),

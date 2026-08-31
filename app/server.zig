@@ -1384,11 +1384,18 @@ pub fn knobs() *Knobs {
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    // Iterate rather than walking `init.args.vector` directly. That field is a
+    // POSIX shape: on Windows it is UTF-16 code units of the raw command line,
+    // so `std.mem.span` on it is a compile error rather than a runtime
+    // surprise. `iterateAllocator` is the form that works on all three. The
+    // iterator owns the strings, so it outlives every use of `argv`.
+    var it = try init.args.iterateAllocator(std.heap.page_allocator);
+    defer it.deinit();
     var argv: [24][]const u8 = undefined;
     var argc: usize = 0;
-    for (init.args.vector) |x| {
+    while (it.next()) |a| {
         if (argc == 24) break;
-        argv[argc] = std.mem.span(x);
+        argv[argc] = a;
         argc += 1;
     }
     const arg_port: u16 = if (argc > 1) (std.fmt.parseInt(u16, argv[1], 10) catch 0) else 0;

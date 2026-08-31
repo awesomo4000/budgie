@@ -16,13 +16,20 @@
 //! except to decide how long to block -- which in virtual mode is a jump.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const posix = std.posix;
 
 /// Monotonic nanoseconds, straight from the OS.
 ///
-/// `posix.system` is the platform dispatch: it resolves to `std.c` where libc
-/// is linked and to the native OS module otherwise, so this needs no switch of
-/// its own and no direct reference to libc. `posix.errno` normalises the two
+/// On Linux and Darwin `posix.system` is the platform dispatch: it resolves to
+/// `std.c` where libc is linked and to the native OS module otherwise, so no
+/// switch and no direct reference to libc is needed.
+///
+/// Windows is the exception and needs one, which is why the switch below
+/// exists at all. There is no `clock_gettime` outside libc there, and pulling
+/// libc in for one function would make every other target link it too. The
+/// counter is `QueryPerformanceCounter`, whose frequency is fixed at boot, so
+/// it is read once and kept. `posix.errno` normalises the two
 /// return conventions -- Linux returns a negative errno, Darwin returns -1 and
 /// sets a global -- which is the other half of what a hand-written switch here
 /// would have had to get right. It is the same call std makes internally for
@@ -33,9 +40,40 @@ const posix = std.posix;
 /// MONOTONIC and never REALTIME. Nothing here may observe time going backwards
 /// because an operator set the wall clock.
 pub fn monotonicNs() i64 {
+    if (comptime builtin.os.tag == .windows) return windowsNs();
     var ts: posix.timespec = undefined;
     if (posix.errno(posix.system.clock_gettime(posix.CLOCK.MONOTONIC, &ts)) != .SUCCESS) return 0;
     return @as(i64, @intCast(ts.sec)) * 1_000_000_000 + @as(i64, @intCast(ts.nsec));
+}
+
+/// Ticks to nanoseconds without overflowing and without losing the remainder.
+///
+/// The obvious `ticks * 1_000_000_000 / hz` overflows a u64 after about
+/// eighteen seconds at a 10 MHz counter, which is the frequency Windows
+/// actually reports on current hardware. Splitting into whole seconds plus
+/// remainder keeps full resolution and cannot overflow until the machine has
+/// been up for centuries.
+fn windowsNs() i64 {
+    // `RtlQueryPerformance*` from ntdll rather than the kernel32 wrappers,
+    // which is where 0.16 keeps them. Both return BOOL and write through a
+    // pointer; a false return means no high-resolution counter, and returning
+    // zero then matches what the posix path does when `clock_gettime` fails.
+    const ntdll = std.os.windows.ntdll;
+    const cached = struct {
+        var hz: i64 = 0;
+    };
+    if (cached.hz == 0) {
+        var f: std.os.windows.LARGE_INTEGER = undefined;
+        if (ntdll.RtlQueryPerformanceFrequency(&f) == .FALSE) return 0;
+        cached.hz = f;
+    }
+    if (cached.hz <= 0) return 0;
+    var c: std.os.windows.LARGE_INTEGER = undefined;
+    if (ntdll.RtlQueryPerformanceCounter(&c) == .FALSE) return 0;
+    const ticks: i64 = c;
+    const whole = @divTrunc(ticks, cached.hz);
+    const rest = @mod(ticks, cached.hz);
+    return whole * 1_000_000_000 + @divTrunc(rest * 1_000_000_000, cached.hz);
 }
 
 pub const Mode = enum { real, virtual };
