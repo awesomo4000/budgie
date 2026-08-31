@@ -338,9 +338,6 @@ pub const Sched = struct {
 
     // --------------------------------------------------------- quota handle
 
-    pub fn assignQuota(s: *Sched, id: TaskId, q: quota.Id) void {
-        s.quota_of[id] = q;
-    }
 
     /// Draw execution units into this task's grant. The scheduler asks the
     /// tree; it does not implement conservation itself.
@@ -391,11 +388,6 @@ pub const Sched = struct {
         return null;
     }
 
-    /// True when work exists in any class strictly above `c`.
-    pub fn runnableAbove(s: *const Sched, c: u8) bool {
-        const mask = (@as(u32, 1) << @intCast(c)) - 1;
-        return (s.nonempty & mask) != 0;
-    }
 
     pub fn reasonFor(s: *const Sched, id: TaskId) Wake {
         return s.wake[id];

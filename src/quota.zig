@@ -55,6 +55,18 @@ pub const Tree = struct {
     denials: u64 = 0,
 
     pub fn define(t: *Tree, id: Id, parent: Id, quota: i64, refill: Refill, period_ms: i64, tag: []const u8) void {
+        // `.on_return` is not implemented and selecting it silently deadlocks,
+        // so it fails here instead. `refillPeriodic` skips non-periodic nodes,
+        // which leaves `giveBack` as the only thing that could restore the
+        // balance, and `giveBack` has no callers anywhere: nothing returns
+        // budget when a task ends. A node declared this way drains to zero on
+        // first use and never recovers, and every draw after that is denied
+        // for a reason nobody could see.
+        //
+        // The idea is worth keeping, which is why the variant stays. Wiring it
+        // means deciding where unspent budget goes when a task is released,
+        // and that is a design question rather than a missing line.
+        if (refill == .on_return) @panic("quota: Refill.on_return needs a caller for giveBack; nothing returns budget yet");
         t.nodes[id] = .{
             .parent = parent,
             .quota = quota,
