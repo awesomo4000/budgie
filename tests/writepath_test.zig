@@ -275,7 +275,7 @@ fn tPeerNeverReads(port: u16) !void {
     c.throttleReceive(2048);
     c.setNonblocking();
 
-    var rq: [128]u8 = undefined;
+    var rq: [hc.work_request_bytes]u8 = undefined;
     const req = hc.workRequest(1, &rq);
     var asked: usize = 0;
     while (asked < 200) : (asked += 1) {

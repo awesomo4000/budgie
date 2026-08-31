@@ -211,9 +211,19 @@ pub const work_request_bytes = "GET /work/0000 HTTP/1.1\r\nHost: x\r\n\r\n".len;
 
 /// A work request with the unit count zero-padded, so every request in a burst
 /// is the same length.
-pub fn workRequest(units: usize, buf: []u8) []const u8 {
+///
+/// Takes a pointer to an array of exactly the right size rather than a slice,
+/// which is the strongest of the options for a call that "cannot fail": the
+/// buffer being too small stops being a runtime panic and becomes a compile
+/// error at the call site. `@panic` is what to reach for when the size is not
+/// comptime-known, as in `request` above, where the target is a runtime slice
+/// and the output length is not knowable here.
+///
+/// The output length is fixed because the units are zero-padded to four
+/// digits, which is the whole reason `work_request_bytes` can be a constant.
+pub fn workRequest(units: usize, buf: *[work_request_bytes]u8) []const u8 {
     return std.fmt.bufPrint(buf, "GET /work/{d:0>4} HTTP/1.1\r\nHost: x\r\n\r\n", .{units}) catch
-        @panic("httpclient.workRequest: buffer smaller than work_request_bytes");
+        @panic("httpclient.workRequest: work_request_bytes is wrong");
 }
 
 /// How many 200 responses are in a buffer. Counting rather than parsing,
