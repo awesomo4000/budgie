@@ -52,6 +52,11 @@ pub const SockAddrIn = extern struct {
 /// The externs, in one namespace so the symbol names stay honest and the
 /// wrappers below can reuse them.
 const c = struct {
+    extern "ntdll" fn NtSetTimerResolution(
+        DesiredResolution: u32,
+        SetResolution: win.BOOLEAN,
+        CurrentResolution: *u32,
+    ) callconv(.winapi) i32;
     extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *WSADATA) callconv(.winapi) c_int;
     extern "ws2_32" fn WSAGetLastError() callconv(.winapi) c_int;
     extern "ws2_32" fn socket(af: c_int, t: c_int, protocol: c_int) callconv(.winapi) SOCKET;
@@ -137,7 +142,50 @@ fn ensureStarted() void {
     if (started) return;
     var data: WSADATA = undefined;
     _ = c.WSAStartup(0x0202, &data); // 2.2
+    raiseTimerResolution();
     started = true;
+}
+
+/// Ask for a 1ms timer, because the default is 15.625ms and everything that
+/// waits inherits it.
+///
+/// Windows paces timer expiry off the system clock interrupt, which runs at
+/// 64Hz unless somebody asks for better. That is not only `Sleep`: the timeout
+/// on `GetQueuedCompletionStatusEx` is the same clock, and that timeout is how
+/// this project's timer wheel gets to run at all. Measured on this machine at
+/// the default resolution, a 1ms `Sleep` took 16.1ms and a 1ms completion-port
+/// wait took 16.1ms. After this call they are 2.0ms and 1.1ms.
+///
+/// The cost is real and worth stating: a faster tick means the CPU idles less
+/// deeply, which costs power. It used to be worse, because the setting was
+/// global and one process ruined everyone's battery life. Since Windows 10
+/// version 2004 it applies to the calling process, so a server that wants
+/// millisecond deadlines pays for them itself. Older builds still take it
+/// globally, which is the honest reason this is worth a comment rather than
+/// being slipped in.
+///
+/// `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION` is the alternative for a single
+/// timer and needs no global change, measured at 1.5ms for a 1ms request. It
+/// does not help here, because it cannot change the completion-port wait, which
+/// is where the deadlines actually live.
+///
+/// This goes through ntdll rather than `timeBeginPeriod` in winmm, and the
+/// reason is a build property rather than a preference. `extern "ws2_32"` and
+/// `extern "kernel32"` link themselves; `extern "winmm"` does not, and it would
+/// have to be named on all fourteen executables this repository builds. The
+/// first attempt did that and linked cleanly with the import missing from the
+/// table, so the call silently did nothing and the deadline numbers did not
+/// move. A fix whose failure mode is silence is not a fix. ntdll is already
+/// linked, because `clock.zig` reads the performance counter through it, so
+/// there is one place to get this wrong instead of fourteen.
+///
+/// `timeBeginPeriod` is a wrapper over this call. It is not in the documented
+/// API, which is a genuine cost and the reason for this paragraph.
+fn raiseTimerResolution() void {
+    // 100ns units, so 10000 is 1ms. Failure is not worth reporting: it means
+    // deadlines stay coarse, which is what they were before the call.
+    var current: u32 = 0;
+    _ = c.NtSetTimerResolution(10_000, .TRUE, &current);
 }
 
 /// Narrow a SOCKET to the `i32` the rest of the project passes around, mapping
