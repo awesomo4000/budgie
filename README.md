@@ -55,7 +55,7 @@ The `s` and `r` used above are the two values the program owns, declared once at
 
 ```zig
 var s: sched.Sched = .{};                        // the scheduler
-var r: Reactor = .{};                            // epoll or kqueue, chosen at compile time
+var r: Reactor = .{};                            // epoll, kqueue or IOCP, chosen at compile time
 var conns: [max_conns + 1]Conn = @splat(.{});    // this program's own per-task state
 ```
 
@@ -101,7 +101,7 @@ Two things in there are important to notice:
 
 `r.read` is the *reactor's* call, not the task's. A readiness reactor that hands out `watch` and lets the application do the read never learns how many bytes anyone consumed, so any fairness policy has to live somewhere else and coordinate with it. Six attempts came apart that way before the read moved inside. Now the reactor sees the byte count, so it owns the accounting and the arming together, and a pause happens in the same code that will resume it.
 
-The second is that the file names no operating system. Build it on Linux and the reactor underneath is epoll. Build it on macOS and it is kqueue. The same file compiles for both. `zig build echo`, then `curl localhost:8080`.
+The second is that the file names no operating system. Build it on Linux and the reactor underneath is epoll. Build it on macOS and it is kqueue. Build it on Windows and it is IOCP. The same file compiles for all three. `zig build echo`, then `curl localhost:8080`.
 
 ## What the scheduler holds
 
@@ -121,13 +121,17 @@ Finally there is `yieldCheck()` and a stall watchdog. Cooperative scheduling has
 
 ## Reactors, and what swapping them proved
 
-Five backends have been written against the same contract: poll, epoll, io_uring readiness, io_uring completion, and kqueue. `sched.zig` stayed byte-identical through all of them. That is the strongest evidence I have that the separation holds.
+Six backends have been written against the same contract: poll, epoll, io_uring readiness, io_uring completion, kqueue, and IOCP. `sched.zig` stayed byte-identical through all of them. That is the strongest evidence I have that the separation holds.
 
 The kqueue port reused the reactor whole. Of `reactor.zig`'s 400 lines, about 15 were epoll-specific, and those 15 are now `backend_epoll.zig` and `backend_kqueue.zig`. The client table, the byte accounting, and the round policy stay shared. The semantics line up because `EV_ONESHOT` and `EPOLLONESHOT` mean the same thing: an event fires, the registration is gone, and the task stays parked until something rearms it.
 
+IOCP was the one that tested the contract rather than confirming it, because IOCP is not a readiness interface. epoll and kqueue answer which sockets you could act on now; IOCP answers which operations you already started have finished. The bridge is the zero-byte overlapped operation: a `WSARecv` for zero bytes completes when the socket becomes readable without consuming anything. So the same 400 lines of fairness policy sit on top, unchanged, and `backend_iocp.zig` is the platform half.
+
+Two things there are genuinely different rather than differently spelled. A listening socket has no readiness at all, so accept goes through `AcceptEx`, which does not report that a client arrived but performs the accept. And the kernel owns an operation's `OVERLAPPED` block until its completion packet has been collected, which cancelling does not shorten: `CancelIoEx` asks, the packet still arrives marked cancelled. So a cancelled block is held rather than freed, and freeing it early would be a use-after-free the kernel commits on your behalf at a time it picks. `tests/iocp_orphan_test.zig` does nothing but cancel, in the three shapes that leave the kernel holding different things, and asserts the conservation law.
+
 That interchangeability covers the readiness backends. The io_uring completion build asks for a different application shape, since there the kernel fills buffers and hands back completions, so `app/server_uring2.zig` is its own file. The portability claim covers the readiness backends and stops there.
 
-The claim is now checked rather than asserted, which it was not until recently. `app/server.zig` builds against epoll, kqueue and io_uring readiness with nothing in it changing, and the same socket tests run against all three. That matters because for a while it was false and nothing said so: nothing built against the readiness io_uring reactor, so when the server grew `open`, `close`, `read` and a byte-fairness interface, that reactor silently stopped fitting. An alternative nobody exercises does not rot quietly on its own. The interface moves and the alternative stops being an alternative, which is worse, because the portability claim is the thing the alternatives exist to support.
+The claim is now checked rather than asserted, which it was not until recently. `app/server.zig` builds against epoll, kqueue, IOCP and io_uring readiness with nothing in it changing, and the same socket tests run against all of them. That matters because for a while it was false and nothing said so: nothing built against the readiness io_uring reactor, so when the server grew `open`, `close`, `read` and a byte-fairness interface, that reactor silently stopped fitting. An alternative nobody exercises does not rot quietly on its own. The interface moves and the alternative stops being an alternative, which is worse, because the portability claim is the thing the alternatives exist to support.
 
 Having all three also gives the control that separates two questions usually asked as one: whether io_uring is faster because of the submission interface, or because of completion semantics. Same server, three reactors, one difference at a time.
 
@@ -135,7 +139,9 @@ Having all three also gives the control that separates two questions usually ask
 
 `tests/sim.zig` imports the unmodified scheduler and runs it on a virtual clock. The same seed gives a byte-identical trace hash over a million dispatches, and six hours of virtual time takes seconds of real time.
 
-The hash also matches across macOS on arm64 and Linux on x86_64. That falls out of keeping the clock away from control flow. Once no branch reads the time, the platform has nothing left to influence.
+The hash also matches across all three platforms. Measured over 72 runs each of macOS on arm64, Linux on x86_64 and Windows on x86_64, being 24 seeds times three task counts, nine traces per run: identical, byte for byte, with the three result files sharing one MD5. That falls out of keeping the clock away from control flow. `sim` imports `sched`, `quota`, `clock` and `invariant` and nothing else, and the one call it makes to the wall clock times the run for reporting and feeds no decision. Once no branch reads the time, the platform has nothing left to influence.
+
+It is worth being clear about what that does not cover. `sim` never touches a reactor, so it says nothing about IOCP against epoll against kqueue. The socket tests and the seeded chaos runs are what cover those, and they pass on all three.
 
 ## Layout
 
@@ -147,6 +153,8 @@ src/
   reactor.zig          readiness reactor: client table, byte accounting, rounds
   backend_epoll.zig    the epoll half of it (Linux)
   backend_kqueue.zig   the kqueue half of it (macOS)
+  backend_iocp.zig     the IOCP half of it (Windows), over zero-byte overlaps
+  invariant.zig        one shape for "something that should be true is not"
   interest.zig         what a task waits for
   reactor_uring.zig    io_uring, IORING_OP_POLL_ADD (readiness)
   reactor_uring2.zig   io_uring, multishot recv and a buffer ring (completion)
@@ -156,9 +164,12 @@ src/
   drr.zig              deficit round robin over byte flows, off by default
   clock.zig            real or virtual time, injected
   sys.zig              sockets and process introspection, per platform
+  sys_linux.zig        its Linux half
+  sys_darwin.zig       its macOS half
+  sys_windows.zig      its Windows half, over ws2_32 and ntdll directly
   root.zig             module root
 
-app/         two servers. `server.zig` builds against epoll, kqueue or
+app/         two servers. `server.zig` builds against epoll, kqueue, IOCP or
              io_uring readiness; `server_uring2.zig` is the completion one
 examples/    echo.zig, and cancellation with and without a dispatcher
 tests/       parser, pipelining, chunk fuzzing, the simulator, and socket
@@ -177,32 +188,35 @@ Requires Zig 0.16.0. Use `-Drelease`, which Zig 0.16 exposes in place of `-Dopti
 ```sh
 zig build -Drelease        # servers and the example into zig-out/bin
 zig build echo             # run the example server
-zig build test             # ten test programs, twelve runs on Linux
+zig build test             # 16 test programs, 28 runs on Linux
 zig build check            # typecheck everything for Linux without running
 ```
 
-|  | Linux | macOS |
-|---|---|---|
-| `zig build test` | 13/13 | 10/10 |
-| `examples/echo.zig` | epoll | kqueue |
-| `app/server.zig` | epoll | kqueue |
-| `app/server_uring2.zig` | io_uring, socket-tested | not available |
-| `zig build bench` | all eight | the four network ones |
+|  | Linux | macOS | Windows |
+|---|---|---|---|
+| `zig build test` | 28/28 | 16/16 | 16/16 |
+| `examples/echo.zig` | epoll | kqueue | IOCP |
+| `app/server.zig` | epoll | kqueue | IOCP |
+| `app/server_uring2.zig` | io_uring, socket-tested | not available | not available |
+| `zig build bench` | all eight | the four network ones | the four network ones |
 
-The Linux build links no libc. Nothing calls `linkLibC`, the ELF is static, and it carries no libc symbols, so a binary cross-compiled on a Mac runs on a Linux box with nothing installed. macOS is the opposite and always will be, because there is no stable syscall ABI there.
+Linux runs more programs than the other two because the socket tests repeat over the io_uring readiness reactor. `iocp_orphan_test` compiles everywhere and reports that there is nothing to test off Windows, which is cheaper than a build condition and means it cannot rot unnoticed.
 
-`zig build check` cross-compiles every executable for `x86_64-linux-gnu` without running it, which is how a change made on a Mac gets checked against the Linux path.
+The Linux build links no libc. Nothing calls `linkLibC`, the ELF is static, and it carries no libc symbols, so a binary cross-compiled on a Mac runs on a Linux box with nothing installed. Windows links no libc either: `std.os.windows` in 0.16 ships `ws2_32` as types with no function declarations and `kernel32` with a single extern, so the externs are ours, declared against ws2_32, kernel32 and ntdll. macOS is the opposite and always will be, because there is no stable syscall ABI there.
+
+`zig build check` cross-compiles every executable for `x86_64-linux-gnu` without running it, which is how a change made on a Mac gets checked against the Linux path. `zig build -Dtarget=x86_64-windows` does the same for Windows, and both are worth running before pushing, because a platform seam breaks at compile time or not at all.
+
+Two Windows differences are not spelled differently, they behave differently, and both cost a bug before they were found. Closing a socket that still holds unread data is an abortive close, so `sys_windows.close` half-closes first: measured, plain close delivered 0 bytes of a 78-byte response and `shutdown` first delivered all 78. And the default timer resolution is 15.625ms, which the completion-port wait inherits, so a 40ms deadline was answered at 47.6ms until the platform layer asked for 1ms. It is now answered at 40.4ms, against 41.0ms on macOS.
 
 ## Status
 
-Working: the scheduler, all five reactors, supervisors, cancellation, the timer wheel, the parser, the simulator, the buffer pool, and the control surface.
+Working: the scheduler, all six reactors, supervisors, cancellation, the timer wheel, the parser, the simulator, the buffer pool, and the control surface.
 
 Open, roughly in the order I would take them:
 
 - One carrier, single threaded. Multi-core is designed as sharding, and still on paper.
 - Tasks are hand-rolled state machines. Fibers, `perform` and `around` are still open, and are the part most likely to change how this feels to use.
 - The io_uring completion build stays flat as queue depth rises. A provided buffer ring gives global backpressure, so per-connection flow control has to come from somewhere else. See APIGUIDE.
-- `iobuf` needs a "the kernel owns this" state before an IOCP port is possible.
 - `gen`, `diskbench`, `iobench` and `sysc` stay Linux-only. The first three are io_uring, and `sysc` measures raw syscall entry cost, which on macOS would be measuring libc.
 
 Numbers from the original measurements live in `results/` and are discussed in `docs/LESSONS.md`. Read them as a diary of one session on one shared vCPU with the load generator running on the same core.
