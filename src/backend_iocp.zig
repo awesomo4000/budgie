@@ -63,6 +63,7 @@ const Interest = @import("interest.zig").Interest;
 
 const sched = @import("sched.zig");
 const sys_windows = @import("sys_windows.zig");
+const Violation = @import("invariant.zig").Violation;
 
 pub const TaskId = sched.TaskId;
 
@@ -79,6 +80,7 @@ const max_ops = max_tasks * 2;
 const SOCKET = usize;
 const HANDLE = *anyopaque;
 const WSA_IO_PENDING: c_int = 997;
+const ERROR_INVALID_PARAMETER: u32 = 87;
 const INFINITE: u32 = 0xFFFF_FFFF;
 
 /// Creating a port and associating a socket with one are the same call, told
@@ -159,6 +161,8 @@ const c = struct {
         hFile: HANDLE,
         lpOverlapped: ?*OVERLAPPED,
     ) callconv(.winapi) win.BOOL;
+
+    extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
     extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) win.BOOL;
 
@@ -244,6 +248,33 @@ pub const Backend = struct {
     /// Resolved once, from the first listening socket armed. Null until then.
     accept_ex: ?AcceptExFn = null,
 
+    // --- what the kernel is holding, counted rather than asserted
+    //
+    // The block a cancelled operation lives in cannot be reused until its
+    // packet comes back, and "cannot" is doing real work there: reusing it
+    // early is a write the kernel performs into memory that now belongs to
+    // somebody else, at a time of its choosing. That is not a bug you find by
+    // reading. These are how the shape of it is visible from outside.
+    /// Cancellations that left a block held, and packets collected for one.
+    /// They must end equal, which `check` enforces.
+    orphans_made: u64 = 0,
+    orphans_reclaimed: u64 = 0,
+    /// Held right now, and the most ever held at once. The peak is the number
+    /// that says whether `max_ops` is a real bound or a lucky one.
+    orphans_held: u32 = 0,
+    orphan_peak: u32 = 0,
+    /// Times the pool was empty and had to collect before it could arm, and
+    /// times that still was not enough.
+    alloc_drains: u64 = 0,
+    alloc_fails: u64 = 0,
+    /// Accepted sockets closed when their cancelled `AcceptEx` finally
+    /// reported. This is the one that would be a descriptor leak if orphans
+    /// were freed at cancellation time instead.
+    late_closes: u64 = 0,
+    /// Tasks woken with no completion behind them, because arming failed on a
+    /// socket already in the state the task needed to see.
+    ready_now: u64 = 0,
+
     /// Readiness collected by a drain that was not `wait`. Only `allocOp` fills
     /// this, and only when the pool is empty; `wait` empties it before asking
     /// the kernel for more. Without it, a drain to reclaim orphans would throw
@@ -271,7 +302,25 @@ pub const Backend = struct {
         const port = be.port orelse return false;
 
         if (be.assoc_fd[task] != fd) {
-            if (c.CreateIoCompletionPort(@ptrFromInt(@as(usize, @intCast(fd))), port, @intCast(task), 0) == null) return false;
+            // Association is permanent and cannot be undone, so the cache above
+            // exists to keep this off the rearm path, which runs once per
+            // request. It is cleared on `disarm` because the descriptor number
+            // will be reused by a different socket later and that one does need
+            // associating.
+            //
+            // Which leaves the case where a task disarms and rearms the SAME
+            // still-open socket. The cache says associate, the kernel says this
+            // handle already is, and the call fails with ERROR_INVALID_PARAMETER.
+            // Treating that as an arming failure is wrong: the socket is
+            // attached to the port, everything is fine, and the task is
+            // perfectly armable. The first version did treat it as a failure,
+            // and the effect was that a socket could be armed exactly once,
+            // ever. Nothing caught it, because the server rearms without
+            // disarming and so never took this path; `iocp_orphan_test` does
+            // nothing but take it, and reported 25 cancellations where it had
+            // asked for 9600.
+            if (c.CreateIoCompletionPort(@ptrFromInt(@as(usize, @intCast(fd))), port, @intCast(task), 0) == null and
+                c.GetLastError() != ERROR_INVALID_PARAMETER) return false;
             be.assoc_fd[task] = fd;
         }
 
@@ -403,6 +452,9 @@ pub const Backend = struct {
         if (op.state != .live) return;
         be.op_of[op.task] = no_op;
         op.state = .orphan;
+        be.orphans_made += 1;
+        be.orphans_held += 1;
+        if (be.orphans_held > be.orphan_peak) be.orphan_peak = be.orphans_held;
         if (op.fd >= 0) {
             // Failure here is expected and ignored. The usual reason is that
             // the operation already completed and its packet is in the queue,
@@ -419,17 +471,21 @@ pub const Backend = struct {
         if (be.stashed == be.stash.len) return false;
         be.stash[be.stashed] = task;
         be.stashed += 1;
+        be.ready_now += 1;
         return true;
     }
 
     fn allocOp(be: *Backend) ?u32 {
         if (be.scan()) |s| return s;
+        be.alloc_drains += 1;
         // Nothing free, which means orphans are holding the pool. Their packets
         // may already be queued, so collect what is there without blocking and
         // try once more. Real readiness picked up on the way is stashed rather
         // than dropped.
         be.drain(0);
-        return be.scan();
+        const s = be.scan();
+        if (s == null) be.alloc_fails += 1;
+        return s;
     }
 
     fn scan(be: *Backend) ?u32 {
@@ -483,9 +539,14 @@ pub const Backend = struct {
                     // reused and, for an accept, the socket it was holding can
                     // be closed. Doing either of those at cancellation time
                     // would have been the bug this state exists to prevent.
-                    if (op.kind == .accept and op.conn >= 0) _ = c.closesocket(@intCast(op.conn));
+                    if (op.kind == .accept and op.conn >= 0) {
+                        _ = c.closesocket(@intCast(op.conn));
+                        be.late_closes += 1;
+                    }
                     op.conn = -1;
                     op.state = .free;
+                    be.orphans_reclaimed += 1;
+                    be.orphans_held -= 1;
                 },
                 .live => {
                     // Woken regardless of the completion status. A failed
@@ -550,6 +611,51 @@ pub const Backend = struct {
         // not collecting, so the honest thing is to refuse the connection
         // rather than hold it open unanswered.
         if (!sys_windows.pushAccepted(listener, conn)) _ = c.closesocket(@intCast(conn));
+    }
+
+    /// What must be true of the pool at any quiescent point.
+    ///
+    /// The counted orphans and the blocks actually in that state have to agree.
+    /// They can only disagree two ways, and both are the same bug seen from
+    /// either end: a block freed while the kernel still owned it, or a packet
+    /// counted twice and a block handed out that is still live. Either one ends
+    /// as the kernel writing into a block some other task is using, which is
+    /// silent until it is not.
+    ///
+    /// `alloc_fails` is in here rather than being a counter nobody reads.
+    /// Failing to allocate means a task asked to be woken and was not armed,
+    /// and the reactor treats that as parked-nowhere. The pool is sized at two
+    /// blocks per task precisely so this cannot happen, so if it does the
+    /// sizing argument is wrong and saying so is the point.
+    pub fn check(be: *const Backend) ?Violation {
+        var held: u32 = 0;
+        var live: u32 = 0;
+        for (be.ops) |op| switch (op.state) {
+            .orphan => held += 1,
+            .live => live += 1,
+            .free => {},
+        };
+        if (held != be.orphans_held) return .{
+            .what = "every block the kernel still owns is counted as held",
+            .got = held,
+            .want = be.orphans_held,
+        };
+        if (be.orphans_made - be.orphans_reclaimed != be.orphans_held) return .{
+            .what = "orphans made minus reclaimed is what is still held",
+            .got = @intCast(be.orphans_made - be.orphans_reclaimed),
+            .want = be.orphans_held,
+        };
+        if (held + live > max_ops) return .{
+            .what = "blocks in use fit in the pool",
+            .got = held + live,
+            .want = max_ops,
+        };
+        if (be.alloc_fails != 0) return .{
+            .what = "a task never failed to arm for want of a block",
+            .got = @intCast(be.alloc_fails),
+            .want = 0,
+        };
+        return null;
     }
 
     /// Which block a completed `OVERLAPPED` belongs to. Pointer arithmetic

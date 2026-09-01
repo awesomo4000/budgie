@@ -24,6 +24,7 @@ const builtin = @import("builtin");
 const sched = @import("sched.zig");
 
 pub const Interest = @import("interest.zig").Interest;
+pub const Violation = @import("invariant.zig").Violation;
 
 /// Whether this backend meters bytes per connection and can throttle a greedy
 /// one. Declared rather than assumed, so an application can configure DRR only
@@ -377,6 +378,20 @@ pub const Reactor = struct {
 
     pub fn watching(r: *const Reactor, task: sched.TaskId) bool {
         return r.added[task];
+    }
+
+    /// What must be true of the backend, when the backend has anything to say.
+    ///
+    /// Optional on purpose. epoll and kqueue hold a descriptor and nothing
+    /// else, so there is no state of theirs that can be inconsistent and no
+    /// check worth writing. IOCP holds a pool of blocks the kernel owns until
+    /// it is done with them, which is real state with a real conservation law,
+    /// so that backend has one. Asking with `@hasDecl` lets the one that has
+    /// something to say say it, without making the other two grow an empty
+    /// function to satisfy an interface.
+    pub fn check(r: *const Reactor) ?Violation {
+        if (comptime @hasDecl(Backend, "check")) return r.be.check();
+        return null;
     }
 
     /// Block up to `timeout_ms` and mark every ready task runnable.

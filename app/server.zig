@@ -1298,6 +1298,7 @@ pub fn invariants() ?Violation {
     const a = &app_storage;
     if (a.s.check()) |v| return v;
     if (a.bufs.check()) |v| return v;
+    if (a.r.check()) |v| return v;
 
     if (a.bufs_stranded != 0)
         return .{ .what = "no connection ended still holding a buffer", .got = @intCast(a.bufs_stranded), .want = 0 };
