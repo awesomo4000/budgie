@@ -31,11 +31,15 @@ const C = struct {
 };
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    // Iterate rather than walking `init.args.vector`: that field is UTF-16 code
+    // units on Windows, so `std.mem.span` on it is a compile error there.
+    var it = try init.args.iterateAllocator(std.heap.page_allocator);
+    defer it.deinit();
     var argv: [8][]const u8 = undefined;
     var argc: usize = 0;
-    for (init.args.vector) |a| {
+    while (it.next()) |a| {
         if (argc == 8) break;
-        argv[argc] = std.mem.span(a);
+        argv[argc] = a;
         argc += 1;
     }
     const gpa = std.heap.page_allocator;
@@ -47,7 +51,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const slow_u = if (argc > 6) try std.fmt.parseInt(u32, argv[6], 10) else 900;
 
     const conns = try gpa.alloc(C, nconn);
-    const fds = try gpa.alloc(posix.pollfd, nconn);
+    const fds = try gpa.alloc(sys.PollFd, nconn);
     var fast_lat = std.ArrayList(i64).empty;
     var slow_lat = std.ArrayList(i64).empty;
 
@@ -69,12 +73,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     while (nowNs() < stop) {
         for (conns, 0..) |*c, i| {
             fds[i] = .{
-                .fd = c.fd,
-                .events = if (c.sending) posix.POLL.OUT else posix.POLL.IN,
+                .fd = sys.pollFd(c.fd),
+                .events = if (c.sending) sys.poll_out else sys.poll_in,
                 .revents = 0,
             };
         }
-        _ = posix.poll(fds, 100) catch 0;
+        _ = sys.pollSet(fds, 100);
         for (conns, 0..) |*c, i| {
             if (fds[i].revents == 0) continue;
             if (c.sending) {

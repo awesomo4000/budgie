@@ -259,11 +259,15 @@ fn actShed(port: u16, r: std.Random) void {
 pub fn main(init: std.process.Init.Minimal) !void {
     hc.ignoreSigpipe();
 
+    // Iterate rather than walking `init.args.vector`: that field is UTF-16 code
+    // units on Windows, so `std.mem.span` on it is a compile error there.
+    var it = try init.args.iterateAllocator(std.heap.page_allocator);
+    defer it.deinit();
     var argv: [8][]const u8 = undefined;
     var argc: usize = 0;
-    for (init.args.vector) |a| {
+    while (it.next()) |a| {
         if (argc == 8) break;
-        argv[argc] = std.mem.span(a);
+        argv[argc] = a;
         argc += 1;
     }
     // usage: chaos <seed> [io_bufs] [deadline_ms] [steps]

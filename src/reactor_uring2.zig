@@ -32,6 +32,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const IoUring = linux.IoUring;
 const sched = @import("sched.zig");
+pub const Violation = @import("invariant.zig").Violation;
 
 pub const Interest = enum { read, write };
 
@@ -421,6 +422,19 @@ pub const Reactor = struct {
         r.sqes_total += 1;
         r.sends += 1;
         return true;
+    }
+
+    /// Nothing to check here yet.
+    ///
+    /// The readiness reactor over io_uring keeps a submission queue and a set
+    /// of armed tasks, and both are already covered by what the scheduler and
+    /// the application assert about parked tasks. The IOCP backend has a
+    /// conservation law of its own because the kernel holds blocks it is not
+    /// finished with; nothing in this file does. Present so the application can
+    /// ask every reactor the same question.
+    pub fn check(r: *const Reactor) ?Violation {
+        _ = r;
+        return null;
     }
 
     pub fn watching(r: *const Reactor, task: sched.TaskId) bool {

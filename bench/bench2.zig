@@ -23,7 +23,9 @@ const C = struct {
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var argv: [8][]const u8 = undefined; var argc: usize = 0;
-    for (init.args.vector) |a| { if (argc == 8) break; argv[argc] = std.mem.span(a); argc += 1; }
+    var it = try init.args.iterateAllocator(std.heap.page_allocator);
+    defer it.deinit();
+    while (it.next()) |a| { if (argc == 8) break; argv[argc] = a; argc += 1; }
     const gpa = std.heap.page_allocator;
     const port = try std.fmt.parseInt(u16, argv[1], 10);
     const nconn = try std.fmt.parseInt(usize, argv[2], 10);
@@ -41,7 +43,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     for (0..depth) |i| @memcpy(burst[i * req.len ..][0..req.len], req);
 
     const conns = try gpa.alloc(C, nconn);
-    const fds = try gpa.alloc(posix.pollfd, nconn);
+    const fds = try gpa.alloc(sys.PollFd, nconn);
     const addr = sockaddr_in{ .port = std.mem.nativeToBig(u16, port), .addr = 0x0100007f };
     for (conns) |*c| {
         const rc = sys.tcpSocket();
@@ -68,8 +70,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 c.outstanding += 1;
             }
         }
-        for (conns, 0..) |*c, i| fds[i] = .{ .fd = c.fd, .events = posix.POLL.IN, .revents = 0 };
-        _ = posix.poll(fds, 50) catch 0;
+        for (conns, 0..) |*c, i| fds[i] = .{ .fd = sys.pollFd(c.fd), .events = sys.poll_in, .revents = 0 };
+        _ = sys.pollSet(fds, 50);
         for (conns, 0..) |*c, i| {
             if (fds[i].revents == 0) continue;
             const r = sys.read(c.fd, c.rbuf[c.rlen..].ptr, c.rbuf.len - c.rlen);

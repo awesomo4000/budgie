@@ -11,6 +11,7 @@
 //! lives in sched.zig. Swapping poll for epoll touches reactor.zig only.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const Sched = @import("budgie").sched.Sched;
 const TaskId = @import("budgie").sched.TaskId;
@@ -268,6 +269,16 @@ pub const stall_fault_after: u32 = 3; // consecutive missed ticks -> fault
 var shared: Shared = .{};
 
 fn onTick(_: posix.SIG) callconv(.c) void {
+    tick();
+}
+
+/// The tick itself, separated from how it is delivered.
+///
+/// On Linux and macOS a signal handler calls this; on Windows a timer-queue
+/// callback does. The body is the same because everything it touches is either
+/// atomic or private to whichever single thread delivers the tick, and both
+/// delivery mechanisms give it one.
+fn tick() void {
     const in_k = shared.in_kernel.load(.monotonic);
     if (in_k) {
         _ = shared.took_in_kernel.fetchAdd(1, .monotonic);
@@ -1220,15 +1231,31 @@ pub fn start(want_port: u16) !u16 {
     });
     a.s.arm(background_task, nowMs() + K.bg_period_ms);
 
-    var act: posix.Sigaction = .{
-        .handler = .{ .handler = onTick },
-        .mask = posix.sigemptyset(),
-        .flags = posix.SA.RESTART,
-    };
-    posix.sigaction(.ALRM, &act, null);
-    if (K.lazy_tick == 0) {
-        armTimer(K.tick_ms);
-        a.tick_armed = true;
+    // The preemption tick, installed two different ways.
+    //
+    // A signal handler on Linux and macOS; a timer-queue callback on Windows,
+    // which has no signals. Both end up calling `tick`, and the difference
+    // that matters is documented on `sys_windows.armIntervalTimer`: a signal
+    // runs on the interrupted thread and a callback runs beside it. Since the
+    // handler only ever set a flag and counted, neither one preempts anything
+    // and the two behave the same.
+    if (comptime builtin.os.tag == .windows) {
+        sys.impl.tick_handler = &tick;
+        if (K.lazy_tick == 0) {
+            armTimer(K.tick_ms);
+            a.tick_armed = true;
+        }
+    } else {
+        var act: posix.Sigaction = .{
+            .handler = .{ .handler = onTick },
+            .mask = posix.sigemptyset(),
+            .flags = posix.SA.RESTART,
+        };
+        posix.sigaction(.ALRM, &act, null);
+        if (K.lazy_tick == 0) {
+            armTimer(K.tick_ms);
+            a.tick_armed = true;
+        }
     }
 
     std.debug.print("listening on 127.0.0.1:{d}  budget={d} reserve={d} quantum={d}\n", .{
@@ -1271,6 +1298,7 @@ pub fn invariants() ?Violation {
     const a = &app_storage;
     if (a.s.check()) |v| return v;
     if (a.bufs.check()) |v| return v;
+    if (a.r.check()) |v| return v;
 
     if (a.bufs_stranded != 0)
         return .{ .what = "no connection ended still holding a buffer", .got = @intCast(a.bufs_stranded), .want = 0 };
@@ -1384,11 +1412,18 @@ pub fn knobs() *Knobs {
 }
 
 pub fn main(init: std.process.Init.Minimal) !void {
+    // Iterate rather than walking `init.args.vector` directly. That field is a
+    // POSIX shape: on Windows it is UTF-16 code units of the raw command line,
+    // so `std.mem.span` on it is a compile error rather than a runtime
+    // surprise. `iterateAllocator` is the form that works on all three. The
+    // iterator owns the strings, so it outlives every use of `argv`.
+    var it = try init.args.iterateAllocator(std.heap.page_allocator);
+    defer it.deinit();
     var argv: [24][]const u8 = undefined;
     var argc: usize = 0;
-    for (init.args.vector) |x| {
+    while (it.next()) |a| {
         if (argc == 24) break;
-        argv[argc] = std.mem.span(x);
+        argv[argc] = a;
         argc += 1;
     }
     const arg_port: u16 = if (argc > 1) (std.fmt.parseInt(u16, argv[1], 10) catch 0) else 0;

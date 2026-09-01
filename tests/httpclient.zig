@@ -36,6 +36,23 @@ pub const Client = struct {
     /// turns one transient refusal under a burst into a permanent failure,
     /// which is what made this flaky before.
     pub fn connect(port: u16) !Client {
+        return connectWithRecvBuf(port, 0);
+    }
+
+    /// Connect with the receive buffer set first, so it actually bounds the
+    /// window.
+    ///
+    /// `throttleReceive` after the fact is too late to be worth much. The TCP
+    /// receive window is negotiated during the handshake, so `SO_RCVBUF` only
+    /// changes what the peer is allowed to send if it is set before `connect`.
+    /// Linux and macOS are forgiving enough that a later call still shrinks
+    /// things in practice; Windows is not, and a test that shrank the buffer
+    /// afterwards saw the full default window and no backpressure at all. That
+    /// looked like a server that never parks on a write, when the truth was a
+    /// client that never made it park.
+    ///
+    /// Zero means leave it alone.
+    pub fn connectWithRecvBuf(port: u16, rcvbuf: i32) !Client {
         var attempt: usize = 0;
         while (attempt < connect_retries) : (attempt += 1) {
             const rc = sys.tcpSocket();
@@ -44,6 +61,7 @@ pub const Client = struct {
                 continue;
             }
             const fd: i32 = @intCast(rc);
+            if (rcvbuf > 0) sys.setRecvBuf(fd, rcvbuf);
             var addr = sys.SockAddrIn{ .port = sys.hostToNetPort(port), .addr = sys.loopback };
             if (!sys.sysErr(sys.connect(fd, &addr))) return .{ .fd = fd };
             sys.close(fd);
@@ -76,9 +94,7 @@ pub const Client = struct {
         var got: usize = 0;
         var stalls: usize = 0;
         while (got < want and got < buf.len) {
-            var p = [_]std.posix.pollfd{.{ .fd = c.fd, .events = std.posix.POLL.IN, .revents = 0 }};
-            const ready = std.posix.poll(&p, timeout_ms) catch return got;
-            if (ready == 0) return got; // timed out
+            if (!sys.waitReadable(c.fd, timeout_ms)) return got; // timed out
 
             const rc = sys.read(c.fd, buf[got..].ptr, buf.len - got);
             if (sys.sysErr(rc)) {
@@ -106,9 +122,7 @@ pub const Client = struct {
         while (got < buf.len) {
             if (countOf(buf[0..got], needle) >= count) return got;
 
-            var p = [_]std.posix.pollfd{.{ .fd = c.fd, .events = std.posix.POLL.IN, .revents = 0 }};
-            const ready = std.posix.poll(&p, timeout_ms) catch return got;
-            if (ready == 0) return got;
+            if (!sys.waitReadable(c.fd, timeout_ms)) return got;
 
             const rc = sys.read(c.fd, buf[got..].ptr, buf.len - got);
             if (sys.sysErr(rc)) {
@@ -126,9 +140,7 @@ pub const Client = struct {
     /// Whether the peer closed within the timeout. Tells "closed" apart from
     /// "idle", which matters when the expected behaviour is a refusal.
     pub fn closedByPeer(c: Client, timeout_ms: i32) bool {
-        var p = [_]std.posix.pollfd{.{ .fd = c.fd, .events = std.posix.POLL.IN, .revents = 0 }};
-        const ready = std.posix.poll(&p, timeout_ms) catch return false;
-        if (ready == 0) return false;
+        if (!sys.waitReadable(c.fd, timeout_ms)) return false;
         var b: [1]u8 = undefined;
         const rc = sys.read(c.fd, &b, 1);
         return !sys.sysErr(rc) and rc == 0;

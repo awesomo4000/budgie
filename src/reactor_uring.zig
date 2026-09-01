@@ -34,6 +34,7 @@ const sched = @import("sched.zig");
 /// swapping reactors then fails to compile for a reason that has nothing to do
 /// with the reactor.
 pub const Interest = @import("interest.zig").Interest;
+pub const Violation = @import("invariant.zig").Violation;
 
 /// No byte fairness here. See `reactor.zig` for what the flag is for; the
 /// honest answer for this backend is that `read` is a plain syscall with
@@ -151,6 +152,19 @@ pub const Reactor = struct {
         r.queued_sqes += 1;
         r.armed_now[task] = false;
         if (r.armed > 0) r.armed -= 1;
+    }
+
+    /// Nothing to check here yet.
+    ///
+    /// The readiness reactor over io_uring keeps a submission queue and a set
+    /// of armed tasks, and both are already covered by what the scheduler and
+    /// the application assert about parked tasks. The IOCP backend has a
+    /// conservation law of its own because the kernel holds blocks it is not
+    /// finished with; nothing in this file does. Present so the application can
+    /// ask every reactor the same question.
+    pub fn check(r: *const Reactor) ?Violation {
+        _ = r;
+        return null;
     }
 
     pub fn watching(r: *const Reactor, task: sched.TaskId) bool {

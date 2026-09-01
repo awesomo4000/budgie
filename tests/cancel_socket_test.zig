@@ -21,6 +21,7 @@
 const std = @import("std");
 const server = @import("server");
 const hc = @import("httpclient");
+const clock = @import("budgie").clock;
 
 const Client = hc.Client;
 const check = hc.check;
@@ -195,20 +196,47 @@ fn tShedBusyConnections(port: u16, ctrl: Client) !void {
     }
     check(opened == conns, "opened and warmed every connection", .{ .opened = opened });
 
+    // Let the previous scene's teardown land first. Its connections are still
+    // finishing, and `served` counts every connection the server has, so their
+    // last answers would otherwise read as this burst having started.
+    _ = hc.waitUntil(buffersBalanced, 3000);
     const before = server.stats();
     for (clients[0..opened]) |c| c.send(burst) catch {};
 
     // Wait until the server has started on it, so there is work in progress
     // rather than work merely queued in a socket.
+    // Spin rather than sleep. The window this is trying to land inside is the
+    // one where the server has started the pipelines and not finished them,
+    // and the shortest sleep a platform will give you is not the same
+    // everywhere: about a millisecond on Linux and macOS, about fifteen on
+    // Windows, where the timer granularity is 15.6ms unless something has
+    // asked for better. Fifteen milliseconds late was enough for every
+    // connection to have cycled its buffer, so the scene cancelled eight busy
+    // connections and measured none of them. Reading the counter in a tight
+    // loop costs one core for a few milliseconds and removes the platform from
+    // the answer.
+    // Wait on buffers held, not on answers produced. A buffer is handed out on
+    // the first read of a request and taken back when the connection goes
+    // idle, so `buf_live` counts connections that are mid-request right now,
+    // which is exactly the population the next check is about. `served` only
+    // says some connection somewhere finished something, which was true here
+    // while every connection in this scene was still untouched.
+    const spin_deadline = clock.monotonicNs() + 3_000_000_000;
     var spun: usize = 0;
-    while (server.stats().served == before.served and spun < 3000) : (spun += 1) hc.sleepMs(1);
-    check(server.stats().served > before.served, "the server has started on the pipelines", .{ .spun = spun });
+    while (server.stats().buf_live < 2 and clock.monotonicNs() < spin_deadline) spun += 1;
+    check(server.stats().buf_live >= 2, "the server has started on the pipelines", .{
+        .live_bufs = server.stats().buf_live,
+        .spun = spun,
+    });
 
+    const at_shed = server.stats();
     const r = try shed(ctrl, opened);
     check(r.cancelled == opened, "shed all of them", .{ .shed = r.cancelled, .of = opened });
     check(r.busy > 0, "and at least one had I/O in flight when it was cancelled", .{
         .busy = r.busy,
         .of = r.cancelled,
+        .live_bufs = at_shed.buf_live,
+        .served = at_shed.served - before.served,
     });
 
     var told: usize = 0;

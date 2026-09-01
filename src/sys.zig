@@ -28,12 +28,13 @@ const builtin = @import("builtin");
 
 /// The platform implementation. Selected here and nowhere else.
 ///
-/// Linux and Darwin only. The kqueue backend under `reactor.zig` would work on
-/// the other BSDs, but `rssKb` here is a Mach call, so claiming them would be
+/// Linux, Darwin and Windows. The kqueue backend under `reactor.zig` would work
+/// on the other BSDs, but `rssKb` here is a Mach call, so claiming them would be
 /// claiming something untested and, in that one function, wrong.
 pub const impl = switch (builtin.os.tag) {
     .linux => @import("sys_linux.zig"),
     .macos, .ios, .tvos, .watchos, .visionos => @import("sys_darwin.zig"),
+    .windows => @import("sys_windows.zig"),
     else => @compileError("no platform implementation in sys.zig for this OS"),
 };
 
@@ -78,13 +79,43 @@ pub const cpuMs = impl.cpuMs;
 ///
 /// Every write in this project already checks its return value, so EPIPE lands
 /// on a path that closes the connection and reclaims the task.
+///
+/// Nothing to do on Windows, and this is one of the rare cases where the
+/// platform is simply better. There is no SIGPIPE: a send to a peer that has
+/// gone away returns `WSAECONNRESET` as an ordinary failed call, which is what
+/// the code above already handles. The default disposition problem does not
+/// exist, so there is no default to change.
 pub fn ignoreSigpipe() void {
+    if (comptime builtin.os.tag == .windows) return;
     var act: std.posix.Sigaction = .{
         .handler = .{ .handler = std.posix.SIG.IGN },
         .mask = std.posix.sigemptyset(),
         .flags = 0,
     };
     std.posix.sigaction(.PIPE, &act, null);
+}
+
+pub const PollFd = impl.PollFd;
+pub const poll_in = impl.poll_in;
+pub const poll_out = impl.poll_out;
+pub const pollFd = impl.pollFd;
+pub const pollSet = impl.pollSet;
+
+/// Wait for one socket to become readable, or for the timeout to pass. True
+/// means readable.
+///
+/// A seam rather than a direct `std.posix.poll` call because that does not
+/// compile for Windows in 0.16: `std.posix.pollfd` aliases a `ws2_32.pollfd`
+/// which the types-only ws2_32 module does not declare. The Windows side uses
+/// `WSAPoll`, which is the same idea for sockets.
+///
+/// Error and timeout are the same answer here. Every caller treated them the
+/// same anyway, and collapsing them removes a distinction nobody acted on.
+pub fn waitReadable(fd: i32, timeout_ms: i32) bool {
+    if (comptime builtin.os.tag == .windows) return impl.pollReadable(fd, timeout_ms);
+    var p = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+    const n = std.posix.poll(&p, timeout_ms) catch return false;
+    return n > 0;
 }
 
 // --- platform-independent, so they stay here rather than being written twice

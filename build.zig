@@ -53,6 +53,10 @@ const tests = [_]Test{
     .{ .name = "wrong_cancel", .step = "wrong-cancel" },
     .{ .name = "cancel_socket_test", .needs_server = true },
     .{ .name = "chaos_test", .needs_server = true, .step = "chaos" },
+    // Windows only in substance: it compiles everywhere and reports that there
+    // is nothing to test off Windows, which is cheaper than a build condition
+    // and means the file cannot rot unnoticed on the other two platforms.
+    .{ .name = "iocp_orphan_test", .step = "orphans" },
 };
 
 pub fn build(b: *std.Build) void {
