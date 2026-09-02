@@ -336,9 +336,7 @@ const App = struct {
     bg_starved: u64 = 0,
     on_data: u64 = 0,
     completions_handled: u64 = 0,
-    data_dropped: u64 = 0,
     reqs_parsed: u64 = 0,
-    pipelined_kept: u64 = 0,
     bad_logged: u32 = 0,
     tr: [64]Trace = @splat(.{}),
     tr_n: usize = 0,
@@ -363,7 +361,6 @@ const App = struct {
     book: acct.Book = .{},
     drr_resumes: u64 = 0,
     ctrl_listener: i32 = -1,
-    drain_breaks: u64 = 0,
     endings: [8]u64 = @splat(0),
     ticks_drained: u64 = 0,
     tick_coalesced: u64 = 0,
@@ -1529,7 +1526,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         "\nsteps={d} accepted={d} served={d} reactor_waits={d} avg_armed={d} rearms={d}\n",
         .{ a.steps, a.accepted, a.served, a.r.waits, if (a.r.waits > 0) a.r.fds_polled / a.r.waits else 0, a.s.rearms },
     );
-    std.debug.print("data: on_data={d} dropped={d} parsed={d} pipelined_kept={d} stashed={d} deferred={d} backpressure={d} held_now={d}\n", .{ a.on_data, a.data_dropped, a.reqs_parsed, a.pipelined_kept, a.data_stashed, a.stash_overflow, a.backpressure_events, a.r.held });
+    std.debug.print("data: on_data={d} parsed={d} stashed={d} deferred={d} backpressure={d} held_now={d}\n", .{ a.on_data, a.reqs_parsed, a.data_stashed, a.stash_overflow, a.backpressure_events, a.r.held });
     std.debug.print("uring feats: NODROP={} FAST_POLL={} EXT_ARG={} CQE_SKIP={} SUBMIT_STABLE={}  fixed_files={} fixed_bufs={} sends={d} file_updates={d}\n", .{
         a.r.feat & linux.IORING_FEAT_NODROP != 0,
         a.r.feat & linux.IORING_FEAT_FAST_POLL != 0,
@@ -1560,7 +1557,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (sp.quota == 0) continue;
         std.debug.print("  {s:<6} quota={d:<12} granted={d:<14} denials={d}\n", .{ sp.tag, sp.quota, sp.granted, sp.denials });
     }
-    std.debug.print("drain_breaks={d}  batched_answers={d} (answers that shared a write)\n", .{ a.drain_breaks, a.batched_answers });
+    // No `drain_breaks` here, unlike the readiness server. The tick check that
+    // produced it was removed from the drain loop on purpose -- see the note
+    // there -- and a counter that is printed but never written is worse than no
+    // counter, because it reads as a measurement. This one read as "the drain
+    // never broke" when the truth was that nobody was counting.
+    std.debug.print("batched_answers={d} (answers that shared a write)\n", .{a.batched_answers});
     std.debug.print("rss: start={d}KB end={d}KB   cpu={d}ms of {d}ms wall ({d:.2}%)   asleep={d}ms\n", .{
         rss_start, rssKb(), cpuMs() - cpu_start, @divTrunc(wall_ns, 1_000_000),
         100.0 * @as(f64, @floatFromInt(cpuMs() - cpu_start)) / (@as(f64, @floatFromInt(wall_ns)) / 1e6),
